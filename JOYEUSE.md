@@ -225,6 +225,15 @@ lines also stay in `sysctl kern.sweetgpu`):
 3. Also read the adreno SMMU at 0x5040000 (CR0, IDRs, stream matches,
    context banks), to see what the GMU (stream 5) and GPU (stream 0) get.
 
+Hardware result of stage 2 (2026-10-20, read with
+`/var/jb/usr/sbin/sysctl -n kern.sweetgpu`): the first try enabled the GCC
+bus branches before the CX GDSC and `memnoc_gfx` stayed off (0x80004221);
+with the GDSC first everything comes up: `cx_gdsc on: gdscr 0xf8288000
+gds_hw 0x80001fe0`, `cxo` and `cx_gmu` on, `gmu_rcg cfg 0x602` (200 MHz),
+GCC `memnoc_gfx`/`snoc_dvm_gfx`/`ddrss_gpu_axi` on. The GMU answers: CM3 held
+in reset (`sysreset 1`, `fw_init 0`), `cm3_cfg 0x52`, `rpmh_state 0xf`,
+`sptprac 0xd4`, RSCC idle. iOS keeps running normally.
+
 Test shims: `shim/out/shim-boot-joyeuse-gpu2.img` and `-gpu3.img` (both
 with `sweetdpu=2`). Read the result with
 `ssh ... sysctl -n kern.sweetgpu`.
