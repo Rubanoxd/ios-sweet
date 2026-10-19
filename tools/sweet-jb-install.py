@@ -11,7 +11,9 @@ rootless jailbreak. This port runs with permissive code signing and sandbox,
 so nothing is exploited here: the files are just placed on the root volume.
 
 On iOS, launchd reads its jobs from the /System/Library/xpc/launchd.plist
-cache (launchd_unsecure_cache=1), not from LaunchDaemons directories, so:
+cache (launchd_unsecure_cache=1), not from LaunchDaemons directories, and
+only for entries keyed under the system directories, so these are added as
+/System/Library/LaunchDaemons jobs:
   com.openssh.sshd   Procursus' socket-activated sshd (ports 22 and 2222),
                      host keys made on the first connection
   es.sweet.jb-firstboot  runs /var/jb/var/sweet/firstboot.sh once per boot
@@ -110,8 +112,7 @@ def main():
     with open(os.path.join(jb, 'Library/LaunchDaemons/com.openssh.sshd.plist'), 'rb') as f:
         sshd = plistlib.load(f)
     daemons = plist['LaunchDaemons']
-    daemons['/var/jb/Library/LaunchDaemons/com.openssh.sshd.plist'] = sshd
-    daemons['/var/jb/Library/LaunchDaemons/es.sweet.jb-firstboot.plist'] = {
+    firstboot = {
         'Label': 'es.sweet.jb-firstboot',
         'Program': '/var/jb/bin/sh',
         'ProgramArguments': ['/var/jb/bin/sh', '/var/jb/var/sweet/firstboot.sh'],
@@ -119,12 +120,26 @@ def main():
         'LaunchOnlyOnce': True,
         'UserName': 'root',
         'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/dev/console',
+        'StandardErrorPath': '/dev/console',
     }
+    # launchd only loads cache entries keyed under the system directories
+    # (a first boot with /var/jb/... keys started neither job), so register
+    # them as /System/Library/LaunchDaemons files, which also exist on disk.
+    sysld = os.path.join(root, 'System/Library/LaunchDaemons')
+    for name, job in (('com.openssh.sshd', sshd), ('es.sweet.jb-firstboot', firstboot)):
+        daemons.pop('/var/jb/Library/LaunchDaemons/%s.plist' % name, None)
+        daemons['/System/Library/LaunchDaemons/%s.plist' % name] = job
+        path = os.path.join(sysld, name + '.plist')
+        with open(path, 'wb') as f:
+            plistlib.dump(job, f)
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o644)
     with open(lp, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(lp, st.st_uid, st.st_gid)
     os.chmod(lp, st.st_mode & 0o7777)
-    print('launchd.plist: com.openssh.sshd, es.sweet.jb-firstboot')
+    print('launchd.plist: com.openssh.sshd, es.sweet.jb-firstboot (as /System/Library/LaunchDaemons)')
 
     if a.authorized_key:
         key = open(a.authorized_key).read()
