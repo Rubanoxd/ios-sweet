@@ -20,6 +20,10 @@ only for entries keyed under the system directories, so these are added as
                      until it has finished: prep_bootstrap.sh (no password
                      prompt), `dpkg -i` of the --deb packages, then uicache,
                      logging to /var/jb/var/sweet/firstboot.log and the console
+  es.sweet.netconfig with --netconfig BIN (tools/sweet-netconfig): installed
+                     as /var/jb/usr/bin/sweet-netconfig, run at load and every
+                     60 s, so configd routes and resolves through the Mac
+                     (sudo tools/sweet-nat-macos.sh on the Mac side)
 --authorized-key installs a public key for root and mobile (both home
 directories: the system one and the bootstrap's /var/jb/var/...).
 Run as root (owners and modes are preserved). Idempotent.
@@ -78,6 +82,7 @@ def main():
     ap.add_argument('--bootstrap', required=True)
     ap.add_argument('--deb', action='append', default=[])
     ap.add_argument('--authorized-key')
+    ap.add_argument('--netconfig', help='sweet-netconfig binary (tools/sweet-netconfig/build.sh)')
     a = ap.parse_args()
     root = a.root
     if os.geteuid() != 0 or not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
@@ -112,6 +117,7 @@ def main():
     with open(os.path.join(jb, 'Library/LaunchDaemons/com.openssh.sshd.plist'), 'rb') as f:
         sshd = plistlib.load(f)
     daemons = plist['LaunchDaemons']
+    jobs = [('com.openssh.sshd', sshd)]
     firstboot = {
         'Label': 'es.sweet.jb-firstboot',
         'Program': '/var/jb/bin/sh',
@@ -127,7 +133,23 @@ def main():
     # (a first boot with /var/jb/... keys started neither job), so register
     # them as /System/Library/LaunchDaemons files, which also exist on disk.
     sysld = os.path.join(root, 'System/Library/LaunchDaemons')
-    for name, job in (('com.openssh.sshd', sshd), ('es.sweet.jb-firstboot', firstboot)):
+    jobs.append(('es.sweet.jb-firstboot', firstboot))
+    if a.netconfig:
+        nc = os.path.join(jb, 'usr/bin/sweet-netconfig')
+        shutil.copyfile(a.netconfig, nc)
+        os.chown(nc, 0, 0)
+        os.chmod(nc, 0o755)
+        jobs.append(('es.sweet.netconfig', {
+            'Label': 'es.sweet.netconfig',
+            'Program': '/var/jb/usr/bin/sweet-netconfig',
+            'ProgramArguments': ['/var/jb/usr/bin/sweet-netconfig'],
+            'RunAtLoad': True,
+            'StartInterval': 60,   # again after a configd restart
+            'UserName': 'root',
+            'StandardOutPath': '/dev/null',
+            'StandardErrorPath': '/dev/null',
+        }))
+    for name, job in jobs:
         daemons.pop('/var/jb/Library/LaunchDaemons/%s.plist' % name, None)
         daemons['/System/Library/LaunchDaemons/%s.plist' % name] = job
         path = os.path.join(sysld, name + '.plist')
@@ -139,7 +161,7 @@ def main():
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(lp, st.st_uid, st.st_gid)
     os.chmod(lp, st.st_mode & 0o7777)
-    print('launchd.plist: com.openssh.sshd, es.sweet.jb-firstboot (as /System/Library/LaunchDaemons)')
+    print('launchd.plist: %s (as /System/Library/LaunchDaemons)' % ', '.join(n for n, _ in jobs))
 
     if a.authorized_key:
         key = open(a.authorized_key).read()

@@ -267,3 +267,20 @@ Next steps: GX power through the GMU (legacy OOB `gfx_rail_on`, SPTPRAC
 enable) and the HFI v1 start (init, firmware version, perf and bus tables),
 which makes the GPU core registers reachable; then the zap shader (`a615_zap` via the SCM PAS calls), the
 SQE microcode and the first ring.
+
+## Internet over USB
+
+The phone reaches the internet through the Mac (2026-10-20: ping, DNS and
+`apt-get update` work):
+1. Mac: `sudo tools/sweet-nat-macos.sh` (IP forwarding plus a pf NAT rule
+   in `com.apple/sweet-nat`; lasts until the Mac reboots, `off` undoes it).
+2. Phone: `ue0` is created by the kernel outside IOKit, so configd never
+   makes a service for it (`addNetworkInterface` only looks at
+   IONetworkInterface). `tools/sweet-netconfig` publishes
+   `State:/Network/Service/sweet-usb/{IPv4,DNS}` (router 192.168.7.1, DNS
+   1.1.1.1 and 8.8.8.8); IPMonitor then installs the default route and
+   mDNSResponder gets the servers. The launchd job `es.sweet.netconfig`
+   runs it at boot and every 60 s (`sweet-jb-install.py --netconfig BIN`;
+   on the live phone it was added to the launchd cache by hand, with the
+   original kept in `/var/jb/var/sweet/launchd.plist.orig`).
+`route`, `ifconfig` and `netstat` come from Procursus `network-cmds`.
