@@ -57,7 +57,7 @@
  	gpu_wr(smmu, cb + 0x28, 0);                                    /* TTBR1 */
  	gpu_wr(smmu, cb + 0x2c, 0);
  	gpu_wr(smmu, cb + 0x30, 32u | (2u << 12) | (1u << 23));        /* TCR: T0SZ 32, OSH NC walk, EPD1 */
-@@ -522,29 +528,41 @@
+@@ -522,27 +528,39 @@
  	gpu_wr(smmu, cb + 0x618, 0);                                   /* TLBIALL */
  	gpu_wr(smmu, cb + 0x7f0, 0);                                   /* TLBSYNC */
  	if (!gpu_wait(smmu, cb + 0x7f4, 1u, 0, 1000)) {
@@ -96,18 +96,16 @@
 +	    gpu_rd(smmu, 0x48), gpu_rd(smmu, 0x50), gpu_rd(smmu, 0x54), idx,
  	    gpu_rd(smmu, cb + 0x58), gpu_rd(smmu, cb + 0x64), gpu_rd(smmu, cb + 0x60),
  	    gpu_rd(smmu, cb + 0x68));
- }
- 
++}
++
 +static void
 +gpu_smmu_gmu_faults(vm_offset_t smmu)
 +{
 +	gpu_smmu_faults(smmu, SMMU_GMU_IDX);
-+}
-+
+ }
+ 
  /* a6xx_gmu_rpmh_init for a618 (pdc_address_offset 0x30090), ending with
-  * a6xx_rpmh_stop. */
- static bool
-@@ -1013,8 +1031,366 @@
+@@ -1013,8 +1031,369 @@
  	    gpu_rd(core, 0x210 << 2), gpu_rd(core, 0x211 << 2), gpu_rd(core, 0x213 << 2),
  	    gpu_rd(core, 0x201 << 2), gpu_rd(core, 0x821 << 2));
  	return true;
@@ -163,8 +161,8 @@
 +gfx_sync(uint32_t off, uint32_t len)
 +{
 +	flush_dcache64((addr64_t)(gfx_mem_pa + GMU_TABLES + off), len, TRUE);
- }
- 
++}
++
 +static uint32_t
 +pm4_parity(uint32_t v)
 +{
@@ -261,10 +259,9 @@
 +{
 +	uint64_t res = 0;
 +	int64_t rc = scm_call(2, 7, 1, GPU_PAS_ID, 0, 0, &res);    /* PAS_IS_SUPPORTED */
++	/* On hardware this answers 0 for the GPU (TZ, with the hypervisor in
++	 * front); Android's pil-tz loader still goes ahead, so only log it. */
 +	gpu_log("scm pas_is_supported(%u): rc %lld result %llu", GPU_PAS_ID, rc, res);
-+	if (rc || !res) {
-+		return false;
-+	}
 +	uint8_t *mdt = NULL, *seg = NULL;
 +	size_t mdt_len = 0, seg_len = 0;
 +	if (gpu_load_file("/usr/share/firmware/joyeuse/gpu/a615_zap.mdt", &mdt, &mdt_len)) {
@@ -343,8 +340,8 @@
 +	}
 +	kfree_data(mdt, mdt_len);
 +	return ok;
-+}
-+
+ }
+ 
 +static void
 +gpu_gfx_tables(void)
 +{
@@ -443,15 +440,19 @@
 +
 +	/* Leave secure mode: through the zap shader if TrustZone takes it,
 +	 * otherwise the way Linux does on targets without one. */
-+	if (gpu_zap_load()) {
++	int zap = 1;
++	PE_parse_boot_argn("sweetgpuzap", &zap, sizeof(zap));
++	if (zap && gpu_zap_load()) {
 +		rb_pkt7(CP_SET_SECURE_MODE, 1);
 +		rb_out(0);
 +		if (!rb_kick("cp set_secure_mode 0")) {
 +			return false;
 +		}
 +	} else {
-+		core_wr(0xf400, 0);                   /* RBBM_SECVID_TRUST_CNTL */
-+		gpu_log("no zap shader; secvid_trust_cntl now 0x%08x", core_rd(0xf400));
++		/* Not RBBM_SECVID_TRUST_CNTL: on hardware the write to it stalled
++		 * this thread for good (a secured register). The write below then
++		 * shows what a CP still in secure mode does. */
++		gpu_log("no zap shader; GPU left in secure mode");
 +	}
 +
 +	/* First real work: the CP writes a value to memory through the SMMU. */
@@ -474,7 +475,7 @@
  static int sweet_gpu_sleep_chan;
  
  static void
-@@ -1044,8 +1420,9 @@
+@@ -1044,8 +1423,9 @@
  	if (sg.stage >= 4) {
  		vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
  		if (smmu != 0) {
