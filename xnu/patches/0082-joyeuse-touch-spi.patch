@@ -44,7 +44,7 @@
  	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_spi.c
-@@ -0,0 +1,1219 @@
+@@ -0,0 +1,1224 @@
 +/*
 + * JOYEUSE SE11 FIFO SPI / Focaltech FT8756 / Novatek NT36675 TDDI bring-up.
 + * Redmi Note 9 Pro (joyeuse, SM7125 atoll). sweet_touch_init() starts this
@@ -927,6 +927,11 @@
 +	}
 +	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18604};
 +	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		/* HW_CTL (bit 1): hardware gating (s_ahb, hwcg_bit 1 in gcc-atoll.c), so
++		 * CLK_OFF may read 1 while idle; Linux skips the halt check then too. */
++		if (jg_rd(jg.gcc, branches[i]) & 2u) {
++			continue;
++		}
 +		if (!jg_wait_clear(jg.gcc, branches[i], 1u << 31)) {
 +			printf("SWEET TOUCH SPI: GCC branch %#x halted (%#x)\n", branches[i],
 +			    jg_rd(jg.gcc, branches[i]));
