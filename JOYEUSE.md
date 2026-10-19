@@ -178,3 +178,19 @@ iPhone X). The IPSW has no paravirtualized one. A path, in steps:
 3. A Metal plugin on top (Darling's Indium: Metal on Vulkan 1.3, AIR to
    SPIR-V), plus the private interfaces QuartzCore uses. This is the
    hardest part.
+
+### Step 0: state probe (xnu 0084)
+
+`bsd/dev/sweet_gpu.c` (joyeuse only, `sweetgpu=0` skips it) runs after the
+USB probe and only reads. It prints the GCC branches in front of the GPU
+(`gpu_cfg_ahb` 0x171004, `gpu_memnoc_gfx` 0x17100c, `gpu_snoc_dvm_gfx`
+0x171018) and, only when `gpu_cfg_ahb` is running, the GPUCC CX and GX GDSCs
+(0x509106c, 0x509100c). It reads neither the GMU nor the core: they need
+GPUCC branch clocks that the first real driver step will turn on. Both
+`dpu1`/`dpu2` shims carry it; look for the `SWEET GPU:` lines.
+
+Firmware for the later steps comes from the MIUI 14.0.3.0 vendor image
+(`/vendor/firmware`): `a630_sqe.fw`, `a618_gmu.bin`, `a615_zap.mdt` and
+`.b00`-`.b02` (the zap shader the TrustZone loads; on atoll it is named
+a615). Like the touch firmware it stays outside git: extract it to
+`../gpufw/` next to the checkout.
