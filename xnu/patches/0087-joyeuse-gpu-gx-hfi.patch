@@ -1,0 +1,354 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -17,6 +17,10 @@
+  *      RSCC/PDC sequencer setup, the legacy ITCM+DTCM image from
+  *      /usr/share/firmware/joyeuse/gpu/a630_gmu.bin (sweetgmufw=618 picks
+  *      a618_gmu.bin), then CM3 out of reset until FW_INIT_RESULT 0xbabeface
++ *   5  GX power and HFI v1: GX/MX votes from the cmd-db gfx.lvl/mx.lvl
++ *      levels, BOOT_SLUMBER OOB (gfx rail on), SPTPRAC, HFI queues, the
++ *      init / version / perf table / bw table / test messages, then the
++ *      GPU_SET OOB that powers GX, and a read of the core's RBBM status
+  * 0 skips everything. A block is read only after the status bits of the
+  * clocks and power domain in front of it say it is reachable (an access to
+  * a gated block hangs the bus); the first failure stops the sequence.
+@@ -112,7 +116,7 @@
+ 	bool bus_ok;
+ } sg;
+ 
+-static char sweet_gpu_log[4096];
++static char sweet_gpu_log[8192];
+ static size_t sweet_gpu_log_len;
+ SYSCTL_STRING(_kern, OID_AUTO, sweetgpu, CTLFLAG_RD | CTLFLAG_LOCKED,
+     sweet_gpu_log, sizeof(sweet_gpu_log), "joyeuse GPU bring-up log");
+@@ -697,8 +701,320 @@
+ 		gpu_wr(sg.gmu, GMU_REG(0x5000), 1);   /* halt the CM3 again */
+ 	}
+ 	return up;
++}
++
++/* Stage 5: GX power through the GMU and the HFI v1 start. */
++
++/* cmd-db (Linux soc/qcom/cmd-db.c): ARC resource aux data is the list of
++ * RPMh voltage levels (vlvl) indexed by hardware level. */
++static vm_offset_t cmddb;
++static uint32_t cmddb_size;
++
++static uint32_t
++cmddb_rd32(uint32_t off)
++{
++	return gpu_rd(cmddb, off);
++}
++
++static uint16_t
++cmddb_rd16(uint32_t off)
++{
++	return (uint16_t)(gpu_rd(cmddb, off & ~3u) >> (8u * (off & 3u)));
++}
++
++static bool
++cmddb_map(void)
++{
++	if (cmddb) {
++		return true;
++	}
++	/* The AOP publishes the address in its message RAM; sc7180.dtsi has
++	 * the same region as reserved memory 0x80820000 + 0x20000. */
++	uint32_t pa = 0x80820000u, size = 0x20000u;
++	vm_offset_t dict = ml_io_map(0x0c3f0000u, 0x1000);
++	if (dict) {
++		uint32_t dpa = gpu_rd(dict, 0xc), dsize = gpu_rd(dict, 0x10);
++		if (dpa >= 0x80000000u && !(dpa & 3u) && dsize >= 144 && dsize <= 0x100000u) {
++			pa = dpa;
++			size = dsize;
++		}
++	}
++	cmddb = ml_io_map(pa, size);
++	cmddb_size = size;
++	if (!cmddb || cmddb_rd32(4) != 0x0c0330dbu) {
++		gpu_log("cmd-db at 0x%x: bad magic", pa);
++		cmddb = 0;
++		return false;
++	}
++	return true;
++}
++
++static unsigned
++cmddb_aux16(const char *id, uint16_t *out, unsigned max)
++{
++	uint32_t key[2] = { 0, 0 };
++	for (unsigned i = 0; i < 8 && id[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)id[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		if (!cmddb_rd16(h)) {
++			break;
++		}
++		uint32_t entries = 144u + cmddb_rd16(h + 2), aux = 144u + cmddb_rd16(h + 4);
++		unsigned count = cmddb_rd16(h + 6);
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + 24u * j;
++			if (e + 24u > cmddb_size || cmddb_rd32(e) != key[0] || cmddb_rd32(e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t len = cmddb_rd16(e + 20), at = aux + cmddb_rd16(e + 22);
++			unsigned n = 0;
++			for (; n < len / 2 && n < max && at + 2 * n + 2 <= cmddb_size; ++n) {
++				out[n] = cmddb_rd16(at + 2 * n);
++			}
++			return n;
++		}
++	}
++	return 0;
++}
++
++/* a6xx_gmu_rpmh_arc_votes_init: (vlvl << 16) | (secondary index << 8) |
++ * primary index, for each RPMh level the frequencies need. */
++static bool
++gpu_arc_votes(const char *pri_id, const uint16_t *levels, unsigned n, uint32_t *votes)
++{
++	uint16_t pri[16], sec[16];
++	unsigned np = cmddb_aux16(pri_id, pri, 16), ns = cmddb_aux16("mx.lvl", sec, 16);
++	if (!np || !ns) {
++		gpu_log("cmd-db: %s has %u levels, mx.lvl %u", pri_id, np, ns);
++		return false;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		unsigned p = 0, s = 0, j;
++		for (j = 0; j < np; ++j) {
++			if (pri[j] >= levels[i]) {
++				p = j;
++				break;
++			}
++		}
++		if (j == np) {
++			gpu_log("cmd-db: level %u not in %s", levels[i], pri_id);
++			return false;
++		}
++		for (j = 0; j < ns; ++j) {
++			if (sec[j] >= levels[i]) {
++				s = j;
++				break;
++			} else if (sec[j]) {
++				s = j;
++			}
++		}
++		votes[i] = ((uint32_t)pri[p] << 16) | (s << 8) | p;
++	}
++	gpu_log("cmd-db %s: %u levels (%u %u %u %u ...), mx.lvl %u", pri_id, np, pri[0], pri[1],
++	    pri[2], pri[3], ns);
++	return true;
++}
++
++/* sc7180.dtsi OPPs usable by speed bins 0-2 (opp-supported-hw 0x07), plus
++ * the "off" level first, as a6xx_gmu_build_freq_table does. */
++static const uint32_t gpu_khz[] = { 0, 180000, 267000, 355000, 430000, 565000, 650000, 800000 };
++static const uint16_t gpu_lvl[] = { 0, 48, 64, 128, 192, 256, 320, 384 };
++#define GPU_NLEVELS (sizeof(gpu_khz) / sizeof(gpu_khz[0]))
++static const uint32_t gmu_khz[] = { 0, 200000 };
++static const uint16_t gmu_lvl[] = { 0, 48 };
++
++/* HFI v1 queues: command queue at HFI + 4 KiB, response queue at + 8 KiB
++ * (gpu_hfi_table), 1024 dwords each. The GMU sees them uncached through the
++ * SMMU; the CPU cleans what it writes and invalidates what it reads. */
++#define HFI_QHDR(q)       (GMU_HFI_OFF + 24u + 48u * (q))
++#define HFI_QDATA(q)      (GMU_HFI_OFF + 0x1000u * ((q) + 1))
++#define HFI_QSIZE         1024u
++
++static uint32_t hfi_seq;
++
++static uint32_t
++gpu_get32(uint32_t off)
++{
++	return *(volatile uint32_t *)(gmu_mem + GMU_TABLES + off);
++}
++
++static void
++gmu_mem_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(gmu_mem_pa + GMU_TABLES + off), len, TRUE);
++}
++
++static bool
++hfi_send(uint32_t id, uint32_t *msg, uint32_t dwords, uint32_t *reply, unsigned reply_dwords)
++{
++	uint32_t seq = (++hfi_seq) % 0xfff;
++	msg[0] = (seq << 20) | (0u << 16) | (dwords << 8) | id;
++	gmu_mem_sync(GMU_HFI_OFF, 0x3000);
++	uint32_t w = gpu_get32(HFI_QHDR(0) + 0x2c), r = gpu_get32(HFI_QHDR(0) + 0x28);
++	uint32_t space = (r - w - 1) & (HFI_QSIZE - 1);
++	if (space < dwords) {
++		gpu_log("hfi: command queue full (r %u w %u)", r, w);
++		return false;
++	}
++	for (uint32_t i = 0; i < dwords; ++i) {
++		gpu_put32(HFI_QDATA(0) + 4 * w, msg[i]);
++		w = (w + 1) % HFI_QSIZE;
++	}
++	gpu_put32(HFI_QHDR(0) + 0x2c, w);
++	gmu_mem_sync(GMU_HFI_OFF, 0x3000);
++	gpu_wr(sg.gmu, GMU_REG(0x5194), 1);       /* HOST2GMU_INTR_SET */
++
++	if (!gpu_wait(sg.gmu, GMU_REG(0x5192), 1u, 1u, 5000)) {   /* GMU2HOST MSGQ */
++		gpu_log("hfi: msg %u seq %u: no response (gmu2host 0x%08x)", id, seq,
++		    gpu_rd(sg.gmu, GMU_REG(0x5192)));
++		return false;
++	}
++	gpu_wr(sg.gmu, GMU_REG(0x5191), 1u);      /* GMU2HOST_INTR_CLR MSGQ */
++	for (;;) {
++		gmu_mem_sync(GMU_HFI_OFF, 0x3000);
++		uint32_t rr = gpu_get32(HFI_QHDR(1) + 0x28), rw = gpu_get32(HFI_QHDR(1) + 0x2c);
++		if (rr == rw || rr >= HFI_QSIZE) {
++			gpu_log("hfi: msg %u seq %u: response queue empty (r %u w %u)", id, seq, rr, rw);
++			return false;
++		}
++		uint32_t resp[20] = { 0 };
++		uint32_t hdr = gpu_get32(HFI_QDATA(1) + 4 * rr), n = (hdr >> 8) & 0xff;
++		if (n == 0 || n > 20) {
++			gpu_log("hfi: bad response header 0x%08x", hdr);
++			return false;
++		}
++		for (uint32_t i = 0; i < n; ++i) {
++			resp[i] = gpu_get32(HFI_QDATA(1) + 4 * rr);
++			rr = (rr + 1) % HFI_QSIZE;
++		}
++		gpu_put32(HFI_QHDR(1) + 0x28, rr);
++		gmu_mem_sync(GMU_HFI_OFF, 0x3000);
++		if ((resp[0] & 0xff) == 100) {           /* F2H error */
++			gpu_log("hfi: GMU firmware error %u", resp[1]);
++			continue;
++		}
++		if (((resp[1] >> 20) & 0xfff) != seq) {
++			gpu_log("hfi: unexpected response 0x%08x/0x%08x", resp[0], resp[1]);
++			continue;
++		}
++		if (resp[2]) {
++			gpu_log("hfi: msg %u returned error %u", id, resp[2]);
++			return false;
++		}
++		for (unsigned i = 0; i < reply_dwords && i < 16; ++i) {
++			reply[i] = resp[3 + i];
++		}
++		return true;
++	}
+ }
+ 
++/* Legacy OOB request (a6xx_gmu_set_oob): set bit, wait for the ack bit. */
++static bool
++gmu_oob(const char *name, unsigned set, unsigned ack)
++{
++	gpu_wr(sg.gmu, GMU_REG(0x5194), 1u << set);
++	bool ok = gpu_wait(sg.gmu, GMU_REG(0x5192), 1u << ack, 1u << ack, 10000);
++	gpu_wr(sg.gmu, GMU_REG(0x5191), 1u << ack);
++	if (!ok) {
++		gpu_log("oob %s: no ack (gmu2host 0x%08x)", name, gpu_rd(sg.gmu, GMU_REG(0x5192)));
++	}
++	return ok;
++}
++
++static bool
++gpu_stage_gx_hfi(void)
++{
++	uint32_t gx_votes[GPU_NLEVELS], cx_votes[2];
++	if (!cmddb_map() || !gpu_arc_votes("gfx.lvl", gpu_lvl, GPU_NLEVELS, gx_votes) ||
++	    !gpu_arc_votes("cx.lvl", gmu_lvl, 2, cx_votes)) {
++		return false;
++	}
++	uint32_t boot_vote = gx_votes[GPU_NLEVELS - 1];
++	gpu_log("gx vote 0x%08x (%u kHz), cx vote 0x%08x", boot_vote, gpu_khz[GPU_NLEVELS - 1],
++	    cx_votes[1]);
++
++	/* a6xx_gmu_gfx_rail_on (legacy) */
++	gpu_wr(sg.gmu, GMU_REG(0x23f8), 0);                  /* BOOT_SLUMBER_OPTION */
++	gpu_wr(sg.gmu, GMU_REG(0x23f9), boot_vote & 0xff);   /* GX_VOTE_IDX */
++	gpu_wr(sg.gmu, GMU_REG(0x23fa), (boot_vote >> 8) & 0xff); /* MX_VOTE_IDX */
++	if (!gmu_oob("BOOT_SLUMBER", 22, 30)) {
++		return false;
++	}
++	/* a6xx_sptprac_enable */
++	gpu_wr(sg.gmu, GMU_REG(0x0081), 0x778000);           /* GX_SPTPRAC_POWER_CONTROL */
++	bool sptp = gpu_wait(sg.gmu, GMU_REG(0x50d0), 0x38, 0x28, 100);
++	gpu_log("gx rail on; sptprac %s (0x%08x), gx_gdscr 0x%08x, rpmh_state 0x%08x",
++	    sptp ? "on" : "NOT on", gpu_rd(sg.gmu, GMU_REG(0x50d0)),
++	    gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), gpu_rd(sg.gmu, GMU_REG(0x50ec)));
++	/* a6xx_gmu_hfi_start */
++	gpu_wr(sg.gmu, GMU_REG(0x5186), 1);                  /* HFI_CTRL_INIT */
++	if (!gpu_wait(sg.gmu, GMU_REG(0x5180), 1u, 1u, 10000)) {
++		gpu_log("hfi queues did not start (ctrl_status 0x%08x)", gpu_rd(sg.gmu, GMU_REG(0x5180)));
++		return false;
++	}
++	/* a6xx_hfi_start_v1 */
++	uint32_t init[5] = { 0, 0, GMU_IOVA + GMU_DEBUG_OFF, 0x4000, 1 /* GMU_COLD_BOOT */ };
++	uint32_t ver[2] = { 0, (1u << 28) | (1u << 19) | (1u << 17) }, fw = 0;
++	if (!hfi_send(0, init, 5, NULL, 0) || !hfi_send(1, ver, 2, &fw, 1)) {
++		return false;
++	}
++	gpu_log("hfi up: GMU firmware version 0x%08x, hfi_version_info 0x%08x", fw,
++	    gpu_rd(sg.gmu, GMU_REG(0x5181)));
++	uint32_t perf[3 + 2 * 16 + 2 * 4] = { 0 };
++	perf[1] = GPU_NLEVELS;
++	perf[2] = 2;
++	for (unsigned i = 0; i < GPU_NLEVELS; ++i) {
++		perf[3 + 2 * i] = gx_votes[i];
++		perf[4 + 2 * i] = gpu_khz[i];
++	}
++	for (unsigned i = 0; i < 2; ++i) {
++		perf[3 + 32 + 2 * i] = cx_votes[i];
++		perf[4 + 32 + 2 * i] = gmu_khz[i];
++	}
++	/* a618_build_bw_table: one "off" level, the 618 GMU does no bus scaling. */
++	uint32_t bw[6 + 6 + 12 + 8 + 128] = { 0 };
++	bw[1] = 1;                        /* bw_level_num */
++	bw[2] = 1;                        /* cnoc_cmds_num */
++	bw[3] = 3;                        /* ddr_cmds_num */
++	bw[4] = 0x01;                     /* cnoc_wait_bitmask */
++	bw[5] = 0x01;                     /* ddr_wait_bitmask */
++	bw[6] = 0x5007c;                  /* cnoc_cmds_addrs[0] */
++	bw[12] = 0x40000000;              /* cnoc_cmds_data[0][0] */
++	bw[18] = 0x60000001;              /* cnoc_cmds_data[1][0] */
++	bw[24] = 0x50000;                 /* ddr_cmds_addrs */
++	bw[25] = 0x5003c;
++	bw[26] = 0x5000c;
++	bw[32] = bw[33] = bw[34] = 0x40000000;   /* ddr_cmds_data[0][0..2] */
++	uint32_t test[1] = { 0 };
++	if (!hfi_send(4, perf, sizeof(perf) / 4, NULL, 0) ||
++	    !hfi_send(3, bw, sizeof(bw) / 4, NULL, 0) || !hfi_send(5, test, 1, NULL, 0)) {
++		return false;
++	}
++	gpu_log("hfi: perf table (%u gpu levels), bw table and test accepted", (unsigned)GPU_NLEVELS);
++
++	/* a6xx_hw_init starts with the GPU_SET OOB: the GMU powers GX up. */
++	if (!gmu_oob("GPU_SET", 16, 24)) {
++		return false;
++	}
++	gpu_log("gpu set: gx_gdscr 0x%08x sptprac 0x%08x rpmh_state 0x%08x",
++	    gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), gpu_rd(sg.gmu, GMU_REG(0x50d0)),
++	    gpu_rd(sg.gmu, GMU_REG(0x50ec)));
++	if (!(gpu_rd(sg.gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++		gpu_log("GX GDSC still off; core not read");
++		return false;
++	}
++	vm_offset_t core = ml_io_map(0x05000000u, 0x40000);
++	if (!core) {
++		return false;
++	}
++	gpu_log("core: rbbm_status 0x%08x status1 0x%08x status3 0x%08x int0 0x%08x cp_hw_fault 0x%08x",
++	    gpu_rd(core, 0x210 << 2), gpu_rd(core, 0x211 << 2), gpu_rd(core, 0x213 << 2),
++	    gpu_rd(core, 0x201 << 2), gpu_rd(core, 0x821 << 2));
++	return true;
++}
++
+ static int sweet_gpu_sleep_chan;
+ 
+ static void
+@@ -728,7 +1044,9 @@
+ 	if (sg.stage >= 4) {
+ 		vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+ 		if (smmu != 0) {
+-			(void)gpu_stage_gmu_boot(smmu);
++			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5) {
++				(void)gpu_stage_gx_hfi();
++			}
+ 		}
+ 	}
+ 	gpu_log("done");
