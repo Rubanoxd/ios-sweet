@@ -1,0 +1,405 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -12,6 +12,11 @@
+  *   2  power the CX side: GCC GPU votes and branches, CX GDSC, GPUCC cxo /
+  *      gmu (200 MHz from GPLL0 div) / snoc_dvm clocks, then read the GMU
+  *   3  also read the adreno SMMU (global state, stream match, context banks)
++ *   4  boot the GMU firmware: an SMMU context bank for the GMU's stream 5
++ *      with its uncached memory at 0x60000000 (dummy, debug, log, HFI), the
++ *      RSCC/PDC sequencer setup, the legacy ITCM+DTCM image from
++ *      /usr/share/firmware/joyeuse/gpu/a630_gmu.bin (sweetgmufw=618 picks
++ *      a618_gmu.bin), then CM3 out of reset until FW_INIT_RESULT 0xbabeface
+  * 0 skips everything. A block is read only after the status bits of the
+  * clocks and power domain in front of it say it is reachable (an access to
+  * a gated block hangs the bus); the first failure stops the sequence.
+@@ -29,9 +34,16 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <kern/kalloc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
+ #include <stdarg.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+@@ -63,7 +75,26 @@
+ 
+ #define SMMU_PA           0x05040000u
+ #define SMMU_SIZE         0x00010000u
++#define SMMU_GMU_SID      5u          /* sc7180.dtsi gmu iommus <&adreno_smmu 5> */
++#define SMMU_GMU_IDX      4u          /* SMR, S2CR and context bank used for it */
+ 
++#define PDC_PA            0x0b290000u /* gmu_pdc */
++#define PDC_SIZE          0x00010000u
++#define PDC_SEQ_PA        0x0b490000u /* gmu_pdc_seq */
++#define PDC_SEQ_SIZE      0x00001000u
++#define PDC_REG(dw)       ((dw) << 2)
++
++/* GMU address space of its uncached memory (a6xx_gmu.c, legacy GMU). */
++#define GMU_IOVA          0x60000000u
++#define GMU_DUMMY_OFF     0x0000u     /* 4 KiB */
++#define GMU_DEBUG_OFF     0x1000u     /* 16 KiB */
++#define GMU_LOG_OFF       0x5000u     /* 16 KiB */
++#define GMU_HFI_OFF       0x9000u     /* 16 KiB */
++#define GMU_MEM_SIZE      0xd000u
++#define GMU_TABLES        0x3000u     /* L1, L2, L3 page tables before it */
++#define GMU_FW_MAX        0x8000u     /* ITCM 16 KiB + DTCM 16 KiB */
++#define A618_GMU_CHIPID   0x06018000u /* 0x06010800 in the GMU's layout */
++
+ #define CLK_ENABLE        (1u << 0)
+ #define CLK_OFF           (1u << 31)
+ #define GDSC_SW_COLLAPSE  (1u << 0)
+@@ -350,9 +381,324 @@
+ 		gpu_log("smmu cb%u cbar 0x%08x sctlr 0x%08x ttbr0 0x%08x%08x fsr 0x%08x", i, cbar, sctlr,
+ 		    gpu_rd(smmu, (uint32_t)off + 0x24), gpu_rd(smmu, (uint32_t)off + 0x20),
+ 		    gpu_rd(smmu, (uint32_t)off + 0x58));
++	}
++}
++
++/* Stage 4: GMU firmware boot. */
++
++static int
++gpu_load_file(const char *path, uint8_t **out, size_t *out_len)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int resid = 0;
++	uint8_t *buf = NULL;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_size(vp, &size, ctx);
++		if (!err && (size < 64 || size > (off_t)GMU_FW_MAX || (size & 3))) {
++			err = EFBIG;
++		}
++		if (!err) {
++			buf = kalloc_data((vm_size_t)size, Z_WAITOK);
++			err = buf ? 0 : ENOMEM;
++		}
++		if (!err) {
++			err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	(void)vfs_context_rele(ctx);
++	if (err) {
++		if (buf) {
++			kfree_data(buf, (vm_size_t)size);
++		}
++		gpu_log("cannot read %s: %d", path, err);
++		return err;
++	}
++	*out = buf;
++	*out_len = (size_t)size;
++	return 0;
++}
++
++static vm_offset_t gmu_mem;     /* page tables, then the GMU's memory */
++static uint64_t gmu_mem_pa;
++
++static void
++gpu_put32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gmu_mem + GMU_TABLES + off) = v;
++}
++
++/* AArch64 stage-1 tables, 4 KiB granule, 32-bit input (T0SZ 32, start at
++ * level 1): GMU_IOVA..+GMU_MEM_SIZE -> gmu_mem_pa + GMU_TABLES. Attr index 0
++ * (MAIR 0x44, normal non-cacheable: the CPU cleans to PoC instead), outer
++ * shareable, AF, nG, read/write at any privilege (like io-pgtable-arm). */
++static void
++gpu_smmu_tables(void)
++{
++	uint64_t *l1 = (uint64_t *)gmu_mem;
++	uint64_t *l2 = (uint64_t *)(gmu_mem + 0x1000);
++	uint64_t *l3 = (uint64_t *)(gmu_mem + 0x2000);
++	l1[(GMU_IOVA >> 30) & 0x3] = (gmu_mem_pa + 0x1000) | 0x3;
++	l2[(GMU_IOVA >> 21) & 0x1ff] = (gmu_mem_pa + 0x2000) | 0x3;
++	for (uint32_t i = 0; i < GMU_MEM_SIZE / 0x1000; ++i) {
++		l3[((GMU_IOVA >> 12) & 0x1ff) + i] = (gmu_mem_pa + GMU_TABLES + i * 0x1000ull) |
++		    0x3 | (1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11);
++	}
++}
++
++/* HFI queue table (a6xx_hfi.c a6xx_hfi_init): command queue 0 at +4 KiB,
++ * response queue (id 4 on a legacy GMU) at +8 KiB. */
++static void
++gpu_hfi_table(void)
++{
++	uint32_t hfi = GMU_HFI_OFF;
++	gpu_put32(hfi + 0x00, 0);              /* version */
++	gpu_put32(hfi + 0x04, 24 + 2 * 48);    /* size */
++	gpu_put32(hfi + 0x08, 24 >> 2);        /* qhdr0_offset */
++	gpu_put32(hfi + 0x0c, 48 >> 2);        /* qhdr_size */
++	gpu_put32(hfi + 0x10, 2);              /* num_queues */
++	gpu_put32(hfi + 0x14, 2);              /* active_queues */
++	for (uint32_t q = 0; q < 2; ++q) {
++		uint32_t h = hfi + 24 + q * 48;
++		gpu_put32(h + 0x00, 1);                                   /* status */
++		gpu_put32(h + 0x04, GMU_IOVA + hfi + 0x1000 * (q + 1));   /* iova */
++		gpu_put32(h + 0x08, 10u << 8 | (q ? 4u : 0u));            /* type */
++		gpu_put32(h + 0x0c, 0x1000 >> 2);                         /* size */
++		gpu_put32(h + 0x10, 0);
++		gpu_put32(h + 0x14, 0);
++		gpu_put32(h + 0x18, 1);                                   /* rx_watermark */
++		gpu_put32(h + 0x1c, 1);                                   /* tx_watermark */
++		gpu_put32(h + 0x20, 1);                                   /* rx_request */
++		gpu_put32(h + 0x24, 0);
++		gpu_put32(h + 0x28, 0);
++		gpu_put32(h + 0x2c, 0);
++	}
++}
++
++static bool
++gpu_smmu_gmu_context(vm_offset_t smmu)
++{
++	uint32_t id1 = gpu_rd(smmu, 0x24);
++	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	unsigned numpage = 1u << (((id1 >> 28) & 0x7u) + 1);
++	uint32_t cb = (uint32_t)((numpage + SMMU_GMU_IDX) << pgshift);
++	uint32_t gr1 = 1u << pgshift;
++	if ((id1 & 0xffu) <= SMMU_GMU_IDX || (gpu_rd(smmu, 0x20) & 0xffu) <= SMMU_GMU_IDX ||
++	    cb + 0x1000 > SMMU_SIZE) {
++		gpu_log("smmu has no bank %u in the window (idr1 0x%08x)", SMMU_GMU_IDX, id1);
++		return false;
++	}
++	if (gpu_rd(smmu, 0x800 + 4 * SMMU_GMU_IDX) & (1u << 31)) {
++		gpu_log("smmu smr%u already in use", SMMU_GMU_IDX);
++		return false;
++	}
++	/* Context bank (arm-smmu.c arm_smmu_write_context_bank): AArch64
++	 * format, stage 1 with stage 2 bypass, VMID = index + 1. */
++	gpu_wr(smmu, cb + 0x0, 0);                                     /* SCTLR off */
++	gpu_wr(smmu, gr1 + 0x800 + 4 * SMMU_GMU_IDX, 1u);              /* CBA2R VA64 */
++	gpu_wr(smmu, gr1 + 4 * SMMU_GMU_IDX,                           /* CBAR */
++	    (1u << 16) | (0xfu << 12) | (3u << 8) | (SMMU_GMU_IDX + 1));
++	gpu_wr(smmu, cb + 0x10, 0x1);                                  /* TCR2: 36-bit PA */
++	gpu_wr(smmu, cb + 0x20, (uint32_t)gmu_mem_pa);                 /* TTBR0, ASID 0 */
++	gpu_wr(smmu, cb + 0x24, (uint32_t)(gmu_mem_pa >> 32));
++	gpu_wr(smmu, cb + 0x28, 0);                                    /* TTBR1 */
++	gpu_wr(smmu, cb + 0x2c, 0);
++	gpu_wr(smmu, cb + 0x30, 32u | (2u << 12) | (1u << 23));        /* TCR: T0SZ 32, OSH NC walk, EPD1 */
++	gpu_wr(smmu, cb + 0x38, 0x0004ff44u);                          /* MAIR0: NC, WB, dev */
++	gpu_wr(smmu, cb + 0x3c, 0);
++	gpu_wr(smmu, cb + 0x58, gpu_rd(smmu, cb + 0x58));              /* clear FSR */
++	gpu_wr(smmu, cb + 0x0, 0x67u);                       /* M TRE AFE CFRE CFIE */
++	gpu_wr(smmu, cb + 0x618, 0);                                   /* TLBIALL */
++	gpu_wr(smmu, cb + 0x7f0, 0);                                   /* TLBSYNC */
++	if (!gpu_wait(smmu, cb + 0x7f4, 1u, 0, 1000)) {
++		gpu_log("smmu cb%u TLB sync stuck", SMMU_GMU_IDX);
++	}
++	/* Stream mapping: S2CR (translate, this bank) before the valid SMR. */
++	gpu_wr(smmu, 0xc00 + 4 * SMMU_GMU_IDX, SMMU_GMU_IDX);
++	gpu_wr(smmu, 0x800 + 4 * SMMU_GMU_IDX, (1u << 31) | SMMU_GMU_SID);
++	gpu_log("smmu cb%u at 0x%x: sid %u -> ttbr0 0x%llx, sctlr 0x%08x", SMMU_GMU_IDX, cb,
++	    SMMU_GMU_SID, gmu_mem_pa, gpu_rd(smmu, cb));
++	return true;
++}
++
++static void
++gpu_smmu_gmu_faults(vm_offset_t smmu)
++{
++	uint32_t id1 = gpu_rd(smmu, 0x24);
++	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	unsigned numpage = 1u << (((id1 >> 28) & 0x7u) + 1);
++	uint32_t cb = (uint32_t)((numpage + SMMU_GMU_IDX) << pgshift);
++	gpu_log("smmu gfsr 0x%08x gfsynr0 0x%08x gfsynr1 0x%08x cb%u fsr 0x%08x far 0x%08x%08x fsynr0 0x%08x",
++	    gpu_rd(smmu, 0x48), gpu_rd(smmu, 0x50), gpu_rd(smmu, 0x54), SMMU_GMU_IDX,
++	    gpu_rd(smmu, cb + 0x58), gpu_rd(smmu, cb + 0x64), gpu_rd(smmu, cb + 0x60),
++	    gpu_rd(smmu, cb + 0x68));
++}
++
++/* a6xx_gmu_rpmh_init for a618 (pdc_address_offset 0x30090), ending with
++ * a6xx_rpmh_stop. */
++static bool
++gpu_rpmh_init(void)
++{
++	vm_offset_t pdc = ml_io_map(PDC_PA, PDC_SIZE), seq = ml_io_map(PDC_SEQ_PA, PDC_SEQ_SIZE);
++	if (pdc == 0 || seq == 0) {
++		gpu_log("PDC map failed");
++		return false;
+ 	}
++	gpu_log("pdc enable 0x%08x seq_start 0x%08x before", gpu_rd(pdc, PDC_REG(0x1140)),
++	    gpu_rd(pdc, PDC_REG(0x1148)));
++	gpu_wr(sg.gmu, GMU_RSCC(0x0004), 1u << 24);   /* RSC_STATUS0_DRV0 */
++	gpu_wr(sg.gmu, GMU_RSCC(0x000b), 1);          /* PDC_SLAVE_ID_DRV0 */
++	gpu_wr(sg.gmu, GMU_RSCC(0x000e), 0);          /* HIDDEN_TCS_CMD0_DATA */
++	gpu_wr(sg.gmu, GMU_RSCC(0x000d), 0);          /* HIDDEN_TCS_CMD0_ADDR */
++	gpu_wr(sg.gmu, GMU_RSCC(0x0010), 0);
++	gpu_wr(sg.gmu, GMU_RSCC(0x000f), 0);
++	gpu_wr(sg.gmu, GMU_RSCC(0x0012), 0x80000000u);
++	gpu_wr(sg.gmu, GMU_RSCC(0x0011), 0);
++	gpu_wr(sg.gmu, GMU_RSCC(0x0100), 0);          /* OVERRIDE_START_ADDR */
++	gpu_wr(sg.gmu, GMU_RSCC(0x0008), 0x4520);     /* PDC_SEQ_START_ADDR */
++	gpu_wr(sg.gmu, GMU_RSCC(0x0009), 0x4510);     /* PDC_MATCH_VALUE_LO */
++	gpu_wr(sg.gmu, GMU_RSCC(0x000a), 0x4514);     /* PDC_MATCH_VALUE_HI */
++	static const uint32_t rsc_seq[] = { 0xa7a506a0, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
++	for (unsigned i = 0; i < 5; ++i) {
++		gpu_wr(sg.gmu, GMU_RSCC(0x0180 + i), rsc_seq[i]);   /* SEQ_MEM_0_DRV0 */
++	}
++	static const uint32_t pdc_seq[] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
++	for (unsigned i = 0; i < 5; ++i) {
++		gpu_wr(seq, PDC_REG(i), pdc_seq[i]);
++	}
++	/* TCS1 (sleep) and TCS3 (wake): msgid, addr, data triples. */
++	static const struct { uint32_t base; uint32_t data[3]; } tcs[] = {
++		{ 0x1572, { 1, 0, 0 } },
++		{ 0x15d6, { 2, 2, 3 } },
++	};
++	static const uint32_t addr[3] = { 0x30010, 0x30000, 0x30090 };
++	for (unsigned t = 0; t < 2; ++t) {
++		uint32_t b = tcs[t].base;
++		gpu_wr(pdc, PDC_REG(b + 1), 7);               /* CMD_ENABLE_BANK */
++		gpu_wr(pdc, PDC_REG(b + 2), 0);               /* CMD_WAIT_FOR_CMPL_BANK */
++		gpu_wr(pdc, PDC_REG(b + 0), 0);               /* CONTROL */
++		for (unsigned c = 0; c < 3; ++c) {
++			gpu_wr(pdc, PDC_REG(b + 3 + 4 * c), 0x10108);       /* CMDn_MSGID */
++			gpu_wr(pdc, PDC_REG(b + 4 + 4 * c), addr[c]);       /* CMDn_ADDR */
++			gpu_wr(pdc, PDC_REG(b + 5 + 4 * c), tcs[t].data[c]); /* CMDn_DATA */
++		}
++	}
++	gpu_wr(pdc, PDC_REG(0x1148), 0);              /* GPU_SEQ_START_ADDR */
++	gpu_wr(pdc, PDC_REG(0x1140), 0x80000001u);    /* GPU_ENABLE_PDC */
++	/* a6xx_rpmh_stop */
++	gpu_wr(sg.gmu, GMU_REG(0x9307), 1);
++	bool off = gpu_wait(sg.gmu, GMU_RSCC(0x0004), 1u << 16, 1u << 16, 10000);
++	gpu_wr(sg.gmu, GMU_REG(0x9307), 0);
++	gpu_log("rpmh init done; rsc %s (status0 0x%08x)", off ? "off" : "did not power off",
++	    gpu_rd(sg.gmu, GMU_RSCC(0x0004)));
++	return true;
+ }
+ 
++static bool
++gpu_stage_gmu_boot(vm_offset_t smmu)
++{
++	int which = 630;
++	if (sg.gmu == 0) {
++		return false;
++	}
++	PE_parse_boot_argn("sweetgmufw", &which, sizeof(which));
++	const char *path = which == 618 ? "/usr/share/firmware/joyeuse/gpu/a618_gmu.bin" :
++	    "/usr/share/firmware/joyeuse/gpu/a630_gmu.bin";
++	uint8_t *fw = NULL;
++	size_t fw_len = 0;
++	if (gpu_load_file(path, &fw, &fw_len)) {
++		return false;
++	}
++	gpu_log("%s: %zu bytes, sp 0x%08x reset 0x%08x", path, fw_len,
++	    *(const uint32_t *)fw, *(const uint32_t *)(fw + 4));
++
++	if (kmem_alloc_contig(kernel_map, &gmu_mem, GMU_TABLES + GMU_MEM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		gpu_log("no GMU memory");
++		kfree_data(fw, fw_len);
++		return false;
++	}
++	gmu_mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gmu_mem));
++	gpu_smmu_tables();
++	gpu_hfi_table();
++	flush_dcache64((addr64_t)gmu_mem_pa, GMU_TABLES + GMU_MEM_SIZE, TRUE);
++	if (!gpu_smmu_gmu_context(smmu)) {
++		kfree_data(fw, fw_len);
++		return false;
++	}
++
++	/* Interrupts stay masked: nothing in XNU handles them yet. */
++	gpu_wr(sg.gmu, GMU_REG(0x9304), ~0u);     /* AO_HOST_INTERRUPT_CLR */
++	gpu_wr(sg.gmu, GMU_REG(0x9306), ~0u);     /* AO_HOST_INTERRUPT_MASK */
++	gpu_wr(sg.gmu, GMU_REG(0x5191), ~0u);     /* GMU2HOST_INTR_CLR */
++	gpu_wr(sg.gmu, GMU_REG(0x5193), ~0u);     /* GMU2HOST_INTR_MASK */
++
++	if (!gpu_rpmh_init()) {
++		kfree_data(fw, fw_len);
++		return false;
++	}
++
++	/* a6xx_gmu_fw_start, cold boot. */
++	gpu_wr(sg.gmu, GMU_REG(0x51cc), 1);       /* GENERAL_7: TCM retention */
++	gpu_wr(sg.gmu, GMU_REG(0x9307), 1u << 1); /* a6xx_rpmh_start */
++	bool ack = gpu_wait(sg.gmu, GMU_REG(0x9308), 1u << 1, 1u << 1, 10000);
++	bool idle = ack && gpu_wait(sg.gmu, GMU_RSCC(0x0101), ~0u, 0, 10000);
++	gpu_wr(sg.gmu, GMU_REG(0x9307), 0);
++	if (!ack || !idle) {
++		gpu_log("GPU RSC %s (ack 0x%08x seq_busy 0x%08x)", ack ? "sequence stuck" : "no ack",
++		    gpu_rd(sg.gmu, GMU_REG(0x9308)), gpu_rd(sg.gmu, GMU_RSCC(0x0101)));
++		kfree_data(fw, fw_len);
++		return false;
++	}
++	for (size_t i = 0; i < fw_len; i += 4) {   /* ITCM, then DTCM */
++		gpu_wr(sg.gmu, GMU_REG(0x0c00) + (uint32_t)i, *(const uint32_t *)(fw + i));
++	}
++	kfree_data(fw, fw_len);
++	gpu_wr(sg.gmu, GMU_REG(0x501c), 0);       /* FW_INIT_RESULT */
++	gpu_wr(sg.gmu, GMU_REG(0x5001), 0x02);    /* BOOT_CONFIG */
++	gpu_wr(sg.gmu, GMU_REG(0x5185), GMU_IOVA + GMU_HFI_OFF);   /* HFI_QTBL_ADDR */
++	gpu_wr(sg.gmu, GMU_REG(0x5184), 1);       /* HFI_QTBL_INFO */
++	gpu_wr(sg.gmu, GMU_REG(0x9311), (1u << 31) | (0xau << 18) | 0xa0u);   /* AHB_FENCE_RANGE_0 */
++	gpu_wr(sg.gmu, GMU_REG(0x502d), 0x4052);  /* CM3_CFG */
++	gpu_wr(sg.gmu, GMU_REG(0x5182), A618_GMU_CHIPID);   /* HFI_SFR_ADDR */
++	gpu_wr(sg.gmu, GMU_REG(0x5100), (GMU_IOVA + GMU_LOG_OFF) | (0x4000 / 0x1000 - 1));
++	/* a6xx_gmu_power_config, idle level "active". */
++	gpu_wr(sg.gmu, GMU_REG(0x4c0f), 1);       /* SYS_BUS_CONFIG */
++	gpu_wr(sg.gmu, GMU_REG(0x4c00), 1);       /* ICACHE_CONFIG */
++	gpu_wr(sg.gmu, GMU_REG(0x4c01), 1);       /* DCACHE_CONFIG */
++	gpu_wr(sg.gmu, GMU_REG(0x50c0), 0x9c40400);   /* PWR_COL_INTER_FRAME_CTRL */
++	gpu_set(sg.gmu, GMU_REG(0x50e8), (1u << 0) | (1u << 4) | (1u << 8) | (1u << 9) |
++	    (1u << 10) | (1u << 11));             /* RPMH_CTRL votes */
++	/* a6xx_gmu_start */
++	uint32_t ver = gpu_rd(sg.gmu, GMU_REG(0x1c00 + 0xff8));
++	uint32_t mask = 0xffffffffu, want = 0xbabefaceu;
++	if (ver > 0x20010004) {
++		mask = 0x1ff;
++		want = 0x100;
++	}
++	gpu_wr(sg.gmu, GMU_REG(0x5000), 1);       /* CM3_SYSRESET */
++	gpu_wr(sg.gmu, GMU_REG(0x5101), 0);       /* PWR_COL_CP_RESP: log wptr */
++	gpu_wr(sg.gmu, GMU_REG(0x5000), 0);
++	bool up = gpu_wait(sg.gmu, GMU_REG(0x501c), mask, want, 10000);
++	uint32_t res = gpu_rd(sg.gmu, GMU_REG(0x501c));
++	gpu_log("gmu fw %s: init result 0x%08x (want 0x%x, version 0x%08x) fw_busy 0x%08x "
++	    "hfi_ctrl 0x%08x gmu2host 0x%08x ao_int 0x%08x", up ? "UP" : "timed out", res, want, ver,
++	    gpu_rd(sg.gmu, GMU_REG(0x501a)), gpu_rd(sg.gmu, GMU_REG(0x5180)),
++	    gpu_rd(sg.gmu, GMU_REG(0x5192)), gpu_rd(sg.gmu, GMU_REG(0x9305)));
++	gpu_smmu_gmu_faults(smmu);
++	if (!up) {
++		gpu_wr(sg.gmu, GMU_REG(0x5000), 1);   /* halt the CM3 again */
++	}
++	return up;
++}
++
+ static int sweet_gpu_sleep_chan;
+ 
+ static void
+@@ -373,12 +719,18 @@
+ 	}
+ 	gpu_stage_gmu_read();
+ 	if (sg.stage >= 3) {
+-		if (sg.bus_ok) {
+-			gpu_stage_smmu_read();
+-		} else {
++		if (!sg.bus_ok) {
+ 			gpu_log("GCC bus branches off; SMMU not read");
++			return;
+ 		}
++		gpu_stage_smmu_read();
+ 	}
++	if (sg.stage >= 4) {
++		vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++		if (smmu != 0) {
++			(void)gpu_stage_gmu_boot(smmu);
++		}
++	}
+ 	gpu_log("done");
+ }
+ 
