@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-10-19: joyeuse (Redmi Note 9 Pro) port prepared on branch `joyeuse` <<<
+
+See `JOYEUSE.md`: `mkadt.py --board joyeuse`, xnu patch **0082** (SE11 SPI touch, FT8756/NT36675 firmware download; host-tested with `tools/touch-spi-test/run.sh`, compiled against the 0081 CI build tree with `tools/xnu-cc.py`), `tools/joyeuse-touch-fw.py`, `sweet-root-tweaks.py --touch-fw`. Not built by CI and not booted yet. sweet behaviour is unchanged (no `/sweet-touch` node in its ADT).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

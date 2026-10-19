@@ -157,6 +157,7 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `tools/sweet-crash.py` | Symbolicate console crash reports |
 | `tools/xnu-cc.py` | Local single-file compile check from a CI log |
 | `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
+| `JOYEUSE.md`, `tools/joyeuse-touch-fw.py`, `tools/touch-spi-test/` | Redmi Note 9 Pro (joyeuse) port: hardware differences, touch firmware, touch protocol host test |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
 | `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
 

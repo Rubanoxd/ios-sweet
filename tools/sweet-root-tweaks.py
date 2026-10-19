@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--touch-fw DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -26,6 +26,10 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+  touch firmware  --touch-fw DIR (joyeuse only): copies the panel touch IC
+                  blobs from the phone's /vendor/firmware to
+                  /usr/share/firmware/joyeuse, where bsd/dev/sweet_touch_spi.c
+                  (xnu patch 0082) loads them on every boot
 """
 import glob, os, plistlib, shutil, sys
 
@@ -122,10 +126,37 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+TOUCH_FW = ('focaltech_ts_fw_huaxing.bin', 'novatek_ts_tianma_fw.bin')
+
+
+def touch_firmware(root, src):
+    dst = os.path.join(root, 'usr/share/firmware/joyeuse')
+    os.makedirs(dst, mode=0o755, exist_ok=True)
+    for name in TOUCH_FW:
+        path = os.path.join(src, name)
+        if not os.path.exists(path):
+            print('touch firmware missing (that panel will have no touch):', name)
+            continue
+        shutil.copyfile(path, os.path.join(dst, name))
+        os.chown(os.path.join(dst, name), 0, 0)
+        os.chmod(os.path.join(dst, name), 0o644)
+        print('touch firmware', name)
+
+
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    fw = None
+    if '--touch-fw' in args:
+        i = args.index('--touch-fw')
+        fw = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+        if not fw or not os.path.isdir(fw):
+            sys.exit(__doc__)
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
+    if fw:
+        touch_firmware(root, fw)
     launchd(root)
     containers(root)
     activation(root)

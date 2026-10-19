@@ -1,0 +1,1266 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_touch_spi.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,12 +14,14 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_touch_spi_init(void);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+@@ -648,6 +650,16 @@
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	/* Other boards name their touch hardware in the ADT (tools/mkadt.py --board). */
++	DTEntry node;
++	char const *compat = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &size) == kSuccess &&
++	    size >= sizeof("xiaomi,joyeuse-spi") && !strcmp(compat, "xiaomi,joyeuse-spi")) {
++		sweet_touch_spi_init(); /* bsd/dev/sweet_touch_spi.c */
+ 		return;
+ 	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+--- /dev/null
++++ b/bsd/dev/sweet_touch_spi.c
+@@ -0,0 +1,1219 @@
++/*
++ * JOYEUSE SE11 FIFO SPI / Focaltech FT8756 / Novatek NT36675 TDDI bring-up.
++ * Redmi Note 9 Pro (joyeuse, SM7125 atoll). sweet_touch_init() starts this
++ * instead of the sweet I2C driver when the ADT has /sweet-touch with
++ * compatible "xiaomi,joyeuse-spi" (tools/mkadt.py --board joyeuse).
++ * Polled like sweet_touch.c: one kernel thread, no interrupt wiring.
++ *
++ * The touch IC is part of the LCD driver chip and depends on the panel:
++ * Huaxing panels carry a Focaltech FT8756, Tianma panels a Novatek NT36675.
++ * Both are flashless, so the host downloads their firmware into IC SRAM after
++ * every reset. The blobs come from the phone's own vendor partition and are
++ * read from the iOS root at run time, never built into the kernel:
++ *   /usr/share/firmware/joyeuse/focaltech_ts_fw_huaxing.bin
++ *   /usr/share/firmware/joyeuse/novatek_ts_tianma_fw.bin
++ * Bus framing and download sequences follow Xiaomi's miatoll drivers
++ * (MiCode curtana-q-oss: drivers/input/touchscreen/{ft8756_spi,nt36xxx_spi}).
++ *
++ * Touch rails (L18A vddio, LCDB LAB/IBB) belong to the panel and ABL leaves
++ * them on, so unlike sweet there is no RPMh vote and no PMIC access. MMIO
++ * writes: GCC votes for QUP wrapper 1 / SE11 (and SE11's RCG when it is not
++ * in DFS mode), TLMM config of GPIO 8 (reset) and 53-56 (SPI), SE11.
++ *
++ * The protocol half below the GENI section also builds on a host
++ * (SWEET_TOUCH_SPI_HOST, tools/touch-spi-test/) against simulated ICs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET_TOUCH_SPI_HOST)
++#if !defined(SWEET_TOUCH_SPI_HOST)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_spi_init(void);
++#endif
++
++#define JT_MAX           10u
++#define JT_W             1080u
++#define JT_H             2400u
++#define JT_FTS           1
++#define JT_NVT           2
++#define JT_FW_DIR        "/usr/share/firmware/joyeuse/"
++#define JT_FW_MAX        (512u * 1024u)
++/* Largest frame: Novatek SRAM chunk (1 offset byte + 63 KiB). */
++#define JT_BUF           (64u * 1024u + 64u)
++
++/* Bus and board hooks: GENI/TLMM below, or the host test. */
++static int jt_xfer(const uint8_t *tx, uint8_t *rx, unsigned len);
++static void jt_reset_pin(bool high);
++static void jt_msleep(unsigned ms);
++static void jt_udelay(unsigned us);
++
++static uint8_t jt_tx[JT_BUF], jt_rx[JT_BUF];
++
++static struct {
++	uint32_t active;
++	int x[JT_MAX], y[JT_MAX];
++	unsigned abs_x, abs_y;
++} jt;
++
++static void
++jt_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < JT_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(jt.active & bit) || x[id] != jt.x[id] || y[id] != jt.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			jt.x[id] = x[id];
++			jt.y[id] = y[id];
++		} else if (jt.active & bit) {
++			sweet_hid_touch((int)id, 0, jt.x[id], jt.y[id]);
++		}
++	}
++	jt.active = mask;
++}
++
++static uint32_t
++jt_le32(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/*
++ * Novatek NT36675 (nt36xxx_spi). Frame byte 0 is a 7-bit offset into the
++ * current 128-byte page, bit 7 set for a write; 0xff sets the page from
++ * addr[22:7]. A read returns its data after the offset and one dummy byte.
++ * Addresses: nt36xxx_mem_map.h NT36675 (hw_crc 2) and joyeuse's DT.
++ */
++#define NVT_EVENT_BUF      0x22d00u
++#define NVT_ENG_RST        0x7fff80u
++#define NVT_SWRST_N8       0x3f0feu   /* DT novatek,swrst-n8-addr */
++#define NVT_SPI_RD_FAST    0x3f310u   /* DT novatek,spi-rd-fast-addr */
++#define NVT_BOOT_RDY       0x3f10du
++#define NVT_BLD_CRC_EN     0x3f30eu
++#define NVT_ILM_DES        0x3f128u
++#define NVT_ILM_LEN        0x3f118u
++#define NVT_G_ILM_SUM      0x3f100u
++#define NVT_DLM_DES        0x3f12cu
++#define NVT_DLM_LEN        0x3f130u
++#define NVT_G_DLM_SUM      0x3f104u
++#define NVT_TRIM_ID        0x1f64eu
++#define NVT_RESET_COMPLETE 0x60u
++#define NVT_HOST_CMD       0x50u
++#define NVT_FWINFO         0x78u
++#define NVT_CHUNK          (63u * 1024u)
++#define NVT_POINT_LEN      65u
++#define NVT_PARTS_MAX      32u
++
++struct nvt_part {
++	uint32_t sram, size, bin, crc;
++};
++
++static int
++nvt_write(const uint8_t *buf, unsigned len)
++{
++	memcpy(jt_tx, buf, len);
++	jt_tx[0] |= 0x80u;
++	return jt_xfer(jt_tx, NULL, len);
++}
++
++static int
++nvt_set_page(uint32_t addr)
++{
++	const uint8_t b[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	return nvt_write(b, sizeof(b));
++}
++
++static int
++nvt_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	if (n + 2u > JT_BUF) {
++		return EINVAL;
++	}
++	memset(jt_tx, 0, n + 2u);
++	jt_tx[0] = addr & 0x7fu;
++	int err = jt_xfer(jt_tx, jt_rx, n + 2u);
++	if (!err) {
++		memcpy(out, jt_rx + 2, n);
++	}
++	return err;
++}
++
++static int
++nvt_write_addr(uint32_t addr, uint8_t value)
++{
++	int err = nvt_set_page(addr);
++	const uint8_t b[2] = {(uint8_t)(addr & 0x7fu), value};
++	return err ? err : nvt_write(b, sizeof(b));
++}
++
++static int
++nvt_bootloader_reset(void)
++{
++	int err = nvt_write_addr(NVT_SWRST_N8, 0x69);
++	jt_udelay(5000); /* tBRST2FR */
++	return err ? err : nvt_write_addr(NVT_SPI_RD_FAST, 0x00);
++}
++
++/* nvt_ts_check_chip_ver_trim: only the NT36675 row of trim_id_table. */
++static bool
++nvt_detect(void)
++{
++	/* eng reset while TP_RESX is high, then the 10 ms POR wait */
++	jt_reset_pin(true);
++	(void)nvt_write_addr(NVT_ENG_RST, 0x5a);
++	jt_msleep(10);
++	for (unsigned retry = 0; retry < 5; ++retry) {
++		uint8_t id[6] = {0};
++		if (!nvt_bootloader_reset() && !nvt_set_page(NVT_TRIM_ID) &&
++		    !nvt_read(NVT_TRIM_ID, id, sizeof(id))) {
++			printf("SWEET TOUCH SPI: nvt trim %02x %02x %02x %02x %02x %02x\n",
++			    id[0], id[1], id[2], id[3], id[4], id[5]);
++			if (id[3] == 0x75 && id[4] == 0x66 && id[5] == 0x03) {
++				return true;
++			}
++		}
++		jt_msleep(10);
++	}
++	return false;
++}
++
++/* nvt_get_fw_need_write_size + version bar + nvt_bin_header_parser (hw_crc). */
++static int
++nvt_parse(const uint8_t *fw, size_t size, struct nvt_part *p, unsigned *np)
++{
++	size_t need = 0;
++	for (size_t s = size / 4096u; s > 0 && !need; --s) {
++		const uint8_t *flag = fw + s * 4096u - 3u;
++		if (!memcmp(flag, "NVT", 3) || !memcmp(flag, "MOD", 3)) {
++			need = s * 4096u;
++		}
++	}
++	if (need < 4096u || size < 0x30u ||
++	    fw[need - 4096u] + fw[need - 4096u + 1u] != 0xff) {
++		return EINVAL;
++	}
++	uint32_t end = jt_le32(fw);
++	unsigned info = end > 0x30u ? (end - 0x30u + 0x0fu) / 0x10u : 0u;
++	unsigned ovly = (fw[0x28] & 0x10u) ? (fw[0x28] & 0x0fu) : 0u;
++	unsigned n = 2u + info + ovly;
++	if (n > NVT_PARTS_MAX || end > size) {
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		uint32_t pos;
++		if (i < 2u) {
++			p[i].bin = jt_le32(fw + i * 12u);
++			p[i].sram = jt_le32(fw + 4u + i * 12u);
++			p[i].size = jt_le32(fw + 8u + i * 12u);
++			p[i].crc = jt_le32(fw + 0x18u + i * 4u);
++			continue;
++		}
++		pos = i < 2u + info ? 0x30u + 0x10u * (i - 2u) : p[1].bin + 0x10u * (i - 2u - info);
++		if ((uint64_t)pos + 16u > size) {
++			return EINVAL;
++		}
++		p[i].sram = jt_le32(fw + pos);
++		p[i].size = jt_le32(fw + pos + 4u);
++		p[i].bin = jt_le32(fw + pos + 8u);
++		p[i].crc = jt_le32(fw + pos + 12u);
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		/* Download writes size + 1 bytes (vendor quirk), so check that too. */
++		if (p[i].size && (uint64_t)p[i].bin + p[i].size + 1u > size) {
++			return EINVAL;
++		}
++	}
++	*np = n;
++	printf("SWEET TOUCH SPI: nvt fw %lu bytes, ver %#x, %u partitions\n",
++	    (unsigned long)size, fw[need - 4096u], n);
++	return 0;
++}
++
++static int
++nvt_write_sram(const uint8_t *src, uint32_t sram, uint32_t size)
++{
++	while (size) {
++		unsigned len = size < NVT_CHUNK ? size : NVT_CHUNK;
++		int err = nvt_set_page(sram);
++		if (err) {
++			return err;
++		}
++		jt_tx[0] = (uint8_t)((sram & 0x7fu) | 0x80u);
++		memcpy(jt_tx + 1, src, len);
++		err = jt_xfer(jt_tx, NULL, len + 1u);
++		if (err) {
++			return err;
++		}
++		sram += len;
++		src += len;
++		size -= len;
++	}
++	return 0;
++}
++
++/* nvt_set_bld_crc_bank: all three registers share one 128-byte page. */
++static int
++nvt_crc_bank(uint32_t des, uint32_t len_addr, uint32_t sum_addr, const struct nvt_part *p)
++{
++	const uint8_t d[4] = {(uint8_t)(des & 0x7fu), (uint8_t)p->sram, (uint8_t)(p->sram >> 8), (uint8_t)(p->sram >> 16)};
++	const uint8_t l[4] = {(uint8_t)(len_addr & 0x7fu), (uint8_t)p->size, (uint8_t)(p->size >> 8), (uint8_t)((p->size >> 16) & 1u)};
++	const uint8_t s[5] = {(uint8_t)(sum_addr & 0x7fu), (uint8_t)p->crc, (uint8_t)(p->crc >> 8),
++		              (uint8_t)(p->crc >> 16), (uint8_t)(p->crc >> 24)};
++	int err = nvt_set_page(des);
++	err = err ? err : nvt_write(d, sizeof(d));
++	err = err ? err : nvt_write(l, sizeof(l));
++	return err ? err : nvt_write(s, sizeof(s));
++}
++
++static int
++nvt_reset_state(void)
++{
++	int err = nvt_set_page(NVT_EVENT_BUF | NVT_RESET_COMPLETE);
++	for (unsigned retry = 0; !err && retry <= 10u; ++retry) {
++		uint8_t st[5] = {0};
++		err = nvt_read(NVT_RESET_COMPLETE, st, sizeof(st));
++		if (!err && st[0] >= 0xa0u && st[0] <= 0xafu) {
++			return 0;
++		}
++		jt_msleep(10);
++	}
++	return err ? err : ETIMEDOUT;
++}
++
++/* nvt_download_firmware_hw_crc + nvt_get_fw_info; leaves the event page selected. */
++static int
++nvt_download(const uint8_t *fw, size_t size)
++{
++	struct nvt_part p[NVT_PARTS_MAX];
++	unsigned n = 0;
++	int err = nvt_parse(fw, size, p, &n);
++	if (err) {
++		printf("SWEET TOUCH SPI: nvt fw image rejected\n");
++		return err;
++	}
++	for (unsigned attempt = 0; attempt < 3u; ++attempt) {
++		err = nvt_bootloader_reset();
++		for (unsigned i = 0; !err && i < n; ++i) {
++			if (p[i].size) {
++				err = nvt_write_sram(fw + p[i].bin, p[i].sram, p[i].size + 1u);
++			}
++		}
++		err = err ? err : nvt_crc_bank(NVT_ILM_DES, NVT_ILM_LEN, NVT_G_ILM_SUM, &p[0]);
++		err = err ? err : nvt_crc_bank(NVT_DLM_DES, NVT_DLM_LEN, NVT_G_DLM_SUM, &p[1]);
++		uint8_t crc_en = 0;
++		err = err ? err : nvt_set_page(NVT_BLD_CRC_EN);
++		err = err ? err : nvt_read(NVT_BLD_CRC_EN, &crc_en, 1);
++		if (!err) {
++			const uint8_t b[2] = {(uint8_t)(NVT_BLD_CRC_EN & 0x7fu), (uint8_t)(crc_en | 0x80u)};
++			err = nvt_write(b, sizeof(b));
++		}
++		if (!err) {
++			const uint8_t clr[2] = {NVT_RESET_COMPLETE, 0x00};
++			const uint8_t cmd[2] = {NVT_HOST_CMD, 0xae}; /* enable fw crc */
++			err = nvt_set_page(NVT_EVENT_BUF);
++			err = err ? err : nvt_write(clr, sizeof(clr));
++			err = err ? err : nvt_write(cmd, sizeof(cmd));
++		}
++		err = err ? err : nvt_write_addr(NVT_BOOT_RDY, 1);
++		jt_udelay(5000);
++		err = err ? err : nvt_reset_state();
++		if (!err) {
++			break;
++		}
++		printf("SWEET TOUCH SPI: nvt download attempt %u failed %d\n", attempt, err);
++	}
++	if (err) {
++		return err;
++	}
++	uint8_t info[16] = {0};
++	err = nvt_set_page(NVT_EVENT_BUF | NVT_FWINFO);
++	err = err ? err : nvt_read(NVT_FWINFO, info, sizeof(info));
++	if (!err && info[0] + info[1] == 0xff) {
++		jt.abs_x = ((unsigned)info[4] << 8) | info[5];
++		jt.abs_y = ((unsigned)info[6] << 8) | info[7];
++	}
++	if (jt.abs_x < 2u || jt.abs_x > 4096u || jt.abs_y < 2u || jt.abs_y > 4096u) {
++		jt.abs_x = JT_W;
++		jt.abs_y = JT_H;
++	}
++	printf("SWEET TOUCH SPI: nvt running fw %#x (info ok %d) x/y %u/%u max %u/%u\n",
++	    info[0], info[0] + info[1] == 0xff, info[2], info[3], jt.abs_x, jt.abs_y);
++	return err ? err : nvt_set_page(NVT_EVENT_BUF);
++}
++
++/* nvt_ts_work_func, protocol B; >0: fw needs a fresh download. */
++static int
++nvt_poll(void)
++{
++	static unsigned wdt;
++	uint8_t d[NVT_POINT_LEN];
++	int x[JT_MAX] = {0}, y[JT_MAX] = {0};
++	uint32_t mask = 0;
++	int err = nvt_read(0, d, sizeof(d));
++	if (err) {
++		return -err;
++	}
++	unsigned hs = 0, fd = 0;
++	for (unsigned i = 0; i < 6; ++i) {
++		hs += d[i] == 0x77u;
++		fd += d[i] == 0xfdu || d[i] == 0xfeu;
++	}
++	/* nvt_wdt_fw_recovery: more than 10 consecutive 0xfd/0xfe frames */
++	wdt = fd == 6 ? wdt + 1 : 0;
++	if (wdt > 10u) {
++		wdt = 0;
++		return 1;
++	}
++	if (hs == 6 || fd == 6) {
++		return 0; /* firmware handshake/ESD frame: keep current contacts */
++	}
++	for (unsigned i = 0; i < JT_MAX; ++i) {
++		const uint8_t *p = d + 6u * i;
++		unsigned id = p[0] >> 3, status = p[0] & 7u;
++		if (id == 0 || id > JT_MAX || (status != 1u && status != 2u)) {
++			continue;
++		}
++		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 0x0fu);
++		if (px > jt.abs_x || py > jt.abs_y) {
++			continue;
++		}
++		/* Scale the reported resolution to the 1080x2400 HID space. */
++		mask |= 1u << (id - 1u);
++		x[id - 1u] = (int)(px * (JT_W - 1u) / (jt.abs_x - 1u));
++		y[id - 1u] = (int)(py * (JT_H - 1u) / (jt.abs_y - 1u));
++	}
++	jt_report(mask, x, y);
++	return 0;
++}
++
++/*
++ * Focaltech FT8756 (ft8756_spi). Frame: cmd, ctrl (0x00 write, 0xa0 read
++ * with CRC), length (2 bytes BE), then 3 dummy bytes and the data; reads end
++ * in a CRC-16/KERMIT (LE). Status bits 0xa0 of the 4th received byte must be
++ * clear. FT8756 row of upgrade_setting_list: rom id 87 56, PRAM/DRAM writes
++ * (spi_pe 0), half_length, ECC chunks of 32766 bytes, ECC ok value 0xa5.
++ */
++#define FTS_WRITE           0x00u
++#define FTS_READ            0xa0u
++#define FTS_DUMMY           3u
++#define FTS_CS_HIGH_US      150u
++#define FTS_START1          0x55u
++#define FTS_READ_ID         0x90u
++#define FTS_SET_PRAM_ADDR   0xadu
++#define FTS_ROM_WRITE       0xaeu
++#define FTS_START_APP       0x08u
++#define FTS_ECC_CALC        0xccu
++#define FTS_ECC_READ        0xcdu
++#define FTS_ECC_FINISH      0xceu
++#define FTS_DRAM_SADDR      0xd00000u
++#define FTS_PACKET          (32u * 1024u - 16u)
++#define FTS_ECC_CHUNK       32766u
++#define FTS_APP_MAX         (88u * 1024u)
++#define FTS_MIN_LEN         0x120u
++#define FTS_APP_INFO        0x100u
++#define FTS_TOUCH_LEN       63u   /* FTS_TOUCH_DATA_LEN: 10 points * 6 + 3 */
++
++static uint16_t
++fts_crc(const uint8_t *d, unsigned len)
++{
++	uint16_t crc = 0xffff;
++	for (unsigned i = 0; i < len; ++i) {
++		crc ^= d[i];
++		for (unsigned j = 0; j < 8; ++j) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) : (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++/* buf[0] is the command, buf[1..len) its data (fts_write). */
++static int
++fts_write(const uint8_t *buf, unsigned len)
++{
++	unsigned dl = len - 1u, n = 4u + (dl ? FTS_DUMMY + dl : 0u);
++	if (!len || n > JT_BUF) {
++		return EINVAL;
++	}
++	memset(jt_tx, 0, n);
++	jt_tx[0] = buf[0];
++	jt_tx[1] = FTS_WRITE;
++	jt_tx[2] = (uint8_t)(dl >> 8);
++	jt_tx[3] = (uint8_t)dl;
++	if (dl) {
++		memcpy(jt_tx + 4u + FTS_DUMMY, buf + 1, dl);
++	}
++	int err = EIO;
++	for (unsigned retry = 0; retry < 3u && err; ++retry) {
++		err = jt_xfer(jt_tx, jt_rx, n);
++		if (!err && (jt_rx[3] & 0xa0u)) {
++			err = EIO;
++		}
++		jt_udelay(FTS_CS_HIGH_US);
++	}
++	return err;
++}
++
++static int
++fts_read(uint8_t cmd, uint8_t *out, unsigned n)
++{
++	unsigned data_off = 4u + FTS_DUMMY, frame_len = data_off + n + 2u;
++	if (!n || frame_len > JT_BUF) {
++		return EINVAL;
++	}
++	memset(jt_tx, 0, frame_len);
++	jt_tx[0] = cmd;
++	jt_tx[1] = FTS_READ;
++	jt_tx[2] = (uint8_t)(n >> 8);
++	jt_tx[3] = (uint8_t)n;
++	int err = EIO;
++	for (unsigned retry = 0; retry < 3u && err; ++retry) {
++		err = jt_xfer(jt_tx, jt_rx, frame_len);
++		if (!err && ((jt_rx[3] & 0xa0u) ||
++		    fts_crc(jt_rx + data_off, n) != (jt_rx[data_off + n] | ((uint16_t)jt_rx[data_off + n + 1u] << 8)))) {
++			err = EIO;
++		}
++		jt_udelay(FTS_CS_HIGH_US);
++	}
++	if (!err) {
++		memcpy(out, jt_rx + data_off, n);
++	}
++	return err;
++}
++
++static void
++fts_reset(void)
++{
++	jt_reset_pin(false);
++	jt_msleep(1);
++	jt_reset_pin(true);
++}
++
++/* fts_enter_into_boot: reset, START1, boot id 87 56 (romboot). */
++static bool
++fts_enter_boot(unsigned loops)
++{
++	for (unsigned i = 0; i < loops; ++i) {
++		fts_reset();
++		jt_msleep(8);
++		for (unsigned j = 0; j < 3u; ++j) {
++			const uint8_t start = FTS_START1;
++			uint8_t id[2] = {0};
++			if (!fts_write(&start, 1)) {
++				jt_msleep(8);
++				if (!fts_read(FTS_READ_ID, id, sizeof(id)) && id[0] == 0x87u && id[1] == 0x56u) {
++					return true;
++				}
++			}
++		}
++	}
++	return false;
++}
++
++static uint16_t
++fts_ecc_host(const uint8_t *d, unsigned len)
++{
++	uint16_t ecc = 0;
++	for (unsigned i = 0; i + 1u < len; i += 2u) {
++		ecc ^= (uint16_t)((d[i] << 8) | d[i + 1u]);
++		for (unsigned j = 0; j < 16; ++j) {
++			ecc = (ecc & 1u) ? (uint16_t)((ecc >> 1) ^ 0x8408u) : (uint16_t)(ecc >> 1);
++		}
++	}
++	return ecc;
++}
++
++static int
++fts_ecc_check(const uint8_t *d, uint32_t len, uint32_t saddr)
++{
++	for (uint32_t off = 0; off < len; off += FTS_ECC_CHUNK) {
++		uint32_t n = len - off < FTS_ECC_CHUNK ? len - off : FTS_ECC_CHUNK;
++		uint32_t a = saddr + off;
++		const uint8_t cmd[7] = {FTS_ECC_CALC, (uint8_t)(a >> 16), (uint8_t)(a >> 8), (uint8_t)a,
++			                (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
++		uint8_t v[2] = {0};
++		int err = fts_write(cmd, sizeof(cmd));
++		if (err) {
++			return err;
++		}
++		jt_msleep(2);
++		unsigned i;
++		for (i = 0; i < 100u; ++i) {
++			err = fts_read(FTS_ECC_FINISH, v, 1);
++			if (err) {
++				return err;
++			}
++			if (v[0] == 0xa5u) {
++				break;
++			}
++			jt_msleep(1);
++		}
++		if (i == 100u) {
++			return ETIMEDOUT;
++		}
++		err = fts_read(FTS_ECC_READ, v, 2);
++		if (err) {
++			return err;
++		}
++		uint16_t tp = (uint16_t)((v[0] << 8) | v[1]), host = fts_ecc_host(d + off, n);
++		if (tp != host) {
++			printf("SWEET TOUCH SPI: fts ecc mismatch at %#x: ic %#x host %#x\n", a, tp, host);
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/* fts_dpram_write (spi_pe 0): set address, then one ROM write per packet. */
++static int
++fts_dpram_write(const uint8_t *d, uint32_t len, uint32_t base)
++{
++	static uint8_t pkt[1u + FTS_PACKET];
++	if (len < FTS_MIN_LEN || len > FTS_APP_MAX) {
++		return EINVAL;
++	}
++	for (uint32_t off = 0; off < len; off += FTS_PACKET) {
++		uint32_t n = len - off < FTS_PACKET ? len - off : FTS_PACKET, a = base + off;
++		const uint8_t set[4] = {FTS_SET_PRAM_ADDR, (uint8_t)(a >> 16), (uint8_t)(a >> 8), (uint8_t)a};
++		int err = fts_write(set, sizeof(set));
++		if (err) {
++			return err;
++		}
++		pkt[0] = FTS_ROM_WRITE;
++		memcpy(pkt + 1, d + off, n);
++		err = fts_write(pkt, 1u + n);
++		if (err) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++/* fts_fw_write_start(need_reset): boot, PRAM + ECC, DRAM + ECC, start. */
++static int
++fts_download(const uint8_t *fw, size_t size)
++{
++	if (size < FTS_APP_INFO + 12u) {
++		return EINVAL;
++	}
++	const uint8_t *ai = fw + FTS_APP_INFO;
++	uint16_t code = (uint16_t)((ai[0] << 8) | ai[1]), code_n = (uint16_t)((ai[2] << 8) | ai[3]);
++	uint16_t cst = (uint16_t)((ai[8] << 8) | ai[9]), cst_n = (uint16_t)((ai[10] << 8) | ai[11]);
++	uint32_t pram = (uint32_t)code * 2u;
++	uint32_t dram = (cst + cst_n == 0xffffu) ? (uint32_t)cst * 2u : 0u;
++	if (code + code_n != 0xffffu || (uint64_t)pram + dram > size) {
++		printf("SWEET TOUCH SPI: fts fw image rejected (code %#x/%#x)\n", code, code_n);
++		return EINVAL;
++	}
++	printf("SWEET TOUCH SPI: fts fw %lu bytes, pram %u dram %u\n", (unsigned long)size, pram, dram);
++	int err = EIO;
++	for (unsigned attempt = 0; attempt < 3u && err; ++attempt) {
++		if (!fts_enter_boot(30)) {
++			err = ENXIO;
++			continue;
++		}
++		err = fts_dpram_write(fw, pram, 0);
++		err = err ? err : fts_ecc_check(fw, pram, 0);
++		if (!err && dram) {
++			err = fts_dpram_write(fw + pram, dram, FTS_DRAM_SADDR);
++			/* The vendor driver checks DRAM ECC at address 0, not the DRAM base. */
++			err = err ? err : fts_ecc_check(fw + pram, dram, 0);
++		}
++		if (!err) {
++			const uint8_t start = FTS_START_APP;
++			err = fts_write(&start, 1);
++		}
++		if (err) {
++			printf("SWEET TOUCH SPI: fts download attempt %u failed %d\n", attempt, err);
++		}
++	}
++	if (!err) {
++		uint8_t chip = 0, ver = 0;
++		jt_msleep(50);
++		(void)fts_read(0xa3, &chip, 1);
++		(void)fts_read(0xa6, &ver, 1);
++		printf("SWEET TOUCH SPI: fts running chip %#x fw %#x\n", chip, ver);
++	}
++	jt.abs_x = JT_W;
++	jt.abs_y = JT_H;
++	return err;
++}
++
++/* fts_read_touchdata + fts_read_parse_touchdata; >0: fw needs a fresh download. */
++static int
++fts_poll(void)
++{
++	uint8_t buf[1u + FTS_TOUCH_LEN]; /* buf[k] = register k, as in the vendor driver */
++	int x[JT_MAX] = {0}, y[JT_MAX] = {0};
++	uint32_t mask = 0;
++	memset(buf, 0xff, sizeof(buf));
++	buf[0] = 0x01;
++	int err = fts_read(0x01, buf + 1, FTS_TOUCH_LEN);
++	if ((!err && buf[2] == 0xefu && buf[3] == 0xefu && buf[4] == 0xefu) ||
++	    (err && buf[1] == 0xefu)) {
++		return 1; /* fts_fw_recovery */
++	}
++	if (err || (buf[1] & 0xf0u) != 0x90u) {
++		return -(err ? err : EIO);
++	}
++	unsigned n = buf[2] & 0x0fu;
++	if (n == 0x0fu && buf[3] == 0xffu && buf[4] == 0xffu && buf[5] == 0xffu && buf[6] == 0xffu) {
++		jt_report(0, x, y); /* in-cell recovery frame: release everything */
++		return -EIO;
++	}
++	if (n > JT_MAX) {
++		return -EIO;
++	}
++	for (unsigned i = 0; i < JT_MAX; ++i) {
++		const uint8_t *p = buf + 6u * i;
++		unsigned id = p[5] >> 4, flag = p[3] >> 6;
++		if (id >= JT_MAX) {
++			break;
++		}
++		bool down = flag == 0u || flag == 2u; /* EVENT_DOWN: down or contact */
++		if (down && n == 0) {
++			return -EIO;
++		}
++		if (!down) {
++			continue;
++		}
++		unsigned px = ((unsigned)(p[3] & 0x0fu) << 8) | p[4];
++		unsigned py = ((unsigned)(p[5] & 0x0fu) << 8) | p[6];
++		if (px >= JT_W || py >= JT_H) {
++			continue;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++	}
++	jt_report(mask, x, y);
++	return 0;
++}
++
++/* Probe Focaltech first: on a Novatek its START1/READ_ID frames are an
++ * offset read and a write into page-0 SRAM that the download overwrites. */
++static int
++jt_detect(int forced)
++{
++	if (forced == JT_FTS || forced == JT_NVT) {
++		return forced;
++	}
++	if (fts_enter_boot(3)) {
++		return JT_FTS;
++	}
++	return nvt_detect() ? JT_NVT : 0;
++}
++
++#if !defined(SWEET_TOUCH_SPI_HOST)
++/* ---------------- SM7125 GENI SE11 SPI, TLMM and GCC ---------------- */
++#define JT_SE_PA         0x00a94000u /* qupv3_se11_spi: spi@a94000 */
++#define JT_GCC_PA        0x00100000u
++#define JT_NORTH_PA      0x03900000u /* TLMM 0x3400000 + NORTH 0x500000: GPIO 8, 9 */
++#define JT_WEST_PA       0x03500000u /* TLMM 0x3400000 + WEST 0x100000: GPIO 53-56 */
++/* atoll (gcc-atoll.c, gcc-sc7180.c) votes in 0x52008; sm7150/sweet in 0x5200c */
++#define JT_GCC_VOTE      0x52008u
++#define JT_GCC_BITS      ((0x0fu << 18) | (1u << 27)) /* wrap1 2x/core/m/s ahb, s5 */
++#define JT_RCG           0x18608u    /* gcc_qupv3_wrap1_s5_clk_src */
++#define JT_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define JT_GPIO_IO(n)    (JT_GPIO_CFG(n) + 4u)
++#define JT_RST_GPIO      8u
++#define JT_IRQ_GPIO      9u
++#define JT_SPI_GPIO      53u         /* 53 MISO, 54 MOSI, 55 CLK, 56 CS0 */
++#define JT_SPI_FUNC      2u          /* qup15 */
++
++#define SE_GENI_STATUS   0x040u
++#define SE_M_CLK_CFG     0x048u
++#define SE_FIFO_DIS      0x064u
++#define SE_FW_REV        0x068u
++#define SE_CLK_SEL       0x07cu
++#define SE_SPI_CPHA      0x224u
++#define SE_SPI_LOOPBACK  0x22cu
++#define SE_SPI_CPOL      0x230u
++#define SE_SPI_DEMUX_INV 0x24cu
++#define SE_SPI_DEMUX_SEL 0x250u
++#define SE_BYTE_GRAN     0x254u
++#define SE_DMA_MODE      0x258u
++#define SE_SPI_TRANS_CFG 0x25cu
++#define SE_SPI_WORD_LEN  0x268u
++#define SE_SPI_TX_LEN    0x26cu
++#define SE_SPI_RX_LEN    0x270u
++#define SE_SPI_DELAYS    0x278u
++#define SE_M_CMD0        0x600u
++#define SE_M_CMD_CTRL    0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_TX_FIFO       0x700u
++#define SE_RX_FIFO       0x780u
++#define SE_TX_STATUS     0x800u
++#define SE_RX_STATUS     0x804u
++#define SE_TX_WM         0x80cu
++#define SE_RX_WM         0x810u
++#define SE_RX_RFR        0x814u
++#define SE_HW_TX         0xe24u
++#define SE_HW_RX         0xe28u
++#define M_DONE           (1u << 0)
++#define M_CANCEL         (1u << 4)
++#define M_ABORT          (1u << 5)
++#define M_RX_WM          (1u << 26)
++#define M_RX_LAST        (1u << 27)
++#define M_TX_WM          (1u << 30)
++/* overrun, illegal cmd, failure, RX/TX FIFO read/write errors */
++#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (3u << 24) | (3u << 28))
++#define M_EVENTS         (M_DONE | M_ERRORS | M_RX_WM | M_RX_LAST | M_TX_WM)
++#define SPI_TX_ONLY      1u
++#define SPI_FULL_DUPLEX  3u
++/* geni_se_config_packing(8, 4, msb first): same words as sweet's I2C */
++#define SE_PACK0         0x0007f8feu
++#define SE_PACK1         0x000ffefeu
++
++static struct {
++	vm_offset_t se, gcc, north, west;
++	bool started, dead;
++	unsigned depth;
++	int ic;
++} jg;
++static int jt_sleep_chan;
++
++static uint32_t
++jg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++jg_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++jt_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&jt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++jt_udelay(unsigned us)
++{
++	delay(us);
++}
++
++static bool
++jg_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(jg_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM: pull [1:0], function [5:2], drive (mA/2 - 1) [8:6], output enable [9]. */
++static void
++jg_gpio(vm_offset_t tile, unsigned pin, unsigned func, unsigned pull, unsigned drive,
++    bool out, bool high)
++{
++	uint32_t cfg = jg_rd(tile, JT_GPIO_CFG(pin));
++	if (out) {
++		jg_wr(tile, JT_GPIO_IO(pin), (jg_rd(tile, JT_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (func << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	jg_wr(tile, JT_GPIO_CFG(pin), cfg);
++}
++
++static void
++jt_reset_pin(bool high)
++{
++	jg_wr(jg.north, JT_GPIO_IO(JT_RST_GPIO),
++	    (jg_rd(jg.north, JT_GPIO_IO(JT_RST_GPIO)) & ~2u) | (high ? 2u : 0u));
++}
++
++static bool
++jg_clocks(void)
++{
++	jg_wr(jg.gcc, JT_GCC_VOTE, jg_rd(jg.gcc, JT_GCC_VOTE) | JT_GCC_BITS);
++	uint32_t dfs = jg_rd(jg.gcc, JT_RCG + 0x14u), cfg = jg_rd(jg.gcc, JT_RCG + 4u);
++	printf("SWEET TOUCH SPI: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    jg_rd(jg.gcc, JT_GCC_VOTE), jg_rd(jg.gcc, JT_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* CLK_SEL 0 selects DFS level 0; it must be XO/1. Tables stay untouched. */
++		cfg = jg_rd(jg.gcc, JT_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET TOUCH SPI: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++			return false;
++		}
++	} else {
++		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		jg_wr(jg.gcc, JT_RCG + 4u, cfg);
++		jg_wr(jg.gcc, JT_RCG, jg_rd(jg.gcc, JT_RCG) | 1u);
++		if (!jg_wait_clear(jg.gcc, JT_RCG, 1u)) {
++			printf("SWEET TOUCH SPI: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18604};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!jg_wait_clear(jg.gcc, branches[i], 1u << 31)) {
++			printf("SWEET TOUCH SPI: GCC branch %#x halted (%#x)\n", branches[i],
++			    jg_rd(jg.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++jg_se_init(unsigned div)
++{
++	uint32_t fw = jg_rd(jg.se, SE_FW_REV);
++	uint32_t tx = jg_rd(jg.se, SE_HW_TX), rx = jg_rd(jg.se, SE_HW_RX);
++	jg.depth = (tx >> 16) & 0x3fu;
++	printf("SWEET TOUCH SPI: se11 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, jg_rd(jg.se, SE_GENI_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 1u || (jg_rd(jg.se, SE_FIFO_DIS) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    jg.depth < 4u || ((rx >> 16) & 0x3fu) < 4u) {
++		printf("SWEET TOUCH SPI: need firmware-loaded SPI protocol and 32-bit FIFOs\n");
++		return false;
++	}
++	if (jg_rd(jg.se, SE_GENI_STATUS) & 1u) {
++		printf("SWEET TOUCH SPI: SE11 already busy\n");
++		return false;
++	}
++	jg_wr(jg.se, 0xe18, 0);       /* no GSI events */
++	jg_wr(jg.se, 0xe1c, 0);       /* no external IRQ routing; poll local status */
++	jg_wr(jg.se, 0x644, 0);       /* S_IRQ_EN */
++	jg_wr(jg.se, SE_M_IRQ_CLR, 0xffffffffu);
++	jg_wr(jg.se, 0x648, 0xffffffffu);
++	jg_wr(jg.se, SE_DMA_MODE, 0); /* FIFO mode */
++	jg_wr(jg.se, 0x28, jg_rd(jg.se, 0x28) | 0x7fu);
++	jg_wr(jg.se, 0xe30, jg_rd(jg.se, 0xe30) | 0x0fu);
++	jg_wr(jg.se, 0x24, 0x7f);
++	jg_wr(jg.se, 0x20, 1);
++	/* setup_fifo_params, SPI mode 0, CS0, 8-bit words, MSB first */
++	jg_wr(jg.se, SE_SPI_LOOPBACK, jg_rd(jg.se, SE_SPI_LOOPBACK) & ~3u);
++	jg_wr(jg.se, SE_SPI_DEMUX_SEL, 0);
++	jg_wr(jg.se, SE_SPI_CPHA, jg_rd(jg.se, SE_SPI_CPHA) & ~1u);
++	jg_wr(jg.se, SE_SPI_CPOL, jg_rd(jg.se, SE_SPI_CPOL) & ~4u);
++	jg_wr(jg.se, SE_SPI_DEMUX_INV, 0);
++	jg_wr(jg.se, SE_CLK_SEL, 0);
++	jg_wr(jg.se, SE_M_CLK_CFG, (div << 4) | 1u);
++	jg_wr(jg.se, SE_SPI_DELAYS, 0);
++	jg_wr(jg.se, SE_SPI_WORD_LEN, (jg_rd(jg.se, SE_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
++	jg_wr(jg.se, SE_SPI_TRANS_CFG, jg_rd(jg.se, SE_SPI_TRANS_CFG) & ~1u); /* no CS toggle */
++	jg_wr(jg.se, SE_BYTE_GRAN, 0);
++	jg_wr(jg.se, 0x260, SE_PACK0);
++	jg_wr(jg.se, 0x264, SE_PACK1);
++	jg_wr(jg.se, 0x284, SE_PACK0);
++	jg_wr(jg.se, 0x288, SE_PACK1);
++	jg_wr(jg.se, SE_TX_WM, 0);
++	jg_wr(jg.se, SE_RX_WM, 0);
++	jg_wr(jg.se, SE_RX_RFR, ((rx >> 16) & 0x3fu) - 2u);
++	jg_wr(jg.se, SE_M_IRQ_EN, M_EVENTS);
++	if (jg_rd(jg.se, 0x260) != SE_PACK0 || jg_rd(jg.se, 0x284) != SE_PACK0 ||
++	    (jg_rd(jg.se, SE_TX_STATUS) & 0xfffffffu) || (jg_rd(jg.se, SE_RX_STATUS) & 0x1ffffffu)) {
++		printf("SWEET TOUCH SPI: packing/FIFO state mismatch\n");
++		return false;
++	}
++	printf("SWEET TOUCH SPI: SE11 SPI mode 0 at %u kHz, fifo depth %u\n", 19200u / div, jg.depth);
++	return true;
++}
++
++/* Called only for a command started by this driver. */
++static void
++jg_abort(void)
++{
++	bool done = false;
++	jg_wr(jg.se, SE_M_CMD_CTRL, 1u << 2); /* cancel */
++	for (unsigned i = 0; i < 1000 && !done; ++i) {
++		done = (jg_rd(jg.se, SE_M_IRQ) & M_CANCEL) != 0;
++		delay(1);
++	}
++	if (!done) {
++		jg_wr(jg.se, SE_M_CMD_CTRL, 1u << 1); /* abort */
++		for (unsigned i = 0; i < 5000 && !done; ++i) {
++			done = (jg_rd(jg.se, SE_M_IRQ) & M_ABORT) != 0;
++			delay(1);
++		}
++	}
++	if (!done || !jg_wait_clear(jg.se, SE_GENI_STATUS, 1u)) {
++		jg.dead = true;
++		printf("SWEET TOUCH SPI: cancel/abort failed status=%#x irq=%#x; stopping\n",
++		    jg_rd(jg.se, SE_GENI_STATUS), jg_rd(jg.se, SE_M_IRQ));
++	}
++	for (unsigned i = 0; i < 256 && (jg_rd(jg.se, SE_RX_STATUS) & 0x1ffffffu); ++i) {
++		(void)jg_rd(jg.se, SE_RX_FIFO);
++	}
++	jg_wr(jg.se, SE_TX_WM, 0);
++	jg_wr(jg.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (jg_rd(jg.se, SE_TX_STATUS) & 0xfffffffu) {
++		jg.dead = true;
++		printf("SWEET TOUCH SPI: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++/*
++ * One chip-select framed transfer (no FRAGMENTATION: CS drops at the end).
++ * Polled FIFO mode for any length, refilling TX on the watermark and
++ * draining RX as words arrive; the sequencer waits on an empty TX FIFO.
++ */
++static int
++jt_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	if (jg.dead || !len || len > 0xffffffu) {
++		return EIO;
++	}
++	if (!jg_wait_clear(jg.se, SE_GENI_STATUS, 1u)) {
++		jg.dead = true;
++		return EBUSY;
++	}
++	jg_wr(jg.se, SE_M_IRQ_CLR, 0xffffffffu);
++	jg_wr(jg.se, SE_SPI_TX_LEN, len);
++	if (rx) {
++		jg_wr(jg.se, SE_SPI_RX_LEN, len);
++	}
++	jg_wr(jg.se, SE_TX_WM, 1);
++	jg_wr(jg.se, SE_M_CMD0, (rx ? SPI_FULL_DUPLEX : SPI_TX_ONLY) << 27);
++	unsigned sent = 0, got = 0, idle = 0;
++	/* 1.25 us per byte at 6.4 MHz; allow 4x plus 20 ms */
++	unsigned idle_max = 20000u + len * 5u;
++	int err = ETIMEDOUT;
++	while (idle < idle_max) {
++		uint32_t irq = jg_rd(jg.se, SE_M_IRQ);
++		bool progress = false;
++		if (irq & M_ERRORS) {
++			printf("SWEET TOUCH SPI: xfer len %u error irq=%#x sent %u got %u\n", len, irq, sent, got);
++			err = EIO;
++			break;
++		}
++		if (sent < len && (irq & M_TX_WM)) {
++			uint32_t used = jg_rd(jg.se, SE_TX_STATUS) & 0xfffffffu;
++			for (uint32_t room = used < jg.depth ? jg.depth - used : 0; room && sent < len; --room) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4u && sent < len; ++j) {
++					word |= (uint32_t)tx[sent++] << (8u * j);
++				}
++				jg_wr(jg.se, SE_TX_FIFO, word);
++			}
++			if (sent == len) {
++				jg_wr(jg.se, SE_TX_WM, 0);
++			}
++			jg_wr(jg.se, SE_M_IRQ_CLR, M_TX_WM);
++			progress = true;
++		}
++		if (rx) {
++			uint32_t wc = jg_rd(jg.se, SE_RX_STATUS) & 0x1ffffffu;
++			if (wc > (len - got + 3u) / 4u) {
++				err = EIO;
++				break;
++			}
++			while (wc--) {
++				uint32_t word = jg_rd(jg.se, SE_RX_FIFO);
++				for (unsigned j = 0; j < 4u && got < len; ++j) {
++					rx[got++] = (uint8_t)(word >> (8u * j));
++				}
++				progress = true;
++			}
++			jg_wr(jg.se, SE_M_IRQ_CLR, irq & (M_RX_WM | M_RX_LAST));
++		}
++		if (irq & M_DONE) {
++			/* RX was drained above after DONE was sampled; a late error wins. */
++			irq = jg_rd(jg.se, SE_M_IRQ);
++			if (irq & M_ERRORS) {
++				continue;
++			}
++			jg_wr(jg.se, SE_M_IRQ_CLR, irq);
++			if (sent == len && (!rx || got == len)) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		if (progress) {
++			idle = 0;
++		} else {
++			++idle;
++			delay(1);
++		}
++	}
++	jg_abort();
++	return err;
++}
++
++/* Firmware blob from the root filesystem; kalloc_data, caller frees. */
++static int
++jt_load(const char *path, uint8_t **out, size_t *out_len)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int resid = 0;
++	uint8_t *buf = NULL;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_size(vp, &size, ctx);
++		if (!err && (size < (off_t)FTS_MIN_LEN || size > (off_t)JT_FW_MAX)) {
++			err = EFBIG;
++		}
++		if (!err) {
++			buf = kalloc_data((vm_size_t)size, Z_WAITOK);
++			err = buf ? 0 : ENOMEM;
++		}
++		if (!err) {
++			err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	(void)vfs_context_rele(ctx);
++	if (err) {
++		if (buf) {
++			kfree_data(buf, (vm_size_t)size);
++		}
++		printf("SWEET TOUCH SPI: cannot read %s: %d\n", path, err);
++		return err;
++	}
++	*out = buf;
++	*out_len = (size_t)size;
++	return 0;
++}
++
++static void
++jt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45, div = 3, forced = 0;
++	uint8_t *fw = NULL;
++	size_t fw_len = 0;
++	(void)arg;
++	(void)result;
++	/* Same late start as sweet_touch.c (boot-arg sweettouchdelay, seconds);
++	 * the root filesystem holding the firmware is mounted by then. */
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	/* SPI clock = 19.2 MHz / sweettouchdiv; the DT allows 8 MHz. */
++	(void)PE_parse_boot_argn("sweettouchdiv", &div, sizeof(div));
++	(void)PE_parse_boot_argn("sweettouchic", &forced, sizeof(forced)); /* 1 fts, 2 nvt */
++	div = div < 3 ? 3 : (div > 0xfff ? 0xfff : div);
++	printf("SWEET TOUCH SPI: joyeuse, starting in %u s\n", delay_s);
++	jt_msleep(delay_s * 1000u);
++	jg.gcc = ml_io_map(JT_GCC_PA, 0x60000);
++	jg.north = ml_io_map(JT_NORTH_PA, JT_GPIO_CFG(JT_IRQ_GPIO + 1u));
++	jg.west = ml_io_map(JT_WEST_PA, JT_GPIO_CFG(JT_SPI_GPIO + 4u));
++	jg.se = ml_io_map(JT_SE_PA, 0x4000);
++	if (!jg.gcc || !jg.north || !jg.west || !jg.se) {
++		printf("SWEET TOUCH SPI: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET TOUCH SPI: TLMM reset cfg=%#x io=%#x irq cfg=%#x io=%#x spi53 cfg=%#x\n",
++	    jg_rd(jg.north, JT_GPIO_CFG(JT_RST_GPIO)), jg_rd(jg.north, JT_GPIO_IO(JT_RST_GPIO)),
++	    jg_rd(jg.north, JT_GPIO_CFG(JT_IRQ_GPIO)), jg_rd(jg.north, JT_GPIO_IO(JT_IRQ_GPIO)),
++	    jg_rd(jg.west, JT_GPIO_CFG(JT_SPI_GPIO)));
++	if (!jg_clocks() || !jg_se_init(div)) {
++		goto out;
++	}
++	/* qupv3_se11_spi_active: qup15, 6 mA, no bias. Reset: output, high. */
++	for (unsigned pin = JT_SPI_GPIO; pin < JT_SPI_GPIO + 4u; ++pin) {
++		jg_gpio(jg.west, pin, JT_SPI_FUNC, 0, 2, false, false);
++	}
++	jg_gpio(jg.north, JT_RST_GPIO, 0, 0, 2, true, true);
++	jt_msleep(10);
++	jg.ic = jt_detect((int)forced);
++	if (!jg.ic || jg.dead) {
++		printf("SWEET TOUCH SPI: neither FT8756 nor NT36675 answered (dead=%d); stopping\n", jg.dead);
++		goto out;
++	}
++	const char *path = jg.ic == JT_FTS ? JT_FW_DIR "focaltech_ts_fw_huaxing.bin" :
++	    JT_FW_DIR "novatek_ts_tianma_fw.bin";
++	printf("SWEET TOUCH SPI: %s detected, firmware %s\n",
++	    jg.ic == JT_FTS ? "Focaltech FT8756 (Huaxing)" : "Novatek NT36675 (Tianma)", path);
++	if (jt_load(path, &fw, &fw_len)) {
++		goto out;
++	}
++	unsigned downloads = 0, errors = 0;
++	bool load = true;
++	while (!jg.dead) {
++		if (load) {
++			if (++downloads > 5u) {
++				printf("SWEET TOUCH SPI: too many firmware downloads; stopping\n");
++				break;
++			}
++			jt_report(0, jt.x, jt.y);
++			int err = jg.ic == JT_FTS ? fts_download(fw, fw_len) : nvt_download(fw, fw_len);
++			if (err) {
++				printf("SWEET TOUCH SPI: firmware download failed %d; stopping\n", err);
++				break;
++			}
++			printf("SWEET TOUCH SPI: polling every 10 ms\n");
++			load = false;
++		}
++		int st = jg.ic == JT_FTS ? fts_poll() : nvt_poll();
++		if (st > 0) {
++			printf("SWEET TOUCH SPI: firmware recovery requested\n");
++			load = true;
++		} else if (st < 0) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET TOUCH SPI: report err=%d\n", -st);
++			}
++			if (errors == 10) {
++				jt_report(0, jt.x, jt.y); /* release after persistent bad reads */
++			}
++		} else {
++			errors = 0;
++		}
++		jt_msleep(10);
++	}
++	jt_report(0, jt.x, jt.y);
++out:
++	if (fw) {
++		kfree_data(fw, fw_len);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_touch_spi_init(void)
++{
++	thread_t thread;
++	if (jg.started) {
++		return;
++	}
++	jg.started = true;
++	kern_return_t kr = kernel_thread_start(jt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET TOUCH SPI: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* !SWEET_TOUCH_SPI_HOST */
++#endif /* ARM64_BOARD_CONFIG_SWEET || SWEET_TOUCH_SPI_HOST */
