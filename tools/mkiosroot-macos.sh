@@ -34,7 +34,7 @@ RSYNC=/opt/homebrew/bin/rsync
 work=$(mktemp -d /tmp/mkiosroot.XXXXXX)
 devs=()
 cleanup() {
-	for d in "${devs[@]}"; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
+	for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
 	rm -f "$work/root.dmg"
 	rmdir "$work"/* "$work" 2>/dev/null || true
 }
@@ -49,7 +49,7 @@ attach() {
 	dev=$(hdiutil attach -nobrowse -noautoopen -noverify -owners on -mountpoint "$mnt" "$@" "$img" |
 		awk '/\/dev\/disk/ {print $1; exit}')
 	[[ -n $dev ]] || { echo "attach failed: $img" >&2; exit 1; }
-	devs=("$dev" "${devs[@]}")
+	devs=("$dev" ${devs[@]+"${devs[@]}"})
 	echo "$img -> $mnt ($dev)"
 }
 # The OS image is UDIF; the cryptexes are raw APFS images.
@@ -120,7 +120,7 @@ diskutil unmount "$root" >/dev/null
 fsck_hfs -f -y "$dev" || true
 fsck_hfs -f -n "$dev"
 hdiutil detach "$dev" >/dev/null
-devs=("${devs[@]:1}")
+devs=(${devs[@]+"${devs[@]:1}"})
 
 # UDIF read-write -> raw volume bytes for fastboot.
 hdiutil convert "$work/root.dmg" -format UDTO -o "$work/root" >/dev/null
