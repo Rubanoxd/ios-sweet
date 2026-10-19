@@ -44,7 +44,7 @@
  	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_spi.c
-@@ -0,0 +1,1246 @@
+@@ -0,0 +1,1253 @@
 +/*
 + * JOYEUSE SE11 FIFO SPI / Focaltech FT8756 / Novatek NT36675 TDDI bring-up.
 + * Redmi Note 9 Pro (joyeuse, SM7125 atoll). sweet_touch_init() starts this
@@ -729,8 +729,14 @@
 +		}
 +		return -err;
 +	}
++	static unsigned idle;
 +	if ((buf[1] & 0xf0u) != 0x90u) {
-+		/* No new frame (the vendor driver reads only on IRQ): keep contacts. */
++		/* No new frame (the vendor driver reads only on IRQ). The IC reports
++		 * continuously while touched, so 5 idle polls (50 ms) mean lifted:
++		 * that also covers a missed up record. */
++		if (++idle == 5u) {
++			jt_report(0, x, y);
++		}
 +		static uint8_t last_hdr = 0x5a;
 +		if (buf[1] != last_hdr && diag < 8u) {
 +			++diag;
@@ -740,6 +746,7 @@
 +		last_hdr = buf[1];
 +		return 0;
 +	}
++	idle = 0;
 +	unsigned n = buf[2] & 0x0fu;
 +	if (n == 0x0fu && buf[3] == 0xffu && buf[4] == 0xffu && buf[5] == 0xffu && buf[6] == 0xffu) {
 +		jt_report(0, x, y); /* in-cell recovery frame: release everything */
