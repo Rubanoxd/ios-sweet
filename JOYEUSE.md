@@ -256,7 +256,14 @@ the whole SMMU.
    `/usr/share/firmware/joyeuse/gpu/` (copied there from `../gpufw/` over
    SSH; `a630_gmu.bin` by default, `sweetgmufw=618` for `a618_gmu.bin`).
 
-Next steps: GMU firmware boot (PDC/RSCC sequences, `a630_gmu.bin` into the
-ITCM, HFI queues in GMU memory mapped through SMMU stream 5, OOB GX power
-through RPMh), then the zap shader (`a615_zap` via the SCM PAS calls), the
+Stage 4 on hardware (2026-10-20): **the GMU firmware runs.**
+`a630_gmu.bin: 32768 bytes, sp 0x00043f80`, `smmu cb4 at 0xc000: sid 5 ->
+ttbr0 0x10483c000, sctlr 0x67`, PDC was disabled before (`enable 0`),
+`rpmh init done; rsc off (status0 0x01010006)`, then `gmu fw UP: init result
+0xbabeface`. No SMMU fault (`gfsr 0`, CB4 `fsr 0x400` is only its
+long-descriptor FORMAT field). iOS keeps running.
+
+Next steps: GX power through the GMU (legacy OOB `gfx_rail_on`, SPTPRAC
+enable) and the HFI v1 start (init, firmware version, perf and bus tables),
+which makes the GPU core registers reachable; then the zap shader (`a615_zap` via the SCM PAS calls), the
 SQE microcode and the first ring.
