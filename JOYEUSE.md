@@ -161,6 +161,15 @@ Test, in order:
    `pipe ... now fetches 0x9cc48000`, a smoother GUI, and lower CPU
    (`ssh ... top`).
 
+Result on hardware (2026-10-19): both work. `dpu1` boots to the home
+screen; its dump runs before the USB log is up, so it is not in the live
+log (the 128 KiB kernel buffer has wrapped by the time SSH works). `dpu2`:
+`pool slot 1 at 0x9cc48000`, then `pipe vig0 now fetches 0x9cc48000` and
+`0x9c000000` alternately, display off/on restores and resumes, and the
+picture and touch are correct. The splash pipe is VIG0. backboardd idles at
+0% CPU, but it still takes 300-600% while the UI moves: that is the
+CoreAnimation software renderer, which only the GPU removes.
+
 If the screen goes wrong, reboot (hold Power + Volume down). Nothing is
 persistent: the pipe is reprogrammed on every boot by ABL.
 
