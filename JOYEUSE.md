@@ -2,8 +2,38 @@
 
 Port of the sweet bring-up to the global Redmi Note 9 Pro (`joyeuse`;
 `curtana`/`excalibur` are the same "miatoll" platform). **Status
-2026-10-19: prepared, not yet booted on the phone.** Everything below the
-GENI layer is host-tested; the GENI SPI layer and the first boot are not.
+2026-10-19: boots iOS 16.7.16 to the home screen, with working touch.**
+Kernel `5e42f18` (fork CI run 39290730255), shim with
+`sweetfb_noconsole=1 sweetusb=2 sweettouchdelay=120`, Huaxing panel
+(FT8756). Unlocking by swipe and reaching the home screen were confirmed
+on the phone.
+
+## Verified on the phone (2026-10-19)
+
+- `fastboot boot` of the shim works with the stock MIUI 14 ABL; the
+  read-only UFS probe sees LUN0 (~115 GB) and the GPT.
+- XNU: framebuffer (`AppleCLCD 1080x2400 at 0x9c000000`), UFS root on
+  `userdata`, SMP with `cpus=6`, launchd, backboardd, SpringBoard.
+- The CPU nodes must stay `qcom,kryo470`: SweetCPU (xnu 0018) matches that
+  name. With `kryo465` the boot stops silently right after AppleCLCD.
+- USB Ethernet live log to a Mac (`tools/sweet-usbnet-macos.sh`, needs
+  `sweetusb=2`).
+- Touch: SE11 comes up with the SPI protocol firmware (proto 1). Polled FIFO
+  SPI handles the 32 KiB firmware frames. The FT8756 firmware download
+  (PRAM + DRAM, ECC) works, and the chip runs (`chip 0x87 fw 0xe`). HID
+  down/up and swipes reach SpringBoard. The QUP1 s_ahb branch is
+  hardware-gated: its CLK_OFF bit is not a failure.
+- The first boot sits on the Apple logo while lsd builds the LaunchServices
+  database; SpringBoard waits in `_LSContextInitCommon`.
+
+Flashing notes: MIUI's `flash_all` writes `sparsecrclist`, so ABL then
+CRC-checks `userdata`. Flash an empty `SPARSECRC-LIST` before the iOS root.
+Homebrew fastboot 37 pads AVB images (`dtbo`/`boot`/`recovery`), and ABL
+rejects them with "Check CRC failed"; platform-tools r32.0.0 does not pad.
+Fastboot can also hang because some app holds the phone's USB device
+(Chrome WebUSB tabs, Spotify): check with
+`ioreg -r -n Android -l | grep IOUserClientCreator`. OrangeFox (R12.0,
+R11.3) did not boot with `fastboot boot` here.
 
 ## How much differs
 
@@ -64,8 +94,9 @@ and `sweettouchdelay`.
    The blobs are Xiaomi's (sha256 FT8756 `83e7fb01…6c9b`, NT36675
    `1a27ab58…bedd` for that ROM) and stay out of git.
 4. ADT: `python3 tools/mkadt.py shim/out/joyeuse.adt --highmem --board joyeuse`
-5. Payload, shim, flash and boot: as README. Use an OrangeFox build for
-   miatoll to read the log with `tools/sweet-log-pull.sh`.
+5. Payload, shim, flash and boot: as README (macOS root image:
+   `sudo tools/mkiosroot-macos.sh OS.dmg SYSOS.dmg APPOS.dmg out.img 16g --touch-fw touchfw`).
+   For the log, add `sweetusb=2` and run `sudo tools/sweet-usbnet-macos.sh`.
 
 Host test of the touch protocol layer (simulated ICs, real firmware):
 
@@ -73,21 +104,13 @@ Host test of the touch protocol layer (simulated ICs, real firmware):
 tools/touch-spi-test/run.sh touchfw/focaltech_ts_fw_huaxing.bin touchfw/novatek_ts_tianma_fw.bin
 ```
 
-## Not verified yet (check these in the first boot logs)
+## Not verified yet
 
-- **GENI SPI in polled FIFO mode for long frames** (up to 63 KiB). Linux
-  uses DMA above the FIFO size; the driver relies on the sequencer waiting
-  on an empty TX / full RX FIFO. Log: `SWEET TOUCH SPI: xfer ... error`.
-  If it fails, `sweettouchdiv` higher is the first thing to try, DMA mode
-  the real fix.
-- SE11 must come up with the SPI protocol firmware loaded (proto 1) and its
-  RCG either in DFS level 0 = XO or free to set; both are checked and logged.
+- The Tianma panel / NT36675 path (63 KiB SRAM frames), since this phone has
+  the Huaxing panel.
 - IC detection probes Focaltech first; on a Novatek its frames are an offset
   read and a write into page-0 SRAM that the firmware download overwrites.
 - Novatek is polled without its IRQ: the event buffer is read every 10 ms.
-- RAM: `--highmem` assumes the 6 GB layout of sweet (upper bank
-  `0x1_00000000`, `0xfcc00000` bytes); check `/proc/iomem` in OrangeFox.
-- ABL framebuffer format on the LCD (sweet: 32-bit BGRA, stride 1080*4).
 - Display off (patch 0079) blacks the pixels; on the LCD the backlight
   stays on (PM6150L WLED control is not implemented).
-- USB, battery, keys: same hardware addresses, untested on joyeuse.
+- Keys and battery on joyeuse (USB works).

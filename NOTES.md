@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-10-19 evening: joyeuse (Redmi Note 9 Pro) boots iOS to the home screen with touch <<<
+
+See `JOYEUSE.md` "Verified on the phone". Kernel 5e42f18 (fork Rubanoxd/ios-sweet CI 39290730255); fixes found on hardware: mkadt CPU nodes must stay `qcom,kryo470` (e2f8993), HW-gated QUP1 s_ahb clock (14267ac), FT8756 idle frames (fd5b643, 5e42f18). Next: Tianma/NT36675 untested, first-boot lsd wait, LCD backlight on display off.
+
 ### >>> 2026-10-19: joyeuse (Redmi Note 9 Pro) port prepared on branch `joyeuse` <<<
 
 See `JOYEUSE.md`: `mkadt.py --board joyeuse`, xnu patch **0082** (SE11 SPI touch, FT8756/NT36675 firmware download; host-tested with `tools/touch-spi-test/run.sh`, compiled against the 0081 CI build tree with `tools/xnu-cc.py`), `tools/joyeuse-touch-fw.py`, `sweet-root-tweaks.py --touch-fw`. Not built by CI and not booted yet. sweet behaviour is unchanged (no `/sweet-touch` node in its ADT).
