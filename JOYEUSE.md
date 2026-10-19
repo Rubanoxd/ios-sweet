@@ -238,6 +238,24 @@ Test shims: `shim/out/shim-boot-joyeuse-gpu2.img` and `-gpu3.img` (both
 with `sweetdpu=2`). Read the result with
 `ssh ... sysctl -n kern.sweetgpu`.
 
+Stage 3 on hardware: `smmu cr0 0x00200626 idr0 0x48016605 idr1 0x20008005
+idr2 0x00007511 gfsr 0`. The SMMU is enabled with unmatched streams
+faulting (USFCFG), 5 stream match groups and 5 stage-1-only context banks
+(4 KiB pages, 8 global pages, so bank n sits at 0x5048000 + n * 0x1000), and
+all of them are empty: ABL leaves nothing for the GPU, so the driver owns
+the whole SMMU.
+
+4. `sweetgpu=4` (xnu 0086, shim `shim-boot-joyeuse-gpu4.img`): GMU firmware
+   boot. Context bank 4 for the GMU's stream 5 (AArch64 stage-1 tables in
+   kernel memory) maps its uncached memory at 0x60000000 (dummy, debug,
+   log, HFI queue table); the a618 RSCC/PDC sequencer values (PDC at
+   0xb290000, its sequencer at 0xb490000); the legacy image (ITCM 16 KiB +
+   DTCM 16 KiB, raw Cortex-M3 vectors) is written through the ITCM window;
+   then CM3 out of reset and `FW_INIT_RESULT` must read `0xbabeface`. The
+   firmware is read from the root filesystem,
+   `/usr/share/firmware/joyeuse/gpu/` (copied there from `../gpufw/` over
+   SSH; `a630_gmu.bin` by default, `sweetgmufw=618` for `a618_gmu.bin`).
+
 Next steps: GMU firmware boot (PDC/RSCC sequences, `a630_gmu.bin` into the
 ITCM, HFI queues in GMU memory mapped through SMMU stream 5, OOB GX power
 through RPMh), then the zap shader (`a615_zap` via the SCM PAS calls), the
