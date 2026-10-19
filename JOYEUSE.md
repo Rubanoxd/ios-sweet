@@ -129,3 +129,52 @@ runs all sleep at 0 % CPU, no LaunchServices `*.csstore` exists yet, installd
 is not running and installcoordinationd is. So this is a wait chain, not
 slowness. Next: thread backtraces of lsd/uicache (kernel sampler,
 `sweetsample=lsd,uicache,SpringBoard`) and installd's launch.
+
+## Display controller: zero-copy swaps (xnu 0083, not yet booted)
+
+Today the CPU copies every frame (the centered 1080x2400 part of
+backboardd's 1125x2436 surface, 10 MB) into ABL's splash framebuffer.
+`bsd/dev/sweet_dpu.c` drives the MDSS display pipe that ABL left scanning
+out that framebuffer instead:
+
+- `sweetdpu=1` (default): read-only dump, `SWEET DPU:` lines with every
+  source pipe (SRC_SIZE, XY, address, stride, format, op mode) and CTL
+  (layers, flush, intf). It also picks the pipe whose SRC0_ADDR is the splash.
+- `sweetdpu=2` (needs `sweetfb_noconsole=1`): zero-copy. backboardd's two
+  display-sized IOSurfaces get physical slots inside cont_splash_region
+  (`0x9c000000` and `0x9cc48000`, 0xab8000 bytes each). A full-screen swap
+  of one of them cleans its caches through its write-back kernel mapping and
+  repoints the pipe (SRC0_ADDR, YSTRIDE0 4608, SRC_XY 22,18) with a CTL
+  flush at the next frame. Other swaps use the copy path, and display off
+  restores ABL's framebuffer.
+
+The slots stay inside the carve-out the display already reads, so the MDSS
+IOMMU setup does not matter. Writes are 3 SSPP registers and CTL_FLUSH
+(nothing else of ABL's pipeline). Register offsets: Linux dpu1
+(dpu_hw_sspp.c, dpu_hw_ctl.c), Xiaomi sde_hw_sspp.c, DT qcom,sde-*-off;
+mdp_phys `0xae00000`.
+
+Test, in order:
+1. `shim/out/shim-boot-joyeuse-dpu1.img`: check the `SWEET DPU:` dump in
+   the live log (pipe found, format and stride as expected).
+2. `shim/out/shim-boot-joyeuse-dpu2.img`: expect `pool slot 1/0 ...` and
+   `pipe ... now fetches 0x9cc48000`, a smoother GUI, and lower CPU
+   (`ssh ... top`).
+
+If the screen goes wrong, reboot (hold Power + Volume down). Nothing is
+persistent: the pipe is reprogrammed on every boot by ABL.
+
+## GPU (Adreno 618): plan
+
+Research (2026-10-19): there is no Apple-GPU-free iOS GPU stack anywhere.
+iOS 16 composites through Metal, and Metal.framework loads the userspace
+driver plugin named by the GPU's kernel service (`AGXMetalA11.bundle` on the
+iPhone X). The IPSW has no paravirtualized one. A path, in steps:
+1. An XNU kernel driver for the Adreno 618 (GMU, SQE `a630_sqe.fw`,
+   `a618_gmu`/`a630_gmu.bin`, zap shader from the MIUI ROM, IOMMU, rings),
+   modelled on Linux msm a6xx. It could expose a KGSL-like interface.
+2. Mesa Turnip (Vulkan 1.3 conformant on A618; it has a KGSL backend and a
+   no-drm build MR) ported to Darwin.
+3. A Metal plugin on top (Darling's Indium: Metal on Vulkan 1.3, AIR to
+   SPIR-V), plus the private interfaces QuartzCore uses. This is the
+   hardest part.
