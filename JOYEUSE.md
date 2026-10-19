@@ -203,3 +203,33 @@ Firmware for the later steps comes from the MIUI 14.0.3.0 vendor image
 `.b00`-`.b02` (the zap shader the TrustZone loads; on atoll it is named
 a615). Like the touch firmware it stays outside git: extract it to
 `../gpufw/` next to the checkout.
+
+### Step 1: CX power (xnu 0085)
+
+SM7125 is SC7180 with other CPU names (Linux `sm7125.dtsi` includes
+`sc7180.dtsi`), and SC7180's A618 is well supported upstream, so the
+sequences come from Linux `gcc-sc7180.c`, `gpucc-sc7180.c`, `gdsc.c`,
+`clk-rcg2.c` and `msm/adreno/a6xx_gmu.c`. UniXNU's `NativeAdreno` is an
+A740 (a7xx) driver: its ring, submit, user client and Metal layers are the
+reference for later steps, not its hardware init.
+
+`sweetgpu=<stage>` (thread `sweetgpudelay` s after boot, default 20; the
+lines also stay in `sysctl kern.sweetgpu`):
+1. Read GCC and GPUCC (default). Hardware result from `dpu1`:
+   `gpu_cfg_ahb` on, `memnoc_gfx` and `snoc_dvm_gfx` off.
+2. Power the CX side: GCC `gpll0`/`gpll0_div` GPU votes (0x152000 bits
+   15/16), `memnoc_gfx`, `snoc_dvm_gfx`, `ddrss_gpu_axi`; CX GDSC (GDSCR
+   0x509106c, status in gds_hw_ctrl 0x5091540); GPUCC `cxo`, `gmu_clk_src`
+   at 200 MHz (GPLL0 div / 1.5), `cx_gmu`, `cx_snoc_dvm`. Then read the GMU
+   (CM3 reset/init result, RSCC, AO status).
+3. Also read the adreno SMMU at 0x5040000 (CR0, IDRs, stream matches,
+   context banks), to see what the GMU (stream 5) and GPU (stream 0) get.
+
+Test shims: `shim/out/shim-boot-joyeuse-gpu2.img` and `-gpu3.img` (both
+with `sweetdpu=2`). Read the result with
+`ssh ... sysctl -n kern.sweetgpu`.
+
+Next steps: GMU firmware boot (PDC/RSCC sequences, `a630_gmu.bin` into the
+ITCM, HFI queues in GMU memory mapped through SMMU stream 5, OOB GX power
+through RPMh), then the zap shader (`a615_zap` via the SCM PAS calls), the
+SQE microcode and the first ring.
