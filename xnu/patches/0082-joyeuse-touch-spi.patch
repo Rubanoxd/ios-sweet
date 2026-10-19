@@ -44,7 +44,7 @@
  	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_spi.c
-@@ -0,0 +1,1224 @@
+@@ -0,0 +1,1246 @@
 +/*
 + * JOYEUSE SE11 FIFO SPI / Focaltech FT8756 / Novatek NT36675 TDDI bring-up.
 + * Redmi Note 9 Pro (joyeuse, SM7125 atoll). sweet_touch_init() starts this
@@ -516,6 +516,9 @@
 +	return err;
 +}
 +
++static uint8_t fts_last_status;
++static bool fts_last_crc_bad;
++
 +static int
 +fts_read(uint8_t cmd, uint8_t *out, unsigned n)
 +{
@@ -531,8 +534,10 @@
 +	int err = EIO;
 +	for (unsigned retry = 0; retry < 3u && err; ++retry) {
 +		err = jt_xfer(jt_tx, jt_rx, frame_len);
-+		if (!err && ((jt_rx[3] & 0xa0u) ||
-+		    fts_crc(jt_rx + data_off, n) != (jt_rx[data_off + n] | ((uint16_t)jt_rx[data_off + n + 1u] << 8)))) {
++		fts_last_status = jt_rx[3];
++		fts_last_crc_bad = !err && fts_crc(jt_rx + data_off, n) !=
++		    (jt_rx[data_off + n] | ((uint16_t)jt_rx[data_off + n + 1u] << 8));
++		if (!err && ((jt_rx[3] & 0xa0u) || fts_last_crc_bad)) {
 +			err = EIO;
 +		}
 +		jt_udelay(FTS_CS_HIGH_US);
@@ -715,8 +720,25 @@
 +	    (err && buf[1] == 0xefu)) {
 +		return 1; /* fts_fw_recovery */
 +	}
-+	if (err || (buf[1] & 0xf0u) != 0x90u) {
-+		return -(err ? err : EIO);
++	static unsigned diag;
++	if (err) {
++		if (diag < 8u) {
++			++diag;
++			printf("SWEET TOUCH SPI: fts touch read err %d status %#x crc %s\n",
++			    err, fts_last_status, fts_last_crc_bad ? "bad" : "ok");
++		}
++		return -err;
++	}
++	if ((buf[1] & 0xf0u) != 0x90u) {
++		/* No new frame (the vendor driver reads only on IRQ): keep contacts. */
++		static uint8_t last_hdr = 0x5a;
++		if (buf[1] != last_hdr && diag < 8u) {
++			++diag;
++			printf("SWEET TOUCH SPI: fts idle header %02x %02x %02x %02x %02x %02x\n",
++			    buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
++		}
++		last_hdr = buf[1];
++		return 0;
 +	}
 +	unsigned n = buf[2] & 0x0fu;
 +	if (n == 0x0fu && buf[3] == 0xffu && buf[4] == 0xffu && buf[5] == 0xffu && buf[6] == 0xffu) {
