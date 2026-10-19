@@ -5,8 +5,8 @@ Port of the sweet bring-up to the global Redmi Note 9 Pro (`joyeuse`;
 2026-10-19: boots iOS 16.7.16 to the home screen, with working touch.**
 Kernel `5e42f18` (fork CI run 39290730255), shim with
 `sweetfb_noconsole=1 sweetusb=2 sweettouchdelay=120`, Huaxing panel
-(FT8756). Unlocking by swipe and reaching the home screen were confirmed
-on the phone.
+(FT8756). Confirmed on the phone: unlocking by swipe, the home screen,
+opening Settings, and the home gesture (leaving an app).
 
 ## Verified on the phone (2026-10-19)
 
