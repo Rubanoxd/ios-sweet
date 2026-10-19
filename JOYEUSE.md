@@ -263,9 +263,17 @@ ttbr0 0x10483c000, sctlr 0x67`, PDC was disabled before (`enable 0`),
 0xbabeface`. No SMMU fault (`gfsr 0`, CB4 `fsr 0x400` is only its
 long-descriptor FORMAT field). iOS keeps running.
 
-Next steps: GX power through the GMU (legacy OOB `gfx_rail_on`, SPTPRAC
-enable) and the HFI v1 start (init, firmware version, perf and bus tables),
-which makes the GPU core registers reachable; then the zap shader (`a615_zap` via the SCM PAS calls), the
+5. `sweetgpu=5` (xnu 0087, shim `shim-boot-joyeuse-gpu5.img`): GX power
+   and HFI v1. Hardware result (2026-10-20): **GX is up and the GPU core
+   answers.** cmd-db `gfx.lvl`/`cx.lvl`/`mx.lvl` have 16 levels each
+   (0, 16, 64, 128, ...); boot vote `0x01800307` (800 MHz); BOOT_SLUMBER
+   OOB acked, `sptprac on (0x28)`, `gx_gdscr 0xf8222000` (on); HFI queues
+   up, GMU firmware version `0x10070000`, perf table (8 GPU levels), a618
+   bw table and test accepted; GPU_SET OOB acked; core `rbbm_status
+   0x00000001`, no CP fault.
+
+Next steps: the GPU's own SMMU context (stream 0) and the a6xx hw_init
+register setup, then the zap shader (`a615_zap` via the SCM PAS calls), the
 SQE microcode and the first ring.
 
 ## Internet over USB
@@ -282,5 +290,6 @@ The phone reaches the internet through the Mac (2026-10-20: ping, DNS and
    mDNSResponder gets the servers. The launchd job `es.sweet.netconfig`
    runs it at boot and every 60 s (`sweet-jb-install.py --netconfig BIN`;
    on the live phone it was added to the launchd cache by hand, with the
-   original kept in `/var/jb/var/sweet/launchd.plist.orig`).
+   original kept in `/var/jb/var/sweet/launchd.plist.orig`; checked across
+a reboot).
 `route`, `ifconfig` and `netstat` come from Procursus `network-cmds`.
