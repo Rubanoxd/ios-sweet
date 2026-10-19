@@ -114,3 +114,18 @@ tools/touch-spi-test/run.sh touchfw/focaltech_ts_fw_huaxing.bin touchfw/novatek_
 - Display off (patch 0079) blacks the pixels; on the LCD the backlight
   stays on (PM6150L WLED control is not implemented).
 - Keys and battery on joyeuse (USB works).
+
+## Sileo / Procursus (2026-10-19)
+
+`tools/sweet-jb-image-macos.sh` (with `sweet-jb-install.py`) puts the Procursus
+iOS 16 rootless bootstrap (`/var/jb`), sshd and queued .debs on the root
+image. On the phone: prep_bootstrap.sh ran (exit 0), Sileo 2.5.1 is
+installed by dpkg, and SSH with key auth works as mobile and root
+(`ssh -i ssh/joyeuse_ed25519 root@192.168.7.2`). `cpus=8`: hw.ncpu 8.
+
+Open issue (first boot after reflashing): the Apple logo stays up with the
+system idle. SpringBoard, lsd and the `uicache` that dpkg's uikittools trigger
+runs all sleep at 0 % CPU, no LaunchServices `*.csstore` exists yet, installd
+is not running and installcoordinationd is. So this is a wait chain, not
+slowness. Next: thread backtraces of lsd/uicache (kernel sampler,
+`sweetsample=lsd,uicache,SpringBoard`) and installd's launch.
