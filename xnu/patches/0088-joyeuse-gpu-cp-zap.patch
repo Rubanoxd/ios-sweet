@@ -1,0 +1,488 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -21,6 +21,11 @@
+  *      levels, BOOT_SLUMBER OOB (gfx rail on), SPTPRAC, HFI queues, the
+  *      init / version / perf table / bw table / test messages, then the
+  *      GPU_SET OOB that powers GX, and a read of the core's RBBM status
++ *   6  the GPU itself: SMMU context bank 0 for its stream 0, the a618 part
++ *      of a6xx hw_init, the a630_sqe.fw microcode, a 32 KiB ring, CP start
++ *      and CP_ME_INIT; the a615_zap shader through the SCM PAS calls (pas
++ *      id 13 into pil_gpu_mem 0x93b15000) and CP_SET_SECURE_MODE 0; then a
++ *      CP_MEM_WRITE that must land in memory
+  * 0 skips everything. A block is read only after the status bits of the
+  * clocks and power domain in front of it say it is reachable (an access to
+  * a gated block hangs the bus); the first failure stops the sequence.
+@@ -487,31 +492,32 @@
+ }
+ 
+ static bool
+-gpu_smmu_gmu_context(vm_offset_t smmu)
++gpu_smmu_bank(vm_offset_t smmu, uint32_t idx, uint32_t sid, uint64_t ttbr)
+ {
+ 	uint32_t id1 = gpu_rd(smmu, 0x24);
+ 	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
+ 	unsigned numpage = 1u << (((id1 >> 28) & 0x7u) + 1);
+-	uint32_t cb = (uint32_t)((numpage + SMMU_GMU_IDX) << pgshift);
++	uint32_t cb = (uint32_t)((numpage + idx) << pgshift);
+ 	uint32_t gr1 = 1u << pgshift;
+-	if ((id1 & 0xffu) <= SMMU_GMU_IDX || (gpu_rd(smmu, 0x20) & 0xffu) <= SMMU_GMU_IDX ||
++	if ((id1 & 0xffu) <= idx || (gpu_rd(smmu, 0x20) & 0xffu) <= idx ||
+ 	    cb + 0x1000 > SMMU_SIZE) {
+-		gpu_log("smmu has no bank %u in the window (idr1 0x%08x)", SMMU_GMU_IDX, id1);
++		gpu_log("smmu has no bank %u in the window (idr1 0x%08x)", idx, id1);
+ 		return false;
+ 	}
+-	if (gpu_rd(smmu, 0x800 + 4 * SMMU_GMU_IDX) & (1u << 31)) {
+-		gpu_log("smmu smr%u already in use", SMMU_GMU_IDX);
++	if (gpu_rd(smmu, 0x800 + 4 * idx) & (1u << 31)) {
++		gpu_log("smmu smr%u already in use", idx);
+ 		return false;
+ 	}
+ 	/* Context bank (arm-smmu.c arm_smmu_write_context_bank): AArch64
+-	 * format, stage 1 with stage 2 bypass, VMID = index + 1. */
++	 * format, stage 1 with stage 2 bypass, VMID = index + 1; the 32-bit
++	 * input tables at ttbr are built by the caller. */
+ 	gpu_wr(smmu, cb + 0x0, 0);                                     /* SCTLR off */
+-	gpu_wr(smmu, gr1 + 0x800 + 4 * SMMU_GMU_IDX, 1u);              /* CBA2R VA64 */
+-	gpu_wr(smmu, gr1 + 4 * SMMU_GMU_IDX,                           /* CBAR */
+-	    (1u << 16) | (0xfu << 12) | (3u << 8) | (SMMU_GMU_IDX + 1));
++	gpu_wr(smmu, gr1 + 0x800 + 4 * idx, 1u);              /* CBA2R VA64 */
++	gpu_wr(smmu, gr1 + 4 * idx,                           /* CBAR */
++	    (1u << 16) | (0xfu << 12) | (3u << 8) | (idx + 1));
+ 	gpu_wr(smmu, cb + 0x10, 0x1);                                  /* TCR2: 36-bit PA */
+-	gpu_wr(smmu, cb + 0x20, (uint32_t)gmu_mem_pa);                 /* TTBR0, ASID 0 */
+-	gpu_wr(smmu, cb + 0x24, (uint32_t)(gmu_mem_pa >> 32));
++	gpu_wr(smmu, cb + 0x20, (uint32_t)ttbr);                 /* TTBR0, ASID 0 */
++	gpu_wr(smmu, cb + 0x24, (uint32_t)(ttbr >> 32));
+ 	gpu_wr(smmu, cb + 0x28, 0);                                    /* TTBR1 */
+ 	gpu_wr(smmu, cb + 0x2c, 0);
+ 	gpu_wr(smmu, cb + 0x30, 32u | (2u << 12) | (1u << 23));        /* TCR: T0SZ 32, OSH NC walk, EPD1 */
+@@ -522,29 +528,41 @@
+ 	gpu_wr(smmu, cb + 0x618, 0);                                   /* TLBIALL */
+ 	gpu_wr(smmu, cb + 0x7f0, 0);                                   /* TLBSYNC */
+ 	if (!gpu_wait(smmu, cb + 0x7f4, 1u, 0, 1000)) {
+-		gpu_log("smmu cb%u TLB sync stuck", SMMU_GMU_IDX);
++		gpu_log("smmu cb%u TLB sync stuck", idx);
+ 	}
+ 	/* Stream mapping: S2CR (translate, this bank) before the valid SMR. */
+-	gpu_wr(smmu, 0xc00 + 4 * SMMU_GMU_IDX, SMMU_GMU_IDX);
+-	gpu_wr(smmu, 0x800 + 4 * SMMU_GMU_IDX, (1u << 31) | SMMU_GMU_SID);
+-	gpu_log("smmu cb%u at 0x%x: sid %u -> ttbr0 0x%llx, sctlr 0x%08x", SMMU_GMU_IDX, cb,
+-	    SMMU_GMU_SID, gmu_mem_pa, gpu_rd(smmu, cb));
++	gpu_wr(smmu, 0xc00 + 4 * idx, idx);
++	gpu_wr(smmu, 0x800 + 4 * idx, (1u << 31) | sid);
++	gpu_log("smmu cb%u at 0x%x: sid %u -> ttbr0 0x%llx, sctlr 0x%08x", idx, cb,
++	    sid, ttbr, gpu_rd(smmu, cb));
+ 	return true;
+ }
+ 
++static bool
++gpu_smmu_gmu_context(vm_offset_t smmu)
++{
++	return gpu_smmu_bank(smmu, SMMU_GMU_IDX, SMMU_GMU_SID, gmu_mem_pa);
++}
++
+ static void
+-gpu_smmu_gmu_faults(vm_offset_t smmu)
++gpu_smmu_faults(vm_offset_t smmu, uint32_t idx)
+ {
+ 	uint32_t id1 = gpu_rd(smmu, 0x24);
+ 	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
+ 	unsigned numpage = 1u << (((id1 >> 28) & 0x7u) + 1);
+-	uint32_t cb = (uint32_t)((numpage + SMMU_GMU_IDX) << pgshift);
++	uint32_t cb = (uint32_t)((numpage + idx) << pgshift);
+ 	gpu_log("smmu gfsr 0x%08x gfsynr0 0x%08x gfsynr1 0x%08x cb%u fsr 0x%08x far 0x%08x%08x fsynr0 0x%08x",
+-	    gpu_rd(smmu, 0x48), gpu_rd(smmu, 0x50), gpu_rd(smmu, 0x54), SMMU_GMU_IDX,
++	    gpu_rd(smmu, 0x48), gpu_rd(smmu, 0x50), gpu_rd(smmu, 0x54), idx,
+ 	    gpu_rd(smmu, cb + 0x58), gpu_rd(smmu, cb + 0x64), gpu_rd(smmu, cb + 0x60),
+ 	    gpu_rd(smmu, cb + 0x68));
+ }
+ 
++static void
++gpu_smmu_gmu_faults(vm_offset_t smmu)
++{
++	gpu_smmu_faults(smmu, SMMU_GMU_IDX);
++}
++
+ /* a6xx_gmu_rpmh_init for a618 (pdc_address_offset 0x30090), ending with
+  * a6xx_rpmh_stop. */
+ static bool
+@@ -1013,8 +1031,366 @@
+ 	    gpu_rd(core, 0x210 << 2), gpu_rd(core, 0x211 << 2), gpu_rd(core, 0x213 << 2),
+ 	    gpu_rd(core, 0x201 << 2), gpu_rd(core, 0x821 << 2));
+ 	return true;
++}
++
++/* Stage 6: the GPU's SMMU context, a6xx hw_init, CP start, zap shader. */
++
++/* GPU memory (context bank 0, stream 0: the DT's gfx3d_user): page tables,
++ * then the ring, the SQE microcode and a scratch page, at GFX_IOVA. */
++#define GFX_IOVA          0x10000000u
++#define GFX_RB_OFF        0x00000u    /* 32 KiB ring */
++#define GFX_SQE_OFF       0x08000u    /* 32 KiB */
++#define GFX_SCRATCH_OFF   0x10000u    /* 4 KiB */
++#define GFX_MEM_SIZE      0x11000u
++#define GFX_RB_DWORDS     (0x8000u / 4)
++#define SMMU_GFX_SID      0u
++#define SMMU_GFX_IDX      0u          /* DT gfx3d_user qcom,gpu-offset 0x48000 */
++
++#define ZAP_PA            0x93b15000u /* DT pil_gpu_mem */
++#define ZAP_SIZE          0x2000u
++#define GPU_PAS_ID        13u         /* DT pil_gpu qcom,pas-id */
++
++#define CP_TYPE7_PKT      0x70000000u
++#define CP_NOP            0x10u
++#define CP_MEM_WRITE      0x3du
++#define CP_ME_INIT        0x48u
++#define CP_SET_SECURE_MODE 0x66u
++
++static vm_offset_t gfx_mem, gpu_core;
++static uint64_t gfx_mem_pa;
++static uint32_t rb_wptr;
++
++static void
++core_wr(uint32_t dw, uint32_t v)
++{
++	gpu_wr(gpu_core, dw << 2, v);
++}
++
++static uint32_t
++core_rd(uint32_t dw)
++{
++	return gpu_rd(gpu_core, dw << 2);
++}
++
++static void
++core_wr64(uint32_t dw, uint64_t v)
++{
++	core_wr(dw, (uint32_t)v);
++	core_wr(dw + 1, (uint32_t)(v >> 32));
++}
++
++static void
++gfx_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(gfx_mem_pa + GMU_TABLES + off), len, TRUE);
+ }
+ 
++static uint32_t
++pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	    (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static void
++rb_out(uint32_t v)
++{
++	*(volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_RB_OFF + 4 * rb_wptr) = v;
++	rb_wptr = (rb_wptr + 1) % GFX_RB_DWORDS;
++}
++
++static void
++rb_pkt7(uint32_t opcode, uint32_t cnt)
++{
++	rb_out(CP_TYPE7_PKT | cnt | (pm4_parity(cnt) << 15) | ((opcode & 0x7f) << 16) |
++	    (pm4_parity(opcode) << 23));
++}
++
++/* a6xx_flush + a6xx_idle: publish the ring, wait for the CP to drain it
++ * and for the GPU to go idle (RBBM_STATUS bit 0, CP_AHB_BUSY_CX_MASTER,
++ * does not count). */
++static bool
++rb_kick(const char *what)
++{
++	gfx_sync(GFX_RB_OFF, 0x8000);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	core_wr(0x0807, rb_wptr);                 /* CP_RB_WPTR */
++	bool drained = false, idle = false;
++	for (unsigned i = 0; i < 100000 && !idle; ++i) {
++		drained = drained || core_rd(0x0806) == rb_wptr;   /* CP_RB_RPTR */
++		idle = drained && !(core_rd(0x0210) & ~1u) && !(core_rd(0x0201) & (1u << 23));
++		if (!idle) {
++			delay(1);
++		}
++	}
++	gpu_log("%s: %s (rptr %u wptr %u rbbm_status 0x%08x int0 0x%08x cp_hw_fault 0x%08x)",
++	    what, idle ? "idle" : "TIMEOUT", core_rd(0x0806), rb_wptr, core_rd(0x0210),
++	    core_rd(0x0201), core_rd(0x0821));
++	return idle;
++}
++
++/* Qualcomm SCM over SMCCC (drivers/firmware/qcom/qcom_scm-smc.c): standard
++ * SMC64 SIP calls, x6 carries the session across QCOM_SCM_INTERRUPTED. */
++static int64_t
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
++    uint64_t *result)
++{
++	uint64_t fn = 0x42000000ull | ((svc & 0xff) << 8) | (cmd & 0xff);
++	for (unsigned busy = 0; busy < 20; ++busy) {
++		uint64_t first = fn, session = 0;
++		register uint64_t x0 __asm__("x0");
++		register uint64_t x1 __asm__("x1");
++		register uint64_t x2 __asm__("x2");
++		register uint64_t x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4");
++		register uint64_t x5 __asm__("x5");
++		register uint64_t x6 __asm__("x6");
++		register uint64_t x7 __asm__("x7");
++		do {
++			x0 = first;
++			x1 = arginfo;
++			x2 = a0;
++			x3 = a1;
++			x4 = a2;
++			x5 = 0;
++			x6 = session;
++			x7 = 0;
++			__asm__ volatile ("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			first = x0;          /* QCOM_SCM_INTERRUPTED: call again with it */
++			session = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12) {        /* QCOM_SCM_V2_EBUSY */
++			if (result) {
++				*result = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++	return -12;
++}
++
++/* adreno_gpu.c zap_shader_load_mdt + mdt_loader.c for the split a615_zap
++ * (metadata = ELF header + hash segment, i.e. the whole .mdt; one
++ * relocatable PT_LOAD segment in .b02), then qcom_scm_pas_auth_and_reset. */
++static bool
++gpu_zap_load(void)
++{
++	uint64_t res = 0;
++	int64_t rc = scm_call(2, 7, 1, GPU_PAS_ID, 0, 0, &res);    /* PAS_IS_SUPPORTED */
++	gpu_log("scm pas_is_supported(%u): rc %lld result %llu", GPU_PAS_ID, rc, res);
++	if (rc || !res) {
++		return false;
++	}
++	uint8_t *mdt = NULL, *seg = NULL;
++	size_t mdt_len = 0, seg_len = 0;
++	if (gpu_load_file("/usr/share/firmware/joyeuse/gpu/a615_zap.mdt", &mdt, &mdt_len)) {
++		return false;
++	}
++	bool ok = false;
++	vm_offset_t meta = 0, zap = 0;
++	uint32_t phnum = *(const uint16_t *)(mdt + 44), phoff = *(const uint32_t *)(mdt + 28);
++	uint32_t seg_pa = 0, seg_memsz = 0, seg_filesz = 0, seg_index = 0, min_pa = ~0u, max_end = 0;
++	if (mdt_len < 52 || memcmp(mdt, "\x7f" "ELF", 4) || mdt[4] != 1 ||
++	    phoff + phnum * 32u > mdt_len) {
++		gpu_log("a615_zap.mdt: not an ELF32 image");
++		goto out;
++	}
++	for (uint32_t i = 0; i < phnum; ++i) {
++		const uint32_t *ph = (const uint32_t *)(mdt + phoff + 32 * i);
++		/* PT_LOAD, not the hash segment, non-empty (mdt_phdr_valid) */
++		if (ph[0] != 1 || (ph[6] & 0x07000000u) == 0x02000000u || !ph[5]) {
++			continue;
++		}
++		seg_index = i;
++		seg_pa = ph[3];
++		seg_filesz = ph[4];
++		seg_memsz = ph[5];
++		min_pa = seg_pa < min_pa ? seg_pa : min_pa;
++		uint32_t end = (seg_pa + seg_memsz + 0xfffu) & ~0xfffu;
++		max_end = end > max_end ? end : max_end;
++	}
++	if (min_pa != seg_pa || max_end - min_pa > ZAP_SIZE || seg_filesz > seg_memsz) {
++		gpu_log("a615_zap.mdt: unexpected segments (pa 0x%x memsz 0x%x)", seg_pa, seg_memsz);
++		goto out;
++	}
++	/* The metadata must be physically contiguous; TZ protects it during the
++	 * call, so the CPU never touches it again afterwards. */
++	if (kmem_alloc_contig(kernel_map, &meta, round_page(mdt_len), PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		goto out;
++	}
++	memcpy((void *)meta, mdt, mdt_len);
++	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta));
++	flush_dcache64((addr64_t)meta_pa, (unsigned)round_page(mdt_len), TRUE);
++	rc = scm_call(2, 1, 0x82, GPU_PAS_ID, meta_pa, 0, &res);      /* PAS_INIT_IMAGE */
++	gpu_log("scm pas_init_image: rc %lld result %llu (metadata %zu bytes at 0x%llx)", rc, res,
++	    mdt_len, meta_pa);
++	if (rc || res) {
++		goto out;
++	}
++	rc = scm_call(2, 2, 3, GPU_PAS_ID, ZAP_PA, max_end - min_pa, &res);  /* PAS_MEM_SETUP */
++	gpu_log("scm pas_mem_setup(0x%x, 0x%x): rc %lld result %llu", ZAP_PA, max_end - min_pa, rc, res);
++	if (rc || res) {
++		goto out;
++	}
++	char name[64];
++	snprintf(name, sizeof(name), "/usr/share/firmware/joyeuse/gpu/a615_zap.b%02u", seg_index);
++	if (gpu_load_file(name, &seg, &seg_len) || seg_len != seg_filesz) {
++		gpu_log("%s: %zu bytes, want %u", name, seg_len, seg_filesz);
++		goto out;
++	}
++	zap = ml_io_map(ZAP_PA, ZAP_SIZE);
++	if (!zap) {
++		goto out;
++	}
++	for (uint32_t i = 0; i < seg_memsz; i += 4) {
++		uint32_t v = 0;
++		if (i < seg_filesz) {
++			memcpy(&v, seg + i, seg_filesz - i >= 4 ? 4 : seg_filesz - i);
++		}
++		gpu_wr(zap, i, v);
++	}
++	rc = scm_call(2, 5, 1, GPU_PAS_ID, 0, 0, &res);                /* PAS_AUTH_AND_RESET */
++	gpu_log("scm pas_auth_and_reset: rc %lld result %llu", rc, res);
++	ok = !rc && !res;
++out:
++	if (seg) {
++		kfree_data(seg, seg_len);
++	}
++	kfree_data(mdt, mdt_len);
++	return ok;
++}
++
++static void
++gpu_gfx_tables(void)
++{
++	uint64_t *l1 = (uint64_t *)gfx_mem;
++	uint64_t *l2 = (uint64_t *)(gfx_mem + 0x1000);
++	uint64_t *l3 = (uint64_t *)(gfx_mem + 0x2000);
++	l1[(GFX_IOVA >> 30) & 0x3] = (gfx_mem_pa + 0x1000) | 0x3;
++	l2[(GFX_IOVA >> 21) & 0x1ff] = (gfx_mem_pa + 0x2000) | 0x3;
++	for (uint32_t i = 0; i < GFX_MEM_SIZE / 0x1000; ++i) {
++		l3[((GFX_IOVA >> 12) & 0x1ff) + i] = (gfx_mem_pa + GMU_TABLES + i * 0x1000ull) |
++		    0x3 | (1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11);
++	}
++}
++
++static bool
++gpu_stage_cp(vm_offset_t smmu)
++{
++	gpu_core = ml_io_map(0x05000000u, 0x40000);
++	uint8_t *sqe = NULL;
++	size_t sqe_len = 0;
++	if (!gpu_core || gpu_load_file("/usr/share/firmware/joyeuse/gpu/a630_sqe.fw", &sqe, &sqe_len)) {
++		return false;
++	}
++	/* adreno_fw_create_bo drops the first dword; a6xx_ucode_check_version
++	 * wants a630 microcode >= 0x190 (or a patched one). */
++	uint32_t ver = *(const uint32_t *)(sqe + 4);
++	gpu_log("a630_sqe.fw: %zu bytes, version 0x%03x", sqe_len, ver & 0xfff);
++	if (sqe_len - 4 > 0x8000 || ((ver & 0xfff) < 0x190 && !((ver & 0xf) == 0xa))) {
++		kfree_data(sqe, sqe_len);
++		return false;
++	}
++	if (kmem_alloc_contig(kernel_map, &gfx_mem, GMU_TABLES + GFX_MEM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		kfree_data(sqe, sqe_len);
++		return false;
++	}
++	gfx_mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gfx_mem));
++	memcpy((void *)(gfx_mem + GMU_TABLES + GFX_SQE_OFF), sqe + 4, sqe_len - 4);
++	kfree_data(sqe, sqe_len);
++	gpu_gfx_tables();
++	flush_dcache64((addr64_t)gfx_mem_pa, GMU_TABLES + GFX_MEM_SIZE, TRUE);
++	if (!gpu_smmu_bank(smmu, SMMU_GFX_IDX, SMMU_GFX_SID, gfx_mem_pa)) {
++		return false;
++	}
++
++	/* hw_init (a6xx_gpu.c) for a618: no hwcg, CP protect or UBWC yet. */
++	core_wr(0x3c45, 0);                       /* GBIF_HALT */
++	(void)core_rd(0x3c45);
++	core_wr(0x0016, 0);                       /* RBBM_GBIF_HALT */
++	(void)core_rd(0x0016);
++	core_wr(0xf803, 0);                       /* RBBM_SECVID_TSB_CNTL */
++	core_wr64(0xf800, 0);                     /* RBBM_SECVID_TSB_TRUSTED_BASE */
++	core_wr(0xf802, 0);                       /* RBBM_SECVID_TSB_TRUSTED_SIZE */
++	static const uint16_t addr_mode[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05,
++		                              0xa601, 0x9601, 0x0e00, 0xae01, 0xb601, 0xf810 };
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); ++i) {
++		core_wr(addr_mode[i], 1);             /* *_ADDR_MODE_CNTL: 64-bit */
++	}
++	core_wr(0x0010, 0x3);                     /* RBBM_VBIF_CLIENT_QOS_CNTL */
++	core_wr(0x050b, 0xffffffffu);             /* RBBM_PERFCTR_GPU_BUSY_MASKED */
++	core_wr64(0x0e05, 0x0001ffffffffffc0ull); /* UCHE_WRITE_RANGE_MAX */
++	core_wr64(0x0e09, 0x0001fffffffff000ull); /* UCHE_TRAP_BASE */
++	core_wr64(0x0e07, 0x0001fffffffff000ull); /* UCHE_WRITE_THRU_BASE */
++	core_wr64(0x0e0b, 0x100000);              /* UCHE_GMEM_RANGE_MIN */
++	core_wr64(0x0e0d, 0x100000 + 0x80000 - 1);   /* .._MAX (512 KiB GMEM) */
++	core_wr(0x0e18, 0x804);                   /* UCHE_FILTER_CNTL */
++	core_wr(0x0e17, 0x4);                     /* UCHE_CACHE_WAYS */
++	core_wr(0x08c2, 0x010000c0);              /* CP_ROQ_THRESHOLDS_2 */
++	core_wr(0x08c1, 0x8040362c);              /* CP_ROQ_THRESHOLDS_1 */
++	core_wr(0x08c3, 128);                     /* CP_MEM_POOL_SIZE */
++	core_wr(0x9e00, 0x00180000);              /* PC_DBG_ECO_CNTL: prim fifo */
++	core_wr(0x098d, 0x1);                     /* CP_AHB_CNTL: default slave error */
++	core_wr(0x0500, 0x1);                     /* RBBM_PERFCTR_CNTL */
++	core_wr(0x001f, (1u << 30) | 0x1fffff);   /* RBBM_INTERFACE_HANG_INT_CNTL */
++	core_wr(0x0e19, (1u << 7) | 0x1);         /* UCHE_CLIENT_PF */
++	core_wr(0x0038, 0);                       /* RBBM_INT_0_MASK: polled */
++
++	core_wr64(0x0830, GFX_IOVA + GFX_SQE_OFF);   /* CP_SQE_INSTR_BASE */
++	core_wr64(0x0800, GFX_IOVA + GFX_RB_OFF);    /* CP_RB_BASE */
++	core_wr(0x0802, 12u | (2u << 8) | (1u << 27));  /* CP_RB_CNTL: 32 KiB, NO_UPDATE */
++	rb_wptr = 0;
++	core_wr(0x0808, 1);                       /* CP_SQE_CNTL: start the CP */
++
++	/* a6xx_cp_init */
++	rb_pkt7(CP_ME_INIT, 8);
++	rb_out(0x0000002f);
++	rb_out(0x00000003);
++	rb_out(0x20000000);
++	for (unsigned i = 0; i < 5; ++i) {
++		rb_out(0);
++	}
++	if (!rb_kick("cp me_init")) {
++		gpu_smmu_faults(smmu, SMMU_GFX_IDX);
++		return false;
++	}
++
++	/* Leave secure mode: through the zap shader if TrustZone takes it,
++	 * otherwise the way Linux does on targets without one. */
++	if (gpu_zap_load()) {
++		rb_pkt7(CP_SET_SECURE_MODE, 1);
++		rb_out(0);
++		if (!rb_kick("cp set_secure_mode 0")) {
++			return false;
++		}
++	} else {
++		core_wr(0xf400, 0);                   /* RBBM_SECVID_TRUST_CNTL */
++		gpu_log("no zap shader; secvid_trust_cntl now 0x%08x", core_rd(0xf400));
++	}
++
++	/* First real work: the CP writes a value to memory through the SMMU. */
++	volatile uint32_t *scratch = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF);
++	*scratch = 0;
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++	rb_pkt7(CP_MEM_WRITE, 3);
++	rb_out(GFX_IOVA + GFX_SCRATCH_OFF);
++	rb_out(0);
++	rb_out(0xcafe0618u);
++	bool idle = rb_kick("cp mem_write");
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++	uint32_t v = *scratch;
++	gpu_log("GPU wrote 0x%08x to memory (want 0xcafe0618): %s", v,
++	    v == 0xcafe0618u ? "THE GPU EXECUTES COMMANDS" : "no");
++	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
++	return idle && v == 0xcafe0618u;
++}
++
+ static int sweet_gpu_sleep_chan;
+ 
+ static void
+@@ -1044,8 +1420,9 @@
+ 	if (sg.stage >= 4) {
+ 		vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+ 		if (smmu != 0) {
+-			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5) {
+-				(void)gpu_stage_gx_hfi();
++			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
++			    sg.stage >= 6) {
++				(void)gpu_stage_cp(smmu);
+ 			}
+ 		}
+ 	}
