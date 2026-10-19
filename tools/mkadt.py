@@ -47,7 +47,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 BOARDS = {
     'sweet': dict(compatible=['xiaomi,sweet', 'qcom,sm7150'], cpu='qcom,kryo470',
                   ecid=0x5357454554000001, touch=None),  # 'SWEET' + 1, synthetic
-    'joyeuse': dict(compatible=['xiaomi,joyeuse', 'xiaomi,sweet', 'qcom,atoll'], cpu='qcom,kryo465',
+    # cpu stays 'qcom,kryo470' (SM7125 is a Kryo 465): SweetCPU (xnu 0018) and
+    # the AppleKeyStore nub match that name, and without them boot stops silently.
+    'joyeuse': dict(compatible=['xiaomi,joyeuse', 'xiaomi,sweet', 'qcom,atoll'], cpu='qcom,kryo470',
                     ecid=0x5357454554000002, touch='joyeuse-spi'),
 }
 
