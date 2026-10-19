@@ -1,0 +1,529 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_touch_spi.c		standard
++bsd/dev/sweet_dpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -36,6 +36,7 @@
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
++	uint64_t                  dpuPA;        /* display pool slot (bsd/dev/sweet_dpu.c), or 0 */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -77,6 +77,9 @@
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++extern "C" int sweet_dpu_pool_get(uint32_t width, uint32_t height, uint32_t bpr, uint32_t size, uint64_t *pa);
++extern "C" void sweet_dpu_pool_put(uint64_t pa);
++
+ void
+ SweetSurface::free()
+ {
+@@ -86,6 +89,9 @@
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
++	if (dpuPA != 0) {
++		sweet_dpu_pool_put(dpuPA);
++	}
+ 	OSObject::free();
+ }
+ 
+@@ -212,6 +218,39 @@
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
+ 	return s;
++}
++
++/*
++ * backboardd's display-sized swap surfaces (zero-copy, sweetdpu=2) live in
++ * the display pool, physical memory the display pipe can fetch directly.
++ * Every mapping is write-back, so the kernel one can clean the caches
++ * before a flip. Leaves s->memory NULL when the surface does not qualify.
++ */
++static void
++sweet_surface_place_in_pool(SweetSurface *s)
++{
++	char who[32];
++	uint64_t pa = 0;
++	proc_selfname(who, sizeof(who));
++	if (strcmp(who, "backboardd") != 0 || s->planeCount != 0 || s->offset != 0 ||
++	    s->pixelFormat != 0x42475241 || s->bytesPerElement != 4 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->width < 1080 || s->height < 2400 ||
++	    sweet_dpu_pool_get(s->width, s->height, s->bytesPerRow, s->allocSize, &pa) != 0) {
++		return;
++	}
++	s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++	if (s->memory != NULL) {
++		s->kernelMap = s->memory->map(kIOMapCopybackCache);
++	}
++	if (s->memory == NULL || s->kernelMap == NULL) {
++		OSSafeReleaseNULL(s->kernelMap);
++		OSSafeReleaseNULL(s->memory);
++		sweet_dpu_pool_put(pa);
++		return;
++	}
++	s->mapCache = kIOMapCopybackCache;
++	s->dpuPA = pa;
++	bzero((void *)s->kernelMap->getVirtualAddress(), s->allocSize);
+ }
+ 
+ static bool
+@@ -685,6 +724,13 @@
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
++		sweet_surface_place_in_pool(s);
++	}
++	if (ret == kIOReturnSuccess && s->dpuPA != 0) {
++		if (!sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,12 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* bsd/dev/sweet_dpu.c: display pipe dump and zero-copy flips */
++extern "C" int sweet_dpu_init(uint64_t fb_pa, uint32_t width, uint32_t height, uint32_t stride);
++extern "C" int sweet_dpu_zero_copy(void);
++extern "C" int sweet_dpu_flip(uint64_t pa, vm_offset_t kva, uint32_t img_w, uint32_t img_h,
++    uint32_t stride, uint32_t x, uint32_t y);
++extern "C" void sweet_dpu_restore(void);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -116,12 +122,15 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fZeroCopy;      /* sweetdpu=2: swaps repoint the display pipe */
++	bool          fShowingPool;   /* the pipe fetches a pool surface, not fPixels */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	bool presentZeroCopy(const uint8_t *rec, uint32_t mask);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -203,6 +212,8 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	sweet_dpu_init(fPhys, fWidth, fHeight, fRowBytes);
++	fZeroCopy = sweet_dpu_zero_copy() != 0;
+ 	return true;
+ }
+ 
+@@ -227,6 +238,10 @@
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
++		if (step == 0 && fb->fShowingPool) {
++			sweet_dpu_restore();    /* fade the panel memory, not a swap surface */
++			fb->fShowingPool = false;
++		}
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+@@ -242,7 +257,8 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	/* A zero-copy flip costs a cache clean, not a 10 MB copy: every vsync. */
++	bool flush = fb->fDirty && (fb->fZeroCopy || (count % fb->fFlushTicks) == 0);
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -308,6 +324,40 @@
+ 	}
+ }
+ 
++/*
++ * Zero-copy: a frame that is one full-screen layer from a display-pool
++ * surface is shown by repointing the display pipe at that surface (the
++ * centered panel-sized part of it, as the copy path shows). Anything else
++ * returns false and takes the copy path.
++ */
++bool
++AppleCLCD::presentZeroCopy(const uint8_t *rec, uint32_t mask)
++{
++	uint32_t layer = 0, count = 0;
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		if ((mask & (1u << i)) && get32(rec, 0x54 + 4 * i) != 0) {
++			layer = i;
++			count++;
++		}
++	}
++	if (count != 1) {
++		return false;
++	}
++	const uint8_t *a = rec + 0x64 + 16 * layer;
++	const uint8_t *b = rec + 0xc4 + 16 * layer;
++	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54 + 4 * layer));
++	bool ok = s != NULL && s->dpuPA != 0 && s->width == fLogicalW && s->height == fLogicalH &&
++	    get32(a, 0) == 0 && get32(a, 4) == 0 && get32(b, 0) == 0 && get32(b, 4) == 0 &&
++	    (get32(b, 8) == 0 || get32(b, 8) == fLogicalW) && (get32(b, 12) == 0 || get32(b, 12) == fLogicalH) &&
++	    sweet_dpu_flip(s->dpuPA, s->kernelAddress(), s->width, s->height, s->bytesPerRow,
++	    (uint32_t)fOffX, (uint32_t)fOffY) == 0;
++	OSSafeReleaseNULL(s);
++	if (ok) {
++		fShowingPool = true;
++	}
++	return ok;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -324,6 +374,13 @@
+ 		}
+ 	}
+ 
++	if (fZeroCopy && presentZeroCopy(rec, mask)) {
++		return;
++	}
++	if (fShowingPool) {
++		sweet_dpu_restore();            /* this frame goes through the copy path */
++		fShowingPool = false;
++	}
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+--- /dev/null
++++ b/bsd/dev/sweet_dpu.c
+@@ -0,0 +1,314 @@
++/*
++ * SWEET display controller (Qualcomm MDSS DPU / "SDE") access for the
++ * built-in IOMobileFramebuffer (iokit/Kernel/arm/SweetFramebuffer.cpp).
++ *
++ * ABL leaves the video-mode DSI panel running: one source pipe (SSPP)
++ * fetches the continuous-splash framebuffer at 0x9c000000 every frame,
++ * through a layer mixer and the DSI interface, all configured by ABL.
++ * Nothing here sets that pipeline up; it is only found and, optionally,
++ * repointed:
++ *
++ *   sweetdpu=0  not touched
++ *   sweetdpu=1  (default) read-only dump of the pipes and CTLs to the log
++ *   sweetdpu=2  zero-copy: the two display-sized backboardd IOSurfaces live
++ *               in a physical pool inside the splash carve-out, and a swap
++ *               repoints the pipe (address, stride, crop) instead of the
++ *               CPU copying 10 MB into the panel memory. Needs
++ *               sweetfb_noconsole=1 (the console draws into the old panel
++ *               memory, which overlaps pool slot 0).
++ *
++ * The pool stays inside cont_splash_region (0x9c000000, 0x1700000 bytes),
++ * which the bootloader's display path already reads, so the MDSS IOMMU
++ * setup does not matter. A repointed pipe takes the new values at the next
++ * frame start after a CTL flush (video mode), like Linux dpu1/sde do.
++ *
++ * Register offsets: Linux drivers/gpu/drm/msm/disp/dpu1 (dpu_hw_sspp.c,
++ * dpu_hw_ctl.c) and the phones' DTs (qcom,sde-sspp-off / qcom,sde-ctl-off,
++ * mdp_phys 0xae00000): identical on SM7150 (sweet) and SM7125 (joyeuse)
++ * except for the extra VIG1 pipe and CTLs 3-5 on SM7150.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++int sweet_dpu_init(uint64_t fb_pa, uint32_t width, uint32_t height, uint32_t stride);
++int sweet_dpu_pool_get(uint32_t width, uint32_t height, uint32_t bpr, uint32_t size, uint64_t *pa);
++void sweet_dpu_pool_put(uint64_t pa);
++int sweet_dpu_flip(uint64_t pa, vm_offset_t kva, uint32_t img_w, uint32_t img_h, uint32_t stride, uint32_t x, uint32_t y);
++void sweet_dpu_restore(void);
++int sweet_dpu_zero_copy(void);
++
++#define MDP_PA            0x0ae00000u
++#define MDP_SIZE          0x00085000u
++#define SPLASH_PA         0x9c000000u
++#define SPLASH_SIZE       0x01700000u
++
++#define SSPP_SRC_SIZE     0x00
++#define SSPP_SRC_IMG_SIZE 0x04   /* dumped only */
++#define SSPP_SRC_XY       0x08
++#define SSPP_OUT_SIZE     0x0c
++#define SSPP_OUT_XY       0x10
++#define SSPP_SRC0_ADDR    0x14
++#define SSPP_SRC_YSTRIDE0 0x24
++#define SSPP_SRC_FORMAT   0x30
++#define SSPP_SRC_UNPACK   0x34
++#define SSPP_SRC_OP_MODE  0x38
++#define SSPP_UBWC_STATIC  0x44
++#define SSPP_FETCH_CONFIG 0x48
++
++#define CTL_LAYER0        0x000
++#define CTL_LAYER1        0x004
++#define CTL_TOP           0x014
++#define CTL_FLUSH         0x018
++#define CTL_LAYER_EXT0    0x040
++#define CTL_INTF_ACTIVE   0x0f4
++
++struct dpu_pipe {
++	const char *name;
++	uint32_t off;      /* from mdp_phys (DT qcom,sde-sspp-off) */
++	uint32_t flush;    /* CTL_FLUSH bit */
++};
++
++/* SM7125: VIG0, DMA0-2. SM7150 adds VIG1 (0x7000, flush bit 1). */
++static const struct dpu_pipe dpu_pipes_sm7125[] = {
++	{ "vig0", 0x05000, 1u << 0 }, { "dma0", 0x25000, 1u << 11 },
++	{ "dma1", 0x27000, 1u << 12 }, { "dma2", 0x29000, 1u << 24 },
++};
++static const struct dpu_pipe dpu_pipes_sm7150[] = {
++	{ "vig0", 0x05000, 1u << 0 }, { "vig1", 0x07000, 1u << 1 },
++	{ "dma0", 0x25000, 1u << 11 }, { "dma1", 0x27000, 1u << 12 },
++	{ "dma2", 0x29000, 1u << 24 },
++};
++
++static struct {
++	vm_offset_t mdp;
++	const struct dpu_pipe *pipe;   /* the one scanning out the splash */
++	uint32_t ctl;                  /* its CTL block offset */
++	int mode;
++	bool zero_copy;
++	/* ABL's values, for sweet_dpu_restore() */
++	uint32_t src_size, xy, addr, stride;
++	bool repointed;
++	/* pool: two slots inside the splash carve-out */
++	uint64_t slot_pa[2];
++	uint32_t slot_size;
++	bool slot_used[2];
++	lck_mtx_t *lock;
++} dpu;
++
++static uint32_t
++dpu_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(dpu.mdp + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++dpu_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(dpu.mdp + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++dpu_is_joyeuse(void)
++{
++	DTEntry root;
++	char const *compat = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess) {
++		return false;
++	}
++	for (unsigned int i = 0; i < size; i += (unsigned int)strnlen(compat + i, size - i) + 1) {
++		if (!strncmp(compat + i, "xiaomi,joyeuse", size - i)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++int
++sweet_dpu_init(uint64_t fb_pa, uint32_t width, uint32_t height, uint32_t stride)
++{
++	int mode = 1, quiet = 0;
++	PE_parse_boot_argn("sweetdpu", &mode, sizeof(mode));
++	dpu.mode = mode;
++	if (mode <= 0) {
++		return 0;
++	}
++	dpu.mdp = ml_io_map(MDP_PA, MDP_SIZE);
++	if (dpu.mdp == 0) {
++		printf("SWEET DPU: MDP map failed\n");
++		return -1;
++	}
++	bool joy = dpu_is_joyeuse();
++	const struct dpu_pipe *pipes = joy ? dpu_pipes_sm7125 : dpu_pipes_sm7150;
++	unsigned npipes = joy ? 4 : 5, nctl = joy ? 3 : 6;
++	printf("SWEET DPU: %s, MDP hw rev 0x%08x, splash fb 0x%llx %ux%u stride %u\n",
++	    joy ? "SM7125" : "SM7150", dpu_rd(0x0), fb_pa, width, height, stride);
++	for (unsigned i = 0; i < npipes; i++) {
++		uint32_t b = pipes[i].off;
++		uint32_t addr = dpu_rd(b + SSPP_SRC0_ADDR);
++		printf("SWEET DPU: %s src %08x img %08x xy %08x out %08x/%08x addr %08x stride %08x fmt %08x unpack %08x op %08x ubwc %08x fetch %08x\n",
++		    pipes[i].name, dpu_rd(b + SSPP_SRC_SIZE), dpu_rd(b + SSPP_SRC_IMG_SIZE),
++		    dpu_rd(b + SSPP_SRC_XY), dpu_rd(b + SSPP_OUT_SIZE), dpu_rd(b + SSPP_OUT_XY),
++		    addr, dpu_rd(b + SSPP_SRC_YSTRIDE0), dpu_rd(b + SSPP_SRC_FORMAT),
++		    dpu_rd(b + SSPP_SRC_UNPACK), dpu_rd(b + SSPP_SRC_OP_MODE),
++		    dpu_rd(b + SSPP_UBWC_STATIC), dpu_rd(b + SSPP_FETCH_CONFIG));
++		if (addr == (uint32_t)fb_pa && dpu.pipe == NULL) {
++			dpu.pipe = &pipes[i];
++		}
++	}
++	for (unsigned i = 0; i < nctl; i++) {
++		uint32_t c = 0x2000 + 0x200 * i;
++		uint32_t top = dpu_rd(c + CTL_TOP), l0 = dpu_rd(c + CTL_LAYER0), l1 = dpu_rd(c + CTL_LAYER1);
++		printf("SWEET DPU: ctl%u top %08x layer %08x/%08x ext %08x flush %08x intf %08x\n",
++		    i, top, l0, l1, dpu_rd(c + CTL_LAYER_EXT0), dpu_rd(c + CTL_FLUSH),
++		    dpu_rd(c + CTL_INTF_ACTIVE));
++		/* The CTL that mixes anything on a DSI interface is ABL's. */
++		if (dpu.ctl == 0 && (l0 | l1) != 0) {
++			dpu.ctl = c;
++		}
++	}
++	if (dpu.pipe == NULL || dpu.ctl == 0) {
++		printf("SWEET DPU: no pipe/CTL scanning out 0x%llx; zero-copy off\n", fb_pa);
++		return 0;
++	}
++	uint32_t b = dpu.pipe->off;
++	dpu.src_size = dpu_rd(b + SSPP_SRC_SIZE);
++	dpu.xy = dpu_rd(b + SSPP_SRC_XY);
++	dpu.addr = dpu_rd(b + SSPP_SRC0_ADDR);
++	dpu.stride = dpu_rd(b + SSPP_SRC_YSTRIDE0);
++	printf("SWEET DPU: splash pipe %s, ctl 0x%x\n", dpu.pipe->name, dpu.ctl);
++	if (mode < 2) {
++		return 0;
++	}
++	if (!PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) || quiet == 0) {
++		printf("SWEET DPU: zero-copy needs sweetfb_noconsole=1; off\n");
++		return 0;
++	}
++	static lck_grp_t *grp;
++	grp = lck_grp_alloc_init("sweet_dpu", LCK_GRP_ATTR_NULL);
++	dpu.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	dpu.zero_copy = dpu.lock != NULL;
++	printf("SWEET DPU: zero-copy %s\n", dpu.zero_copy ? "on" : "off (no lock)");
++	return 0;
++}
++
++int
++sweet_dpu_zero_copy(void)
++{
++	return dpu.zero_copy;
++}
++
++/*
++ * A pool slot for a display-sized surface, or nonzero. Slot 1 sits at the
++ * end of the carve-out and does not overlap the splash image ABL shows, so
++ * it is handed out first; slot 0 starts at the carve-out base.
++ */
++int
++sweet_dpu_pool_get(uint32_t width, uint32_t height, uint32_t bpr, uint32_t size, uint64_t *pa)
++{
++	if (!dpu.zero_copy || width == 0 || height == 0 || bpr < width * 4 ||
++	    (uint64_t)bpr * height > size || size > SPLASH_SIZE / 2 || (size & PAGE_MASK)) {
++		return -1;
++	}
++	int got = -1;
++	lck_mtx_lock(dpu.lock);
++	if (dpu.slot_size == 0) {
++		dpu.slot_size = size;
++		dpu.slot_pa[0] = SPLASH_PA;
++		dpu.slot_pa[1] = SPLASH_PA + SPLASH_SIZE - size;
++	}
++	if (size == dpu.slot_size) {
++		for (int i = 1; i >= 0 && got < 0; i--) {
++			if (!dpu.slot_used[i]) {
++				dpu.slot_used[i] = true;
++				*pa = dpu.slot_pa[i];
++				got = i;
++			}
++		}
++	}
++	lck_mtx_unlock(dpu.lock);
++	if (got >= 0) {
++		printf("SWEET DPU: pool slot %d at 0x%llx for a %ux%u surface\n", got, *pa, width, height);
++	}
++	return got >= 0 ? 0 : -1;
++}
++
++void
++sweet_dpu_pool_put(uint64_t pa)
++{
++	if (!dpu.zero_copy) {
++		return;
++	}
++	lck_mtx_lock(dpu.lock);
++	for (int i = 0; i < 2; i++) {
++		if (dpu.slot_used[i] && dpu.slot_pa[i] == pa) {
++			dpu.slot_used[i] = false;
++		}
++	}
++	lck_mtx_unlock(dpu.lock);
++}
++
++/*
++ * Show the (img_w x img_h, stride) image at pa: the pipe fetches the
++ * panel-sized rectangle at (x, y) of it. Its source size, format and the
++ * rest of the pipeline stay as ABL set them. The CPU caches of the image
++ * are cleaned first (MDSS reads are not coherent). That goes by kva, a
++ * write-back kernel mapping of pa: the splash carve-out is outside the
++ * kernel's RAM, so there is no physical-aperture address to clean by.
++ */
++int
++sweet_dpu_flip(uint64_t pa, vm_offset_t kva, uint32_t img_w, uint32_t img_h, uint32_t stride, uint32_t x, uint32_t y)
++{
++	if (!dpu.zero_copy || kva == 0 || pa < SPLASH_PA || pa + (uint64_t)stride * img_h > SPLASH_PA + SPLASH_SIZE ||
++	    img_w > 0xffff || img_h > 0xffff || x > 0xffff || y > 0xffff || (pa & 63) || (stride & 63)) {
++		return -1;
++	}
++	uint32_t w = dpu.src_size & 0xffff, h = dpu.src_size >> 16;
++	if (w == 0 || h == 0 || x + w > img_w || y + h > img_h || w * 4 > stride) {
++		return -1;      /* the panel-sized rectangle must lie inside the image */
++	}
++	clean_dcache(kva, (unsigned)(stride * img_h), FALSE);
++	/* Like Linux sde/dpu1 setup_rects: SRC_SIZE (the panel-sized source
++	 * rectangle, kept) at SRC_XY of the image; 0x04 is never written. */
++	uint32_t b = dpu.pipe->off;
++	dpu_wr(b + SSPP_SRC_XY, (y << 16) | x);
++	dpu_wr(b + SSPP_SRC_YSTRIDE0, stride);
++	dpu_wr(b + SSPP_SRC0_ADDR, (uint32_t)pa);
++	dpu_wr(dpu.ctl + CTL_FLUSH, dpu.pipe->flush);
++	if (!dpu.repointed) {
++		dpu.repointed = true;
++		printf("SWEET DPU: pipe %s now fetches 0x%llx (%ux%u stride %u, at %u,%u)\n",
++		    dpu.pipe->name, pa, img_w, img_h, stride, x, y);
++	}
++	return 0;
++}
++
++/* Back to ABL's framebuffer (panel memory), e.g. for the copy path. */
++void
++sweet_dpu_restore(void)
++{
++	if (!dpu.zero_copy || !dpu.repointed) {
++		return;
++	}
++	uint32_t b = dpu.pipe->off;
++	dpu_wr(b + SSPP_SRC_XY, dpu.xy);
++	dpu_wr(b + SSPP_SRC_YSTRIDE0, dpu.stride);
++	dpu_wr(b + SSPP_SRC0_ADDR, dpu.addr);
++	dpu_wr(dpu.ctl + CTL_FLUSH, dpu.pipe->flush);
++	dpu.repointed = false;
++	printf("SWEET DPU: pipe %s back on the splash framebuffer\n", dpu.pipe->name);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
