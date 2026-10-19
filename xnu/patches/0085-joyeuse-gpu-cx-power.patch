@@ -1,0 +1,434 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,40 +1,113 @@
+ /*
+- * JOYEUSE: Adreno 618 bring-up, step 0 - read-only state probe.
++ * JOYEUSE: Adreno 618 bring-up, staged like the touch probe.
+  *
+- * Reports what state ABL leaves the GPU in, before any driver is written:
+- * the GCC branches the GPU blocks hang off and the GPUCC power domains
+- * (CX: GMU, GX: GPU core). Like the USB probe
+- * (bsd/dev/sweet_usb.c) it never writes a register, and it reads a block
+- * only after the status bits of the clocks and power domain in front of it
+- * say it is reachable (an access to a gated block hangs the bus).
++ * SM7125 (atoll) is SC7180 with other CPU names (Linux sm7125.dtsi includes
++ * sc7180.dtsi), so every address and sequence here follows Linux
++ * gcc-sc7180.c, gpucc-sc7180.c, gdsc.c, clk-rcg2.c and msm/adreno/a6xx_gmu.c
++ * (a618: "legacy" GMU, RSCC at GMU + 0x23000):
++ * kgsl-3d0 0x5000000, adreno_smmu 0x5040000, GMU 0x506a000, GPUCC 0x5090000.
+  *
+- * SM7125 (atoll) addresses from the joyeuse DT and Linux gcc-atoll.c:
+- * kgsl-3d0 0x5000000, GMU 0x506a000, GPUCC 0x5090000 with gpu_cx_gdsc
+- * GDSCR at 0x509106c and gpu_gx_gdsc at 0x509100c, chipid 0x06010800.
+- * Boot-arg sweetgpu=0 skips it. joyeuse only (ADT xiaomi,joyeuse).
++ * Boot-arg sweetgpu=<stage> (default 1), each stage includes the previous:
++ *   1  read GCC and GPUCC state (no writes)
++ *   2  power the CX side: GCC GPU votes and branches, CX GDSC, GPUCC cxo /
++ *      gmu (200 MHz from GPLL0 div) / snoc_dvm clocks, then read the GMU
++ *   3  also read the adreno SMMU (global state, stream match, context banks)
++ * 0 skips everything. A block is read only after the status bits of the
++ * clocks and power domain in front of it say it is reachable (an access to
++ * a gated block hangs the bus); the first failure stops the sequence.
++ * It runs on its own thread sweetgpudelay seconds (default 20) after boot, so
++ * its lines reach the live USB log; they are also kept in sysctl kern.sweetgpu.
++ * joyeuse only (ADT xiaomi,joyeuse).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <stdarg.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+ #define GCC_SIZE          0x00090000u
++#define GCC_GPU_VOTE      0x52000u    /* apcs_clk_br_en */
++#define GCC_GPU_GPLL0     (1u << 15)  /* gcc_gpu_gpll0_clk_src */
++#define GCC_GPU_GPLL0_DIV (1u << 16)  /* gcc_gpu_gpll0_div_clk_src */
++#define GCC_DDRSS_GPU_AXI 0x4452cu
+ #define GCC_GPU_CFG_AHB   0x71004u    /* gpucc register access */
+ #define GCC_GPU_MEMNOC    0x7100cu
+ #define GCC_GPU_SNOC_DVM  0x71018u
++
+ #define GPUCC_PA          0x05090000u
+ #define GPUCC_SIZE        0x00009000u
++#define GPUCC_PLL1_MODE   0x0100u
++#define GPUCC_CXO_AON     0x1004u
+ #define GPUCC_GX_GDSCR    0x100cu
+ #define GPUCC_CX_GDSCR    0x106cu
++#define GPUCC_CX_SNOC_DVM 0x108cu
++#define GPUCC_CX_GMU      0x1098u
++#define GPUCC_CXO         0x109cu
++#define GPUCC_GMU_RCG     0x1120u     /* CMD; CFG at +4 */
++#define GPUCC_CX_GDS_HW   0x1540u     /* cx_gdsc gds_hw_ctrl: its status */
++
++#define GMU_PA            0x0506a000u
++#define GMU_SIZE          0x00031000u
++#define GMU_REG(dw)       ((dw) << 2) /* a6xx_gmu.xml offsets are dwords */
++#define GMU_RSCC(dw)      (0x23000u + ((dw) << 2))
++
++#define SMMU_PA           0x05040000u
++#define SMMU_SIZE         0x00010000u
++
++#define CLK_ENABLE        (1u << 0)
+ #define CLK_OFF           (1u << 31)
++#define GDSC_SW_COLLAPSE  (1u << 0)
++#define GDSC_HW_CONTROL   (1u << 1)
++#define GDSC_SW_OVERRIDE  (1u << 2)
+ #define GDSC_PWR_ON       (1u << 31)
++#define RCG_UPDATE        (1u << 0)
++#define RCG_ROOT_EN       (1u << 1)
++#define RCG_ROOT_OFF      (1u << 31)
+ 
++static struct {
++	vm_offset_t gcc, gpucc, gmu;
++	int stage;
++	int delay_s;
++} sg;
++
++static char sweet_gpu_log[4096];
++static size_t sweet_gpu_log_len;
++SYSCTL_STRING(_kern, OID_AUTO, sweetgpu, CTLFLAG_RD | CTLFLAG_LOCKED,
++    sweet_gpu_log, sizeof(sweet_gpu_log), "joyeuse GPU bring-up log");
++
++static void gpu_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++gpu_log(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("SWEET GPU: %s\n", line);
++	size_t len = strnlen(line, sizeof(line));
++	if (sweet_gpu_log_len + len + 2 <= sizeof(sweet_gpu_log)) {
++		memcpy(sweet_gpu_log + sweet_gpu_log_len, line, len);
++		sweet_gpu_log_len += len;
++		sweet_gpu_log[sweet_gpu_log_len++] = '\n';
++		sweet_gpu_log[sweet_gpu_log_len] = '\0';
++	}
++}
++
+ static uint32_t
+ gpu_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -43,7 +116,46 @@
+ 	return v;
+ }
+ 
++static void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++gpu_set(vm_offset_t base, uint32_t off, uint32_t bits)
++{
++	gpu_wr(base, off, gpu_rd(base, off) | bits);
++}
++
++/* Poll until (reg & mask) == want, for up to us microseconds. */
+ static bool
++gpu_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i <= us; ++i) {
++		if ((gpu_rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static const char *
++onoff(uint32_t v, uint32_t bit_on)
++{
++	return (v & bit_on) ? "on" : "off";
++}
++
++static const char *
++clk_state(uint32_t cbcr)
++{
++	return (cbcr & CLK_OFF) ? "off" : "on";
++}
++
++static bool
+ gpu_is_joyeuse(void)
+ {
+ 	DTEntry root;
+@@ -61,36 +173,226 @@
+ 	return false;
+ }
+ 
+-void
+-sweet_gpu_probe(void)
++static void
++gpu_dump_gpucc(const char *when)
+ {
+-	int enabled = 1;
+-	PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (!enabled || !gpu_is_joyeuse()) {
++	uint32_t cx = gpu_rd(sg.gpucc, GPUCC_CX_GDSCR), gx = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR);
++	uint32_t hw = gpu_rd(sg.gpucc, GPUCC_CX_GDS_HW);
++	gpu_log("%s: gpucc cx_gdscr 0x%08x gds_hw 0x%08x (%s) gx_gdscr 0x%08x (%s)",
++	    when, cx, hw, onoff(hw, GDSC_PWR_ON), gx, onoff(gx, GDSC_PWR_ON));
++	uint32_t cxo = gpu_rd(sg.gpucc, GPUCC_CXO), gmu = gpu_rd(sg.gpucc, GPUCC_CX_GMU);
++	uint32_t dvm = gpu_rd(sg.gpucc, GPUCC_CX_SNOC_DVM), aon = gpu_rd(sg.gpucc, GPUCC_CXO_AON);
++	gpu_log("%s: gpucc cxo 0x%08x (%s) cx_gmu 0x%08x (%s) cx_snoc_dvm 0x%08x (%s) cxo_aon 0x%08x (%s)",
++	    when, cxo, clk_state(cxo), gmu, clk_state(gmu), dvm, clk_state(dvm), aon, clk_state(aon));
++	gpu_log("%s: gpucc gmu_rcg cmd 0x%08x cfg 0x%08x pll1_mode 0x%08x", when,
++	    gpu_rd(sg.gpucc, GPUCC_GMU_RCG), gpu_rd(sg.gpucc, GPUCC_GMU_RCG + 4),
++	    gpu_rd(sg.gpucc, GPUCC_PLL1_MODE));
++}
++
++/* Stage 1: what ABL leaves. Returns false when GPUCC cannot be read. */
++static bool
++gpu_stage_read(void)
++{
++	uint32_t vote = gpu_rd(sg.gcc, GCC_GPU_VOTE);
++	uint32_t ahb = gpu_rd(sg.gcc, GCC_GPU_CFG_AHB), axi = gpu_rd(sg.gcc, GCC_DDRSS_GPU_AXI);
++	uint32_t memnoc = gpu_rd(sg.gcc, GCC_GPU_MEMNOC), dvm = gpu_rd(sg.gcc, GCC_GPU_SNOC_DVM);
++	gpu_log("gcc vote 0x%08x (gpll0 %s, div %s) cfg_ahb 0x%08x (%s) ddrss_axi 0x%08x (%s) "
++	    "memnoc_gfx 0x%08x (%s) snoc_dvm 0x%08x (%s)",
++	    vote, onoff(vote, GCC_GPU_GPLL0), onoff(vote, GCC_GPU_GPLL0_DIV),
++	    ahb, clk_state(ahb), axi, clk_state(axi), memnoc, clk_state(memnoc), dvm, clk_state(dvm));
++	if (ahb & CLK_OFF) {
++		gpu_log("GPUCC unclocked; not read");
++		return false;
++	}
++	sg.gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (sg.gpucc == 0) {
++		gpu_log("GPUCC map failed");
++		return false;
++	}
++	gpu_dump_gpucc("abl");
++	return true;
++}
++
++static bool
++gpu_branch_on(vm_offset_t base, uint32_t cbcr, const char *name)
++{
++	gpu_set(base, cbcr, CLK_ENABLE);
++	if (!gpu_wait(base, cbcr, CLK_OFF, 0, 200)) {
++		gpu_log("%s stays off: 0x%08x", name, gpu_rd(base, cbcr));
++		return false;
++	}
++	return true;
++}
++
++/* Stage 2: power the CX side the way Linux does before touching the GMU. */
++static bool
++gpu_stage_power(void)
++{
++	/* GCC: GPLL0 outputs into GPUCC, then the GPU's bus branches. */
++	gpu_set(sg.gcc, GCC_GPU_VOTE, GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV);
++	delay(10);
++	if (!gpu_branch_on(sg.gcc, GCC_GPU_MEMNOC, "gcc memnoc_gfx") ||
++	    !gpu_branch_on(sg.gcc, GCC_GPU_SNOC_DVM, "gcc snoc_dvm_gfx") ||
++	    !gpu_branch_on(sg.gcc, GCC_DDRSS_GPU_AXI, "gcc ddrss_gpu_axi")) {
++		return false;
++	}
++
++	/* CX GDSC (gdsc.c gdsc_init + gdsc_enable for a VOTABLE GDSC with a
++	 * gds_hw_ctrl status register; clk_dis_wait_val 8). */
++	uint32_t g = gpu_rd(sg.gpucc, GPUCC_CX_GDSCR);
++	g &= ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | (0xfu << 20) | (0xfu << 16) | (0xfu << 12));
++	g |= (0x2u << 20) | (0x8u << 16) | (0x8u << 12);
++	gpu_wr(sg.gpucc, GPUCC_CX_GDSCR, g);
++	gpu_wr(sg.gpucc, GPUCC_CX_GDSCR, g & ~GDSC_SW_COLLAPSE);
++	delay(1);
++	if (!gpu_wait(sg.gpucc, GPUCC_CX_GDS_HW, GDSC_PWR_ON, GDSC_PWR_ON, 1500)) {
++		gpu_log("cx_gdsc does not power up: gdscr 0x%08x gds_hw 0x%08x",
++		    gpu_rd(sg.gpucc, GPUCC_CX_GDSCR), gpu_rd(sg.gpucc, GPUCC_CX_GDS_HW));
++		return false;
++	}
++	delay(1);
++
++	/* GPUCC clocks. gmu_clk_src: 200 MHz = GPLL0 div (source 6) / 1.5,
++	 * hid divider field 2*1.5-1 = 2 (rcg2 shared ops: force the root on,
++	 * write CFG, latch it with UPDATE). */
++	if (!gpu_branch_on(sg.gpucc, GPUCC_CXO, "gpucc cxo")) {
++		return false;
++	}
++	gpu_set(sg.gpucc, GPUCC_GMU_RCG, RCG_ROOT_EN);
++	if (!gpu_wait(sg.gpucc, GPUCC_GMU_RCG, RCG_ROOT_OFF, 0, 500)) {
++		gpu_log("gmu_clk_src root stays off: cmd 0x%08x", gpu_rd(sg.gpucc, GPUCC_GMU_RCG));
++		return false;
++	}
++	uint32_t cfg = gpu_rd(sg.gpucc, GPUCC_GMU_RCG + 4);
++	cfg = (cfg & ~(0x7u << 8 | 0x1fu | 0x3u << 12)) | (6u << 8) | 2u;
++	gpu_wr(sg.gpucc, GPUCC_GMU_RCG + 4, cfg);
++	gpu_set(sg.gpucc, GPUCC_GMU_RCG, RCG_UPDATE);
++	if (!gpu_wait(sg.gpucc, GPUCC_GMU_RCG, RCG_UPDATE, 0, 500)) {
++		gpu_log("gmu_clk_src update stuck: cmd 0x%08x cfg 0x%08x",
++		    gpu_rd(sg.gpucc, GPUCC_GMU_RCG), gpu_rd(sg.gpucc, GPUCC_GMU_RCG + 4));
++		return false;
++	}
++	/* Recommended WAKEUP/SLEEP for cx_gmu (gpucc-sc7180.c probe). */
++	uint32_t gmu = gpu_rd(sg.gpucc, GPUCC_CX_GMU);
++	gpu_wr(sg.gpucc, GPUCC_CX_GMU, (gmu & ~(0xffu << 4)) | (0xfu << 8) | (0xfu << 4));
++	bool ok = gpu_branch_on(sg.gpucc, GPUCC_CX_GMU, "gpucc cx_gmu") &&
++	    gpu_branch_on(sg.gpucc, GPUCC_CX_SNOC_DVM, "gpucc cx_snoc_dvm");
++	gpu_wr(sg.gpucc, GPUCC_GMU_RCG, gpu_rd(sg.gpucc, GPUCC_GMU_RCG) & ~RCG_ROOT_EN);
++	gpu_dump_gpucc("cx up");
++	return ok;
++}
++
++static void
++gpu_stage_gmu_read(void)
++{
++	sg.gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (sg.gmu == 0) {
++		gpu_log("GMU map failed");
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("SWEET GPU: GCC map failed\n");
++	gpu_log("gmu sysreset 0x%08x boot_cfg 0x%08x fw_init 0x%08x cm3_cfg 0x%08x general_7 0x%08x",
++	    gpu_rd(sg.gmu, GMU_REG(0x5000)), gpu_rd(sg.gmu, GMU_REG(0x5001)),
++	    gpu_rd(sg.gmu, GMU_REG(0x501c)), gpu_rd(sg.gmu, GMU_REG(0x502d)),
++	    gpu_rd(sg.gmu, GMU_REG(0x51cc)));
++	gpu_log("gmu sptprac 0x%08x rpmh_state 0x%08x hfi_ctrl 0x%08x ao_int 0x%08x cx_busy 0x%08x "
++	    "ahb_fence 0x%08x",
++	    gpu_rd(sg.gmu, GMU_REG(0x50d0)), gpu_rd(sg.gmu, GMU_REG(0x50ec)),
++	    gpu_rd(sg.gmu, GMU_REG(0x5180)), gpu_rd(sg.gmu, GMU_REG(0x9305)),
++	    gpu_rd(sg.gmu, GMU_REG(0x930c)), gpu_rd(sg.gmu, GMU_REG(0x9313)));
++	gpu_log("gmu rscc ctl req 0x%08x ack 0x%08x rsc_status0 0x%08x seq_busy 0x%08x",
++	    gpu_rd(sg.gmu, GMU_REG(0x9307)), gpu_rd(sg.gmu, GMU_REG(0x9308)),
++	    gpu_rd(sg.gmu, GMU_RSCC(0x0004)), gpu_rd(sg.gmu, GMU_RSCC(0x0101)));
++}
++
++/* Stage 3: the adreno SMMU (arm,smmu-v2 register layout). Its clocks are
++ * gcc memnoc_gfx (bus) and cfg_ahb (iface), its power the CX GDSC. */
++static void
++gpu_stage_smmu_read(void)
++{
++	vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	if (smmu == 0) {
++		gpu_log("SMMU map failed");
+ 		return;
+ 	}
+-	uint32_t ahb = gpu_rd(gcc, GCC_GPU_CFG_AHB);
+-	uint32_t memnoc = gpu_rd(gcc, GCC_GPU_MEMNOC), dvm = gpu_rd(gcc, GCC_GPU_SNOC_DVM);
+-	printf("SWEET GPU: gcc gpu_cfg_ahb 0x%08x (%s) memnoc_gfx 0x%08x (%s) snoc_dvm 0x%08x (%s)\n",
+-	    ahb, (ahb & CLK_OFF) ? "off" : "on", memnoc, (memnoc & CLK_OFF) ? "off" : "on",
+-	    dvm, (dvm & CLK_OFF) ? "off" : "on");
+-	if (ahb & CLK_OFF) {
+-		printf("SWEET GPU: GPUCC unclocked; not read\n");
++	uint32_t cr0 = gpu_rd(smmu, 0x0), id0 = gpu_rd(smmu, 0x20), id1 = gpu_rd(smmu, 0x24);
++	uint32_t id2 = gpu_rd(smmu, 0x28), gfsr = gpu_rd(smmu, 0x48);
++	gpu_log("smmu cr0 0x%08x idr0 0x%08x idr1 0x%08x idr2 0x%08x gfsr 0x%08x",
++	    cr0, id0, id1, id2, gfsr);
++	unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	unsigned numpage = 1u << (((id1 >> 28) & 0x7u) + 1);
++	for (unsigned i = 0; i < nsmr && i < 16; ++i) {
++		uint32_t smr = gpu_rd(smmu, 0x800 + 4 * i), s2cr = gpu_rd(smmu, 0xc00 + 4 * i);
++		if (smr & (1u << 31)) {
++			gpu_log("smmu smr%u 0x%08x (id 0x%x mask 0x%x) s2cr 0x%08x", i, smr,
++			    smr & 0xffffu, (smr >> 16) & 0x7fffu, s2cr);
++		}
++	}
++	for (unsigned i = 0; i < ncb && i < 16; ++i) {
++		size_t off = (size_t)(numpage + i) << pgshift;
++		uint32_t cbar = gpu_rd(smmu, (1u << pgshift) + 4 * i);
++		if (off + 0x60 > SMMU_SIZE) {
++			gpu_log("smmu cb%u cbar 0x%08x (bank outside the 0x%x window)", i, cbar, SMMU_SIZE);
++			continue;
++		}
++		uint32_t sctlr = gpu_rd(smmu, (uint32_t)off);
++		if (!(sctlr & 1u) && !cbar) {
++			continue;
++		}
++		gpu_log("smmu cb%u cbar 0x%08x sctlr 0x%08x ttbr0 0x%08x%08x fsr 0x%08x", i, cbar, sctlr,
++		    gpu_rd(smmu, (uint32_t)off + 0x24), gpu_rd(smmu, (uint32_t)off + 0x20),
++		    gpu_rd(smmu, (uint32_t)off + 0x58));
++	}
++}
++
++static int sweet_gpu_sleep_chan;
++
++static void
++gpu_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline((uint32_t)sg.delay_s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&sweet_gpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++
++	gpu_log("stage %d", sg.stage);
++	if (!gpu_stage_read() || sg.stage < 2) {
+ 		return;
+ 	}
+-	vm_offset_t gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
+-	if (gpucc == 0) {
++	if (!gpu_stage_power()) {
++		gpu_log("CX power-up failed; GMU not read");
+ 		return;
+ 	}
+-	uint32_t cx = gpu_rd(gpucc, GPUCC_CX_GDSCR), gx = gpu_rd(gpucc, GPUCC_GX_GDSCR);
+-	printf("SWEET GPU: gpucc cx_gdsc 0x%08x (%s) gx_gdsc 0x%08x (%s)\n",
+-	    cx, (cx & GDSC_PWR_ON) ? "on" : "off", gx, (gx & GDSC_PWR_ON) ? "on" : "off");
+-	/* GMU and core registers also need their GPUCC branch clocks; reading
+-	 * them is left to the driver that turns those on. */
++	gpu_stage_gmu_read();
++	if (sg.stage >= 3) {
++		gpu_stage_smmu_read();
++	}
++	gpu_log("done");
+ }
++
++void
++sweet_gpu_probe(void)
++{
++	thread_t thread;
++	sg.stage = 1;
++	sg.delay_s = 20;
++	PE_parse_boot_argn("sweetgpu", &sg.stage, sizeof(sg.stage));
++	PE_parse_boot_argn("sweetgpudelay", &sg.delay_s, sizeof(sg.delay_s));
++	if (sg.stage <= 0 || !gpu_is_joyeuse()) {
++		return;
++	}
++	if (sg.delay_s < 0) {
++		sg.delay_s = 0;
++	}
++	sg.gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (sg.gcc == 0) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET GPU: kernel_thread_start failed\n");
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -661,7 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+-	sweet_gpu_probe();       /* bsd/dev/sweet_gpu.c, read-only */
++	sweet_gpu_probe();       /* bsd/dev/sweet_gpu.c, sweetgpu=<stage> */
+ 	return 0;
+ }
+ 
