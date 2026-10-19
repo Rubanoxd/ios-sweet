@@ -1,0 +1,127 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_touch_spi.c		standard
+ bsd/dev/sweet_dpu.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();       /* bsd/dev/sweet_gpu.c, read-only */
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,96 @@
++/*
++ * JOYEUSE: Adreno 618 bring-up, step 0 - read-only state probe.
++ *
++ * Reports what state ABL leaves the GPU in, before any driver is written:
++ * the GCC branches the GPU blocks hang off and the GPUCC power domains
++ * (CX: GMU, GX: GPU core). Like the USB probe
++ * (bsd/dev/sweet_usb.c) it never writes a register, and it reads a block
++ * only after the status bits of the clocks and power domain in front of it
++ * say it is reachable (an access to a gated block hangs the bus).
++ *
++ * SM7125 (atoll) addresses from the joyeuse DT and Linux gcc-atoll.c:
++ * kgsl-3d0 0x5000000, GMU 0x506a000, GPUCC 0x5090000 with gpu_cx_gdsc
++ * GDSCR at 0x509106c and gpu_gx_gdsc at 0x509100c, chipid 0x06010800.
++ * Boot-arg sweetgpu=0 skips it. joyeuse only (ADT xiaomi,joyeuse).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GCC_PA            0x00100000u
++#define GCC_SIZE          0x00090000u
++#define GCC_GPU_CFG_AHB   0x71004u    /* gpucc register access */
++#define GCC_GPU_MEMNOC    0x7100cu
++#define GCC_GPU_SNOC_DVM  0x71018u
++#define GPUCC_PA          0x05090000u
++#define GPUCC_SIZE        0x00009000u
++#define GPUCC_GX_GDSCR    0x100cu
++#define GPUCC_CX_GDSCR    0x106cu
++#define CLK_OFF           (1u << 31)
++#define GDSC_PWR_ON       (1u << 31)
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static bool
++gpu_is_joyeuse(void)
++{
++	DTEntry root;
++	char const *compat = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess) {
++		return false;
++	}
++	for (unsigned int i = 0; i < size; i += (unsigned int)strnlen(compat + i, size - i) + 1) {
++		if (!strncmp(compat + i, "xiaomi,joyeuse", size - i)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled || !gpu_is_joyeuse()) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	uint32_t ahb = gpu_rd(gcc, GCC_GPU_CFG_AHB);
++	uint32_t memnoc = gpu_rd(gcc, GCC_GPU_MEMNOC), dvm = gpu_rd(gcc, GCC_GPU_SNOC_DVM);
++	printf("SWEET GPU: gcc gpu_cfg_ahb 0x%08x (%s) memnoc_gfx 0x%08x (%s) snoc_dvm 0x%08x (%s)\n",
++	    ahb, (ahb & CLK_OFF) ? "off" : "on", memnoc, (memnoc & CLK_OFF) ? "off" : "on",
++	    dvm, (dvm & CLK_OFF) ? "off" : "on");
++	if (ahb & CLK_OFF) {
++		printf("SWEET GPU: GPUCC unclocked; not read\n");
++		return;
++	}
++	vm_offset_t gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (gpucc == 0) {
++		return;
++	}
++	uint32_t cx = gpu_rd(gpucc, GPUCC_CX_GDSCR), gx = gpu_rd(gpucc, GPUCC_GX_GDSCR);
++	printf("SWEET GPU: gpucc cx_gdsc 0x%08x (%s) gx_gdsc 0x%08x (%s)\n",
++	    cx, (cx & GDSC_PWR_ON) ? "on" : "off", gx, (gx & GDSC_PWR_ON) ? "on" : "off");
++	/* GMU and core registers also need their GPUCC branch clocks; reading
++	 * them is left to the driver that turns those on. */
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
