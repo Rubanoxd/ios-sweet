@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1,40 +1,113 @@
+@@ -1,40 +1,114 @@
  /*
 - * JOYEUSE: Adreno 618 bring-up, step 0 - read-only state probe.
 + * JOYEUSE: Adreno 618 bring-up, staged like the touch probe.
@@ -92,6 +92,7 @@
 +	vm_offset_t gcc, gpucc, gmu;
 +	int stage;
 +	int delay_s;
++	bool bus_ok;
 +} sg;
 +
 +static char sweet_gpu_log[4096];
@@ -125,7 +126,7 @@
  static uint32_t
  gpu_rd(vm_offset_t base, uint32_t off)
  {
-@@ -43,7 +116,46 @@
+@@ -43,7 +117,46 @@
  	return v;
  }
  
@@ -172,7 +173,7 @@
  gpu_is_joyeuse(void)
  {
  	DTEntry root;
-@@ -61,36 +173,226 @@
+@@ -61,36 +174,237 @@
  	return false;
  }
  
@@ -236,17 +237,15 @@
 +static bool
 +gpu_stage_power(void)
 +{
-+	/* GCC: GPLL0 outputs into GPUCC, then the GPU's bus branches. */
++	/* GCC: GPLL0 outputs into GPUCC. */
 +	gpu_set(sg.gcc, GCC_GPU_VOTE, GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV);
 +	delay(10);
-+	if (!gpu_branch_on(sg.gcc, GCC_GPU_MEMNOC, "gcc memnoc_gfx") ||
-+	    !gpu_branch_on(sg.gcc, GCC_GPU_SNOC_DVM, "gcc snoc_dvm_gfx") ||
-+	    !gpu_branch_on(sg.gcc, GCC_DDRSS_GPU_AXI, "gcc ddrss_gpu_axi")) {
-+		return false;
-+	}
 +
-+	/* CX GDSC (gdsc.c gdsc_init + gdsc_enable for a VOTABLE GDSC with a
-+	 * gds_hw_ctrl status register; clk_dis_wait_val 8). */
++	/* CX GDSC first, as Linux does (GMU runtime resume powers its "cx"
++	 * domain before enabling its clocks): the GPU's GCC bus branches
++	 * stay off while it is collapsed (hardware: memnoc_gfx 0x80004221).
++	 * gdsc.c gdsc_init + gdsc_enable for a VOTABLE GDSC with a gds_hw_ctrl
++	 * status register; clk_dis_wait_val 8. */
 +	uint32_t g = gpu_rd(sg.gpucc, GPUCC_CX_GDSCR);
 +	g &= ~(GDSC_HW_CONTROL | GDSC_SW_OVERRIDE | (0xfu << 20) | (0xfu << 16) | (0xfu << 12));
 +	g |= (0x2u << 20) | (0x8u << 16) | (0x8u << 12);
@@ -259,6 +258,15 @@
 +		return false;
 +	}
 +	delay(1);
++	gpu_log("cx_gdsc on: gdscr 0x%08x gds_hw 0x%08x",
++	    gpu_rd(sg.gpucc, GPUCC_CX_GDSCR), gpu_rd(sg.gpucc, GPUCC_CX_GDS_HW));
++
++	/* GCC: the GPU's bus branches (gmu "axi"/"memnoc", smmu "bus"). The
++	 * GMU registers only need cx_gmu, so a bus branch that stays off is
++	 * reported (sg.bus_ok gates the SMMU) and the sequence goes on. */
++	sg.bus_ok = gpu_branch_on(sg.gcc, GCC_GPU_MEMNOC, "gcc memnoc_gfx");
++	sg.bus_ok &= gpu_branch_on(sg.gcc, GCC_GPU_SNOC_DVM, "gcc snoc_dvm_gfx");
++	sg.bus_ok &= gpu_branch_on(sg.gcc, GCC_DDRSS_GPU_AXI, "gcc ddrss_gpu_axi");
 +
 +	/* GPUCC clocks. gmu_clk_src: 200 MHz = GPLL0 div (source 6) / 1.5,
 +	 * hid divider field 2*1.5-1 = 2 (rcg2 shared ops: force the root on,
@@ -283,8 +291,8 @@
 +	/* Recommended WAKEUP/SLEEP for cx_gmu (gpucc-sc7180.c probe). */
 +	uint32_t gmu = gpu_rd(sg.gpucc, GPUCC_CX_GMU);
 +	gpu_wr(sg.gpucc, GPUCC_CX_GMU, (gmu & ~(0xffu << 4)) | (0xfu << 8) | (0xfu << 4));
-+	bool ok = gpu_branch_on(sg.gpucc, GPUCC_CX_GMU, "gpucc cx_gmu") &&
-+	    gpu_branch_on(sg.gpucc, GPUCC_CX_SNOC_DVM, "gpucc cx_snoc_dvm");
++	bool ok = gpu_branch_on(sg.gpucc, GPUCC_CX_GMU, "gpucc cx_gmu");
++	(void)gpu_branch_on(sg.gpucc, GPUCC_CX_SNOC_DVM, "gpucc cx_snoc_dvm");
 +	gpu_wr(sg.gpucc, GPUCC_GMU_RCG, gpu_rd(sg.gpucc, GPUCC_GMU_RCG) & ~RCG_ROOT_EN);
 +	gpu_dump_gpucc("cx up");
 +	return ok;
@@ -390,7 +398,11 @@
 -	 * them is left to the driver that turns those on. */
 +	gpu_stage_gmu_read();
 +	if (sg.stage >= 3) {
-+		gpu_stage_smmu_read();
++		if (sg.bus_ok) {
++			gpu_stage_smmu_read();
++		} else {
++			gpu_log("GCC bus branches off; SMMU not read");
++		}
 +	}
 +	gpu_log("done");
  }
