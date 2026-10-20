@@ -17,7 +17,11 @@
  * one library, blending) and render encoders (color attachments with
  * load/store/clear, buffers and bytes per stage, viewport, cull, winding,
  * drawPrimitives), sampler states and texture/sampler shader arguments
- * (bound or constexpr samplers). Not yet: newLibraryWithSource (needs the
+ * (bound or constexpr samplers), framebuffer reads, and IOSurface textures
+ * (newTextureWithDescriptor:iosurface:plane:, the surface's own pages; the
+ * GPU does not snoop CPU caches, so every command buffer cleans and
+ * invalidates the surfaces it uses before and after the GPU runs, with
+ * `dc civac`: iOS's sys_dcache_flush() is a no-op on arm64). Not yet: newLibraryWithSource (needs the
  * on-device MSL compiler), storage textures (Iridium samples only), vertex
  * descriptors, depth/stencil, events, heaps, drawables. Those return nil, fail the
  * command buffer or, for selectors not implemented at all, are logged
@@ -26,6 +30,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
 #define VK_NO_PROTOTYPES 1
@@ -442,11 +447,35 @@ pixelFormat(MTLPixelFormat f)
 @property (nonatomic) NSUInteger width, height;
 @property (nonatomic) MTLTextureUsage usage;
 @property (nonatomic) MTLResourceOptions options;
+@property (nonatomic) IOSurfaceRef surface;      /* retained; NULL for ordinary textures */
+@property (nonatomic) void *hostBase;
+@property (nonatomic) size_t hostBytes;
+- (void)flushHost;
 @end
 @implementation SMTexture
 - (void)dealloc
 {
 	smv_texture_free(_handle);
+	if (_surface) {
+		CFRelease(_surface);
+	}
+}
+/* Clean and invalidate the CPU data caches over an IOSurface's pages to the
+ * point of coherency. iOS's sys_dcache_flush() is only a `dsb ish` (Apple
+ * GPUs snoop the CPU caches); the Adreno does not, so this does it by hand:
+ * XNU sets SCTLR_EL1.UCI, which lets EL0 run `dc civac`. 64 bytes is the
+ * Kryo 465's (Cortex-A76/A55) data cache line. */
+- (void)flushHost
+{
+	if (!_hostBase) {
+		return;
+	}
+	uintptr_t p = (uintptr_t)_hostBase & ~(uintptr_t)63, end = (uintptr_t)_hostBase + _hostBytes;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (; p < end; p += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r"(p) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 - (MTLTextureType)textureType
 {
@@ -494,7 +523,7 @@ pixelFormat(MTLPixelFormat f)
 }
 - (IOSurfaceRef)iosurface
 {
-	return NULL;
+	return _surface;
 }
 - (NSUInteger)iosurfacePlane
 {
@@ -521,7 +550,10 @@ pixelFormat(MTLPixelFormat f)
 	}
 	const uint32_t r[4] = { (uint32_t)region.origin.x, (uint32_t)region.origin.y, (uint32_t)region.size.width,
 		(uint32_t)region.size.height };
-	if (!smv_texture_access(_handle, r, bytes, (uint32_t)row, write)) {
+	[self flushHost];
+	BOOL ok = smv_texture_access(_handle, r, bytes, (uint32_t)row, write);
+	[self flushHost];
+	if (!ok) {
 		sweet_metal_log("texture access: %s", smv_error());
 		return NO;
 	}
@@ -1194,10 +1226,35 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 	}
 	return (id<MTLRenderCommandEncoder>)e;
 }
+/* The drawable is presented once the GPU has finished this command buffer
+ * (and the IOSurface caches are flushed), after the completed handlers
+ * registered so far. */
 - (void)presentDrawable:(id<MTLDrawable>)drawable
 {
-	(void)drawable;
-	[self refuse:@"drawables are not implemented yet"];
+	if (drawable) {
+		[self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+			(void)cb;
+			[drawable present];
+		}];
+	}
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time
+{
+	if (drawable) {
+		[self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+			(void)cb;
+			[drawable presentAtTime:time];
+		}];
+	}
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration
+{
+	if (drawable) {
+		[self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+			(void)cb;
+			[drawable presentAfterMinimumDuration:duration];
+		}];
+	}
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block
 {
@@ -1252,8 +1309,26 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 			self.error = smError(self.encodeFailure);
 		} else if (!self->_list) {
 			ok = YES;       /* nothing encoded */
-		} else if (smv_cmd_run(self->_list, kGpuTimeoutMs)) {
-			ok = YES;
+		} else {
+			/* IOSurface textures: the GPU does not see dirty CPU cache lines, nor the CPU fresh GPU writes */
+			NSArray *used;
+			@synchronized (self->_resources) {
+				used = self->_resources.allObjects;
+			}
+			for (id r in used) {
+				if ([r isKindOfClass:[SMTexture class]]) {
+					[(SMTexture *)r flushHost];
+				}
+			}
+			ok = smv_cmd_run(self->_list, kGpuTimeoutMs);
+			for (id r in used) {
+				if ([r isKindOfClass:[SMTexture class]]) {
+					[(SMTexture *)r flushHost];
+				}
+			}
+		}
+		if (ok || !self->_list || self.encodeFailure) {
+			/* done above */
 		} else {
 			self.error = smError([NSString stringWithUTF8String:smv_error()]);
 			sweet_metal_log("command buffer failed: %s", smv_error());
@@ -1563,6 +1638,40 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	NSError *error = nil;
 	id<MTLComputePipelineState> p = [self newComputePipelineStateWithFunction:function error:&error];
 	handler(p, error);
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	const struct pixel_format *f = pixelFormat(d.pixelFormat);
+	void *base = surface ? IOSurfaceGetBaseAddressOfPlane(surface, plane) : NULL;
+	if (!surface || !f || d.textureType != MTLTextureType2D || d.mipmapLevelCount != 1 || d.sampleCount != 1 ||
+	    (IOSurfaceGetPlaneCount(surface) ? plane >= IOSurfaceGetPlaneCount(surface) : plane != 0) || !base) {
+		sweet_metal_log("IOSurface texture refused: format %lu plane %lu", (unsigned long)d.pixelFormat,
+		    (unsigned long)plane);
+		return nil;
+	}
+	if (IOSurfaceGetPlaneCount(surface) || ((uintptr_t)base & 4095)) {
+		sweet_metal_log("IOSurface texture refused: planar or unaligned surfaces are not implemented yet");
+		return nil;
+	}
+	size_t row = IOSurfaceGetBytesPerRow(surface);
+	size_t bytes = (IOSurfaceGetAllocSize(surface) + 4095) & ~(size_t)4095;
+	smv_texture *h = smv_texture_new_host(base, bytes, (uint32_t)d.width, (uint32_t)d.height, (uint32_t)row, f->vk,
+	    f->bytes);
+	if (!h) {
+		sweet_metal_log("IOSurface texture refused: %s", smv_error());
+		return nil;
+	}
+	SMTexture *t = [SMTexture new];
+	t.handle = h;
+	t.pixelFormat = d.pixelFormat;
+	t.width = d.width;
+	t.height = d.height;
+	t.usage = d.usage;
+	t.options = d.resourceOptions;
+	t.surface = (IOSurfaceRef)CFRetain(surface);
+	t.hostBase = base;
+	t.hostBytes = bytes;
+	return (id<MTLTexture>)t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d
 {

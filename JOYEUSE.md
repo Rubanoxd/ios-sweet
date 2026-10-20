@@ -569,6 +569,28 @@ Libraries now translate function by function (each metallib function has
 its own AIR module): a function Iridium cannot handle no longer takes the
 library with it (`newFunctionWithName:` returns nil for it, logged).
 
+IOSurface textures and drawables (2026-10-20):
+- `newTextureWithDescriptor:iosurface:plane:` imports the surface's own
+  pages (as mapped in the process) with VK_EXT_external_memory_host (the
+  kernel's BoImport pins them, Turnip maps them into the GPU) as a linear
+  image with the surface's row pitch (VK_EXT_image_drm_format_modifier,
+  DRM_FORMAT_MOD_LINEAR, explicit layout). Turnip needs the pitch to be a
+  multiple of 64 bytes: SweetSurface already pads rows to 64
+  (`SWEET_SURFACE_ROW_ALIGN`) and publishes that alignment, so no kernel
+  change was needed. Single-plane, page-aligned surfaces only for now.
+- Coherency: the Adreno does not snoop the CPU caches, and iOS's
+  `sys_dcache_flush()` is only `dsb ish` on arm64 (Apple GPUs are
+  coherent): with it, 13-16 of 30 CPU->GPU->CPU rounds had stale 64-byte
+  lines both ways. The device now cleans and invalidates each IOSurface a
+  command buffer uses with `dc civac` from EL0 (XNU sets SCTLR_EL1.UCI)
+  before and after the GPU runs, and every command list starts with a
+  host-write barrier and ends with a host-read one: 0 of 30 rounds wrong
+  (300x200 surfaces, 0.44 ms per round).
+- `presentDrawable:` (and `atTime:`, `afterMinimumDuration:`) presents the
+  drawable from a completed handler. `CAMetalLayer nextDrawable` works
+  with this device: QuartzCore makes the drawable's IOSurface texture
+  through it; a GPU clear of it is presented and reads back right.
+
 QuartzCore (what backboardd would need), from the iOS 16.7 images:
 - `QuartzCore.framework/default.metallib` (1 MB) is AIR: 141 functions
   (39 vertex, 95 fragment, 7 kernels: blurs, downsampling, shading, paths,

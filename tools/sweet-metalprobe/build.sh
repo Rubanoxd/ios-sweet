@@ -44,7 +44,7 @@ $cc -fobjc-arc -I "$top/mesa/src/include" -c SweetMetalDevice.m -o "$tmp/device.
 $cc -I "$top/mesa/src/include" -I "$tmp" -c turnip-job.c -o "$tmp/job.o"
 $cc -I "$top/mesa/src/include" -c sweet-mtl-vk.c -o "$tmp/vk.o"
 clang++ -target arm64-apple-ios16.0 -isysroot "$sdk" -bundle -fobjc-arc \
-	-framework Foundation -framework Metal -framework QuartzCore \
+	-framework Foundation -framework Metal -framework QuartzCore -framework IOSurface \
 	"$tmp/probe.o" "$tmp/device.o" "$tmp/job.o" "$tmp/vk.o" $iridium $llvm -o "$b/SweetMetalProbe"
 codesign -f -s - "$b"
 file "$b/SweetMetalProbe"
@@ -52,7 +52,7 @@ file "$b/SweetMetalProbe"
 $cc -fobjc-arc -framework Foundation -framework Metal sweet-mtlquery.m -o "$out/sweet-mtlquery"
 codesign -f -s - "$out/sweet-mtlquery"
 $cc -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics \
-	-framework ImageIO sweet-mtltest.m -o "$out/sweet-mtltest"
+	-framework ImageIO -framework IOSurface sweet-mtltest.m -o "$out/sweet-mtltest"
 codesign -f -s - "$out/sweet-mtltest"
 $cc -c sweet-air2spv.c -o "$tmp/air2spv.o"
 clang++ -target arm64-apple-ios16.0 -isysroot "$sdk" "$tmp/air2spv.o" $iridium $llvm -o "$out/sweet-air2spv"

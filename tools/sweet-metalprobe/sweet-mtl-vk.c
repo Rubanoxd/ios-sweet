@@ -31,6 +31,13 @@
  * VK_EXT_rasterization_order_attachment_access on such pipelines and a
  * by-region barrier before each of their draws, for Metal's per-pixel
  * ordering.
+ *
+ * IOSurface textures: the surface's own pages (mapped in this process) are
+ * imported with VK_EXT_external_memory_host (the kernel pins them, Turnip
+ * maps them into the GPU) as a linear image with the surface's row pitch
+ * (VK_EXT_image_drm_format_modifier, DRM_FORMAT_MOD_LINEAR, explicit
+ * layout). The GPU does not snoop the CPU caches: the Metal layer cleans
+ * and invalidates the surface around every command buffer that uses it.
  */
 #include <dlfcn.h>
 #include <pthread.h>
@@ -61,7 +68,7 @@ typedef PFN_vkVoidFunction (*PFN_icdGetInstanceProcAddr)(VkInstance, const char 
 	X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) \
 	X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) X(vkCmdSetPrimitiveTopology) \
 	X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCreateSampler) X(vkDestroySampler) \
-	X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout)
+	X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout) X(vkGetMemoryHostPointerPropertiesEXT)
 #define DECL(name) static PFN_##name name;
 FNS(DECL)
 DFNS(DECL)
@@ -193,7 +200,8 @@ smv_open(const char *icd, char *name, size_t len)
 	VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &fro,
 		.dynamicRenderingLocalRead = VK_TRUE };
-	const char *exts[] = { "VK_KHR_dynamic_rendering_local_read", "VK_EXT_rasterization_order_attachment_access" };
+	const char *exts[] = { "VK_KHR_dynamic_rendering_local_read", "VK_EXT_rasterization_order_attachment_access",
+		"VK_EXT_external_memory_host", "VK_EXT_image_drm_format_modifier" };
 	VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &flr,
 		.maintenance4 = VK_TRUE, .dynamicRendering = VK_TRUE };
 	VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -201,7 +209,7 @@ smv_open(const char *icd, char *name, size_t len)
 	VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12,
 		.features = { .shaderInt64 = VK_TRUE } };
 	VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
-		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 2,
+		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 4,
 		.ppEnabledExtensionNames = exts };
 	VkDevice dev;
 	TRY(vkCreateDevice(pd, &dci, NULL, &dev));
@@ -524,6 +532,15 @@ smv_cmd_new(void)
 	if (r == VK_SUCCESS) {
 		r = vkBeginCommandBuffer(c->cb, &cbi);
 	}
+	if (r == VK_SUCCESS) {
+		/* what the CPU wrote before (buffers, IOSurfaces) must not be read
+		 * from the GPU's own caches: host writes -> everything (Turnip
+		 * invalidates its caches for this) */
+		VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+		vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+		    NULL, 0, NULL);
+	}
 	if (r != VK_SUCCESS) {
 		fail("command list: %d", r);
 		smv_cmd_free(c);
@@ -768,6 +785,101 @@ smv_texture_new(uint32_t width, uint32_t height, uint32_t format, uint32_t texel
 		goto bad;
 	}
 	/* to GENERAL once, for good */
+	smv_cmd *c = smv_cmd_new();
+	if (!c) {
+		goto bad;
+	}
+	VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = t->image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
+	    0, NULL, 1, &ib);
+	int ok = smv_cmd_run(c, 5000);
+	smv_cmd_free(c);
+	if (!ok) {
+		goto bad;
+	}
+	return t;
+bad:
+	smv_texture_free(t);
+	return NULL;
+}
+
+/* An image on host memory the caller owns (an IOSurface's pages): linear,
+ * ROW_BYTES per row, contents kept. HOST and BYTES must be 4 KiB aligned. */
+smv_texture *
+smv_texture_new_host(void *host, uint64_t bytes, uint32_t width, uint32_t height, uint32_t row_bytes,
+    uint32_t format, uint32_t texel_bytes)
+{
+	if (!sDev) {
+		fail("no device");
+		return NULL;
+	}
+	if (((uintptr_t)host | bytes) & 4095 || (uint64_t)row_bytes * height > bytes || row_bytes % 64 ||
+	    row_bytes < width * texel_bytes) {
+		fail("host image: pointer/size not page aligned or row pitch %u unusable (64-byte multiple needed)",
+		    row_bytes);
+		return NULL;
+	}
+	smv_texture *t = calloc(1, sizeof(*t));
+	if (!t) {
+		fail("out of memory");
+		return NULL;
+	}
+	t->format = (VkFormat)format;
+	t->width = width;
+	t->height = height;
+	t->texel = texel_bytes;
+	VkSubresourceLayout plane = { .offset = 0, .size = (VkDeviceSize)row_bytes * height, .rowPitch = row_bytes };
+	VkImageDrmFormatModifierExplicitCreateInfoEXT mod = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+		.drmFormatModifier = 0 /* DRM_FORMAT_MOD_LINEAR */, .drmFormatModifierPlaneCount = 1, .pPlaneLayouts = &plane };
+	VkExternalMemoryImageCreateInfo ext = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &mod,
+		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+	VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &ext,
+		.imageType = VK_IMAGE_TYPE_2D, .format = t->format, .extent = { width, height, 1 }, .mipLevels = 1,
+		.arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+		.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+	VkResult r = vkCreateImage(sDev, &ici, NULL, &t->image);
+	if (r != VK_SUCCESS) {
+		fail("vkCreateImage (host, pitch %u): %d", row_bytes, r);
+		goto bad;
+	}
+	VkMemoryHostPointerPropertiesEXT hp = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+	if ((r = vkGetMemoryHostPointerPropertiesEXT(sDev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
+	    &hp)) != VK_SUCCESS) {
+		fail("host pointer properties: %d", r);
+		goto bad;
+	}
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(sDev, t->image, &req);
+	int type = memory_type(req.memoryTypeBits & hp.memoryTypeBits, 0);
+	if (type < 0 || req.size > bytes) {
+		fail("host image: no memory type (bits 0x%x/0x%x) or %llu > %llu bytes", req.memoryTypeBits,
+		    hp.memoryTypeBits, (unsigned long long)req.size, (unsigned long long)bytes);
+		goto bad;
+	}
+	VkImportMemoryHostPointerInfoEXT imp = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = host };
+	VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
+		.allocationSize = bytes, .memoryTypeIndex = (uint32_t)type };
+	if ((r = vkAllocateMemory(sDev, &mai, NULL, &t->mem)) != VK_SUCCESS ||
+	    (r = vkBindImageMemory(sDev, t->image, t->mem, 0)) != VK_SUCCESS) {
+		fail("host image import/bind of %llu bytes: %d", (unsigned long long)bytes, r);
+		goto bad;
+	}
+	VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D, .format = t->format,
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	if ((r = vkCreateImageView(sDev, &vci, NULL, &t->view)) != VK_SUCCESS) {
+		fail("vkCreateImageView: %d", r);
+		goto bad;
+	}
+	/* to GENERAL; on a linear image the layout change keeps the bytes */
 	smv_cmd *c = smv_cmd_new();
 	if (!c) {
 		goto bad;
@@ -1049,6 +1161,12 @@ smv_cmd_end_render(smv_cmd *c)
 int
 smv_cmd_run(smv_cmd *c, uint32_t timeout_ms)
 {
+	/* and what the GPU wrote must reach memory for the CPU: everything ->
+	 * host reads (Turnip flushes its color and L2 caches for this) */
+	VkMemoryBarrier done = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_HOST_READ_BIT };
+	vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &done, 0, NULL,
+	    0, NULL);
 	TRY(vkEndCommandBuffer(c->cb));
 	VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 	VkFence fence;

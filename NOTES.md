@@ -19,7 +19,8 @@ with bound and constexpr samplers, 2852/2852 sample points right). Libraries tra
 default.metallib is AIR (141 functions); with tools/iridium-patches/0002-0003 Iridium translates 123 (119 valid SPIR-V;
 inlining pass, framebuffer reads via dynamic-rendering local read, verified on the phone):
 see JOYEUSE.md "QuartzCore" for the remaining gaps (framebuffer reads, inlining, imageblocks, control flow) and the
-path to backboardd GPU compositing. Mac USB network: `networksetup -setmanual "Sweet iOS (USB Ethernet)"
+path to backboardd GPU compositing. IOSurface textures (host-pointer import, linear explicit pitch) and CAMetalLayer
+drawables work; CPU<->GPU coherency needs `dc civac` by hand (iOS's sys_dcache_flush is a no-op on arm64). Mac USB network: `networksetup -setmanual "Sweet iOS (USB Ethernet)"
 192.168.7.1 255.255.255.0` (no sudo, persists) when the sudo usbnet script is not running.
 
 ### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<

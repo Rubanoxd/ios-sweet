@@ -14,7 +14,9 @@
  * alpha over a background, plus a small copy at 60 % with a constexpr
  * sampler (written to /var/tmp/sweet-mtltest-texture.ppm); a framebuffer
  * read: a cleared target, a triangle that writes 1 - the color it reads from
- * the attachment, and a second overlapping one that inverts again.
+ * the attachment, and a second overlapping one that inverts again; an
+ * IOSurface test: the CPU fills a surface, the GPU copies it into a second
+ * surface (a 1:1 sampled quad) and the CPU checks every pixel there.
  * Every result is checked on the CPU.
  *   sweet-mtltest [LIB.metallib [IMAGE.png]]
  *   (defaults /var/jb/usr/share/sweet-mtltest.metallib and .png)
@@ -24,6 +26,8 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
+#import <IOSurface/IOSurfaceRef.h>
+#include <objc/runtime.h>
 
 static int fails;
 
@@ -49,6 +53,8 @@ static void render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrar
 static void textured(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib, const char *png);
 static const char *gImage = "/var/jb/usr/share/sweet-mtltest.png";
 static void framebufferRead(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
+static void surfaces(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
+static void drawable(id<MTLDevice> device, id<MTLCommandQueue> queue);
 
 static void
 kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
@@ -114,6 +120,8 @@ kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
 	render(device, queue, lib);
 	textured(device, queue, lib, gImage);
 	framebufferRead(device, queue, lib);
+	surfaces(device, queue, lib);
+	drawable(device, queue);
 }
 
 struct vtx {
@@ -422,6 +430,157 @@ framebufferRead(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> 
 	check(cb.status == MTLCommandBufferStatusCompleted && NEAR(none, 64, 128, 191) && NEAR(onlyA, 191, 127, 64) &&
 	    NEAR(onlyB, 191, 127, 64) && NEAR(both, 64, 128, 191),
 	    "framebuffer read: inverted once where one draw covers, restored where both do");
+}
+
+static IOSurfaceRef
+newSurface(int w, int h)
+{
+	NSDictionary *props = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4,
+		(id)kIOSurfacePixelFormat: @((uint32_t)'BGRA') };
+	return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+static void
+surfaces(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+	const int W = 300, H = 200;     /* 1200-byte rows: the kernel pads them to a 64-byte multiple */
+	IOSurfaceRef src = newSurface(W, H), dst = newSurface(W, H);
+	if (!src || !dst) {
+		check(NO, "IOSurfaces created");
+		return;
+	}
+	size_t sRow = IOSurfaceGetBytesPerRow(src), dRow = IOSurfaceGetBytesPerRow(dst);
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:W height:H mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	id<MTLTexture> st = [device newTextureWithDescriptor:td iosurface:src plane:0];
+	id<MTLTexture> dt = [device newTextureWithDescriptor:td iosurface:dst plane:0];
+	printf("IOSurfaces %dx%d, rows %zu/%zu bytes: textures %s/%s, iosurface property %s\n", W, H, sRow, dRow,
+	    st ? "OK" : "nil", dt ? "OK" : "nil", st.iosurface == src ? "OK" : "wrong");
+	check(st && dt && st.iosurface == src, "IOSurface-backed textures");
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];   /* nearest: a 1:1 copy */
+	id<MTLSamplerState> nearest = [device newSamplerStateWithDescriptor:sd];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	NSError *error = nil;
+	id<MTLRenderPipelineState> copy = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	if (!st || !dt || !copy || !nearest) {
+		CFRelease(src);
+		CFRelease(dst);
+		return;
+	}
+	const float quad[4][4] = { { -1, 1, 0, 0 }, { 1, 1, 1, 0 }, { -1, -1, 0, 1 }, { 1, -1, 1, 1 } };
+	/* 30 rounds, a new pattern each: the CPU writes src and scribbles over dst, the GPU copies, the CPU checks */
+	const int rounds = 30;
+	int failed = 0;
+	double ms = 0;
+	for (int round = 0; round < rounds; ++round) {
+		IOSurfaceLock(src, 0, NULL);
+		uint8_t *sp = IOSurfaceGetBaseAddress(src);
+		for (int y = 0; y < H; ++y) {
+			for (int x = 0; x < W; ++x) {
+				uint8_t *p = sp + y * sRow + x * 4;
+				p[0] = (uint8_t)(x * 7 + y + round * 13);
+				p[1] = (uint8_t)(y * 3 + round);
+				p[2] = (uint8_t)((x ^ y) + round * 31);
+				p[3] = 255;
+			}
+		}
+		IOSurfaceUnlock(src, 0, NULL);
+		IOSurfaceLock(dst, 0, NULL);
+		memset(IOSurfaceGetBaseAddress(dst), 0x5a ^ round, dRow * H);
+		IOSurfaceUnlock(dst, 0, NULL);
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = dt;
+		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+		[e setRenderPipelineState:copy];
+		[e setVertexBytes:quad length:sizeof(quad) atIndex:0];
+		[e setFragmentTexture:st atIndex:0];
+		[e setFragmentSamplerState:nearest atIndex:0];
+		[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+		[e endEncoding];
+		CFTimeInterval t0 = CACurrentMediaTime();
+		[cb commit];
+		[cb waitUntilCompleted];
+		ms += (CACurrentMediaTime() - t0) * 1e3;
+		IOSurfaceLock(dst, kIOSurfaceLockReadOnly, NULL);
+		const uint8_t *dp = IOSurfaceGetBaseAddress(dst);
+		int badRows = 0;
+		for (int y = 0; y < H; ++y) {
+			if (memcmp(dp + y * dRow, sp + y * sRow, (size_t)W * 4) == 0) {
+				continue;
+			}
+			if (badRows++ < 2 && failed < 4) {
+				int x = 0, n = 0;
+				while (x < W && !memcmp(dp + y * dRow + x * 4, sp + y * sRow + x * 4, 4)) {
+					x++;
+				}
+				for (int k = 0; k < W; ++k) {
+					n += memcmp(dp + y * dRow + k * 4, sp + y * sRow + k * 4, 4) != 0;
+				}
+				const uint8_t *a = sp + y * sRow + x * 4, *b = dp + y * dRow + x * 4;
+				printf("  round %d row %d: %d pixels differ, first x %d: want %u,%u,%u,%u got %u,%u,%u,%u "
+				    "(status %lu)\n", round, y, n, x, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+				    (unsigned long)cb.status);
+			}
+		}
+		IOSurfaceUnlock(dst, kIOSurfaceLockReadOnly, NULL);
+		failed += badRows != 0 || cb.status != MTLCommandBufferStatusCompleted;
+	}
+	printf("IOSurface copy: %d of %d rounds wrong, %.2f ms per round\n", failed, rounds, ms / rounds);
+	check(failed == 0, "IOSurface -> GPU -> IOSurface (CPU writes seen by the GPU, GPU writes seen by the CPU), 30 rounds");
+	CFRelease(src);
+	CFRelease(dst);
+}
+
+/* CAMetalLayer: QuartzCore makes the drawable's IOSurface texture through
+ * this device; clear it on the GPU, present it, read the surface back. */
+static void
+drawable(id<MTLDevice> device, id<MTLCommandQueue> queue)
+{
+	CAMetalLayer *layer = [CAMetalLayer layer];
+	layer.device = device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	layer.framebufferOnly = NO;
+	layer.drawableSize = CGSizeMake(320, 240);
+	id<CAMetalDrawable> d = [layer nextDrawable];
+	id<MTLTexture> t = d.texture;
+	printf("CAMetalLayer drawable: %s, texture %s %lux%lu, iosurface %s\n", d ? "yes" : "nil",
+	    t ? class_getName(object_getClass(t)) : "-", (unsigned long)t.width, (unsigned long)t.height,
+	    t.iosurface ? "yes" : "no");
+	check(d && t && t.iosurface, "CAMetalLayer nextDrawable (an IOSurface texture of this device)");
+	if (!t) {
+		return;
+	}
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.32, 0.65, 1.0);   /* blaugrana blue */
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e endEncoding];
+	__block BOOL presented = NO;
+	[cb presentDrawable:d];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+		(void)c;
+		presented = YES;
+	}];
+	[cb commit];
+	[cb waitUntilCompleted];
+	IOSurfaceRef s = t.iosurface;
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *p = IOSurfaceGetBaseAddress(s);
+	printf("drawable: status %lu, presented %d, pixel BGRA %u,%u,%u,%u\n", (unsigned long)cb.status, presented,
+	    p[0], p[1], p[2], p[3]);
+	BOOL ok = abs(p[0] - 166) <= 2 && abs(p[1] - 82) <= 2 && p[2] <= 2 && p[3] == 255;
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	check(cb.status == MTLCommandBufferStatusCompleted && presented && ok, "drawable cleared on the GPU and presented");
 }
 
 int

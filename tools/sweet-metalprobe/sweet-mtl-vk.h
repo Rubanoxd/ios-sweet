@@ -79,6 +79,10 @@ void smv_kernel_free(smv_kernel *k);
 /* 2D textures (one mip level), always in the GENERAL layout. REGION is
  * x, y, width, height in texels. */
 smv_texture *smv_texture_new(uint32_t width, uint32_t height, uint32_t format, uint32_t texel_bytes);
+/* A linear image on host memory the caller owns (an IOSurface's pages, 4 KiB
+ * aligned; ROW_BYTES a multiple of 64). The caller keeps it coherent. */
+smv_texture *smv_texture_new_host(void *host, uint64_t bytes, uint32_t width, uint32_t height, uint32_t row_bytes,
+    uint32_t format, uint32_t texel_bytes);
 void smv_texture_free(smv_texture *t);
 int smv_texture_access(smv_texture *t, const uint32_t region[4], void *bytes, uint32_t row_bytes, int write);
 
