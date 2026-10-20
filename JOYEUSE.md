@@ -700,3 +700,31 @@ It answers what our Iridium path lacks for 3D (depth/stencil, mipmaps,
 array/cube/3D textures, more pixel formats, vertex descriptors, function
 constants), so it is the candidate to replace Iridium + sweet-mtl-vk.c
 behind SweetMetalDevice.
+
+## Wi-Fi: plan (2026-10-20)
+
+No Qualcomm Wi-Fi exists on XNU yet (ios-sweet, its forks and UniXNU have
+none). The SM7125 WLAN is integrated: ICNSS (`qcom,icnss@18800000`, copy
+engines, 12 IRQs SPI 414-425, apps SMMU stream 0xc0, IOVA 0xa0000000) with
+the WCN3990 RF, and its firmware (`wlanmdsp.mbn`) runs inside the modem DSP.
+So the order is:
+1. **Modem** (xnu 0097, `sweetwlan=2`): `qcom,pil-tz-generic`, PAS id 4,
+   `modem.mdt` + `modem.bNN` (relocatable, 0x86000000 + 0x8400000), proxy
+   votes on `cx.lvl` / `mss.lvl`, AOP QMP `load_state` (`qcom,signal-aop`),
+   then watch SMP2P (items 435 in / 428 out) and the SSR reason (item 421).
+   `sweetwlan=1` only reads SMEM (0x80900000), cmd-db, the AOP QMP
+   descriptor (0xc300000) and PAS support.
+2. **IPC**: GLINK over SMEM (items 478-480, APCS IPC bit 12, SPI 449) and
+   QRTR; in user space the Linaro services the modem expects: rmtfs (EFS in
+   RAM copies, never writing modemst1/2 or fsg), tqftpserv (serves
+   `wlanmdsp.mbn`), pd-mapper.
+3. **WLAN power and QMI**: ldoa9, ldoc1, ldoc2, ldoc10, ldoc11 through
+   RPMh; the wlfw QMI service (capabilities, board data `bdwlan.*`, mode on).
+4. **ath10k SNOC** in XNU: copy engines, HTC, WMI, HTT; first milestone a
+   scan list.
+5. Association, WPA2 and an iOS network interface.
+
+Firmware: from the MIUI ROM's `NON-HLOS.bin` (a FAT image with 4 KiB
+sectors; `mdir`/`mcopy` from mtools read it, hdiutil does not):
+`image/modem.mdt`, `modem.b00`-`b29`, `wlanmdsp.mbn`, `bdwlan.*`. Xiaomi's
+blobs: on the phone in `/usr/share/firmware/joyeuse/modem/`, never in git.

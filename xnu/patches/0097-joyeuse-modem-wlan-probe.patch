@@ -1,0 +1,1089 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_touch_spi.c		standard
+ bsd/dev/sweet_dpu.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_irq.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,9 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_cmd_db(const char *res, unsigned *slave, uint32_t *addr, uint16_t *aux, unsigned *naux,
++    unsigned max);
++int sweet_rpmh_arc_vote(const char *res, unsigned hlvl);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -43,7 +46,9 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_MAX_CMDS     3u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -205,6 +210,49 @@
+ 	return 0;
+ }
+ 
++/* Any slave (ARC 3, VRM 4, BCM 5): its address and aux data (ARC: the
++ * levels, little-endian 16-bit). Read-only; the caller holds rh_lock. */
++static int
++rh_find(const char *res, unsigned *slave_out, uint32_t *address, uint32_t *aux_off, uint32_t *aux_len)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			uint32_t off = aux + rh_db16(e + 22), len = rh_db16(e + 20);
++			if ((addr >> 16) != slave || !rh_range(off, len)) {
++				return EINVAL;
++			}
++			*slave_out = slave;
++			*address = addr;
++			*aux_off = off;
++			*aux_len = len;
++			++matches;
++		}
++	}
++	return matches == 1 ? 0 : ENODEV;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -218,9 +266,11 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* One ACTIVE (AMC) request of N commands, each a write with ack. */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send_cmds(const uint32_t *addrs, const uint32_t *values, unsigned n, const char *what)
+ {
++	uint32_t address = addrs[0] & ~15u, mask = (1u << n) - 1u;
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -234,7 +284,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n", what, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -266,30 +316,27 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %s (%u commands) irq-enable=%#x\n", t, what, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[RH_MAX_CMDS] = {0, 0, 0};
+ 	bool done = false, progress = false;
+ 	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,10 +367,20 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s ACTIVE vote complete\n", what);
+ 	return 0;
+ }
+ 
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	const uint32_t addrs[3] = {address, address + 8, address + 4};
++	const uint32_t values[3] = {mv, 7, 1};
++	printf("SWEET RPMH: %u mV mode=7 enable=1\n", mv);
++	return rh_send_cmds(addrs, values, 3, "L11C");
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -351,6 +408,69 @@
+ out:
+ 	if (error) {
+ 		printf("SWEET RPMH: enable failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Read-only cmd-db lookup for other drivers (bsd/dev/sweet_wlan.c). */
++int
++sweet_rpmh_cmd_db(const char *res, unsigned *slave, uint32_t *addr, uint16_t *aux, unsigned *naux, unsigned max)
++{
++	if (!res || !slave || !addr || !naux || (max && !aux)) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t off = 0, len = 0;
++	int error = rh_map();
++	if (!error) {
++		error = rh_find(res, slave, addr, &off, &len);
++	}
++	if (!error) {
++		*naux = 0;
++		for (uint32_t i = 0; i + 2 <= len && *naux < max; i += 2) {
++			aux[(*naux)++] = rh_db16(off + i);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* An ACTIVE vote of ARC level index HLVL (cmd-db aux order) for an ARC
++ * resource, e.g. a proxy vote while a subsystem boots. */
++int
++sweet_rpmh_arc_vote(const char *res, unsigned hlvl)
++{
++	if (!res) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	unsigned slave = 0;
++	uint32_t address = 0, off = 0, len = 0;
++	int error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_find(res, &slave, &address, &off, &len);
++	}
++	if (!error && (slave != RH_ARC || hlvl >= len / 2)) {
++		error = EINVAL;
++	}
++	if (!error) {
++		error = rh_send_cmds(&address, &hlvl, 1, res);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s level %u vote failed errno=%d\n", res, hlvl, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_wlan_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_gpu_probe();       /* bsd/dev/sweet_gpu.c, sweetgpu=<stage> */
++	sweet_wlan_probe();      /* bsd/dev/sweet_wlan.c, sweetwlan=<stage> */
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_wlan.c
+@@ -0,0 +1,835 @@
++/*
++ * JOYEUSE: Wi-Fi bring-up, staged like the GPU (bsd/dev/sweet_gpu.c).
++ *
++ * The SM7125 WLAN is integrated (ICNSS, WCN3990 RF over SNOC at 0x18800000)
++ * and its firmware (wlanmdsp.mbn) runs inside the modem DSP, which reaches
++ * the apps side over SMEM, SMP2P and GLINK/QRTR. So the first thing Wi-Fi
++ * needs is the modem running. Addresses from the stock MIUI joyeuse DT
++ * (downstream atoll kernel) and Linux qcom_smem.c, smp2p.c, qcom_aoss.c,
++ * qcom_q6v5_pas.c, mdt_loader.c:
++ *   modem   "qcom,pil-tz-generic", PAS id 4, firmware "modem" (.mdt + .bNN,
++ *           relocatable) into pil_modem_mem 0x86000000 + 0x8400000; proxy
++ *           votes cx.lvl and mss.lvl (TURBO), "qcom,signal-aop" (AOP QMP
++ *           load_state message)
++ *   SMEM    0x80900000 + 2 MiB; SMP2P with the modem: inbound item 435,
++ *           outbound 428, IRQ SPI 451; SSR reason item 421; GLINK native
++ *           xprt items 478-480
++ *   AOP QMP msgram 0xc300000, doorbell APCS IPC 0x17c0000c bit 0
++ *   WLAN    0x18800000 (not touched here), MSA 0x93900000 + 2 MiB,
++ *           supplies ldoa9 (cx/mx), ldoc1 (1.8 xo), ldoc2 (1.3 rfa),
++ *           ldoc10/ldoc11 (3.3 ch0/ch1)
++ *
++ * Boot-arg sweetwlan=<stage> (default 0 = off), each includes the previous:
++ *   1  read-only: SMEM header and partitions, the SMEM items above, the
++ *      cmd-db entries of the rails above, the AOP QMP descriptor, SCM
++ *      PAS_IS_SUPPORTED(4) and the modem firmware files
++ *   2  boot the modem: AOP load_state, cx/mss proxy votes, PAS init, mem
++ *      setup, segment load and auth_and_reset from
++ *      /usr/share/firmware/joyeuse/modem/, then 30 s of watching SMP2P and
++ *      SMEM (the modem's smp2p entries, the SSR reason, GLINK items)
++ * After auth_and_reset the modem region belongs to the modem (an apps access
++ * faults on the XPU): nothing here touches it again.
++ * It runs sweetwlandelay seconds (default 30) after boot on its own thread;
++ * lines go to the console and to sysctl kern.sweetwlan. joyeuse only.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <kern/kalloc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <stdarg.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_rpmh_cmd_db(const char *res, unsigned *slave, uint32_t *addr, uint16_t *aux,
++    unsigned *naux, unsigned max);
++extern int sweet_rpmh_arc_vote(const char *res, unsigned hlvl);
++void sweet_wlan_probe(void);
++
++#define SMEM_PA           0x80900000u
++#define SMEM_SIZE         0x00200000u
++#define SMEM_GLOBAL_HOST  0xfffeu
++#define SMEM_HOST_APPS    0u
++#define SMEM_HOST_MODEM   1u
++#define SMEM_SMP2P_IN     435u        /* modem -> apps */
++#define SMEM_SMP2P_OUT    428u        /* apps -> modem */
++#define SMEM_SSR_MSS      421u        /* SMEM_SSR_REASON_MSS0 */
++#define SMEM_GLINK_DESC   478u        /* SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR */
++#define SMEM_GLINK_FIFO0  479u
++#define SMEM_GLINK_FIFO1  480u
++
++#define QMP_PA            0x0c300000u
++#define QMP_SIZE          0x1000u
++#define QMP_DOORBELL_PA   0x17c00000u /* APCS global; IPC register at +0xc */
++#define QMP_IPC           0x0cu
++#define QMP_MAGIC         0x4d41494cu
++#define QMP_UP            0x0000ffffu
++#define QMP_D_MAGIC       0x00u
++#define QMP_D_VERSION     0x04u
++#define QMP_D_FEATURES    0x08u
++#define QMP_D_UC_LINK     0x0cu
++#define QMP_D_UC_LINK_ACK 0x10u
++#define QMP_D_UC_CH       0x14u
++#define QMP_D_UC_CH_ACK   0x18u
++#define QMP_D_UC_SIZE     0x1cu
++#define QMP_D_UC_OFF      0x20u
++#define QMP_D_MC_LINK     0x24u
++#define QMP_D_MC_LINK_ACK 0x28u
++#define QMP_D_MC_CH       0x2cu
++#define QMP_D_MC_CH_ACK   0x30u
++#define QMP_D_MC_SIZE     0x34u
++#define QMP_D_MC_OFF      0x38u
++
++#define MSS_PAS_ID        4u
++#define MSS_PA            0x86000000u
++#define MSS_SIZE          0x08400000u
++#define MSS_FW_DIR        "/usr/share/firmware/joyeuse/modem/"
++#define MSS_MDT_MAX       0x10000u
++#define TURBO_VLVL        384u        /* RPMH_REGULATOR_LEVEL_TURBO */
++
++static struct {
++	int stage;
++	int delay_s;
++	vm_offset_t smem;
++	uint32_t smem_version;
++	uint32_t global_off, global_size, global_line;    /* global partition (v12) */
++	uint32_t modem_off, modem_size, modem_line;       /* apps<->modem partition */
++} sw;
++
++static char sweet_wlan_log[8192];
++static size_t sweet_wlan_log_len;
++SYSCTL_STRING(_kern, OID_AUTO, sweetwlan, CTLFLAG_RD | CTLFLAG_LOCKED,
++    sweet_wlan_log, sizeof(sweet_wlan_log), "joyeuse Wi-Fi/modem bring-up log");
++
++static void wl_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++wl_log(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++	va_start(ap, fmt);
++	int n = vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	if (n < 0) {
++		return;
++	}
++	printf("SWEET WLAN: %s\n", line);
++	size_t len = strnlen(line, sizeof(line));
++	if (sweet_wlan_log_len + len + 2 <= sizeof(sweet_wlan_log)) {
++		memcpy(sweet_wlan_log + sweet_wlan_log_len, line, len);
++		sweet_wlan_log_len += len;
++		sweet_wlan_log[sweet_wlan_log_len++] = '\n';
++		sweet_wlan_log[sweet_wlan_log_len] = '\0';
++	}
++}
++
++static uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++wl_is_joyeuse(void)
++{
++	DTEntry root;
++	char const *compat = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess) {
++		return false;
++	}
++	for (unsigned int i = 0; i < size; i += (unsigned int)strnlen(compat + i, size - i) + 1) {
++		if (!strncmp(compat + i, "xiaomi,joyeuse", size - i)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* SMEM is device memory here: only aligned 32-bit loads. */
++static uint32_t
++sm32(uint32_t off)
++{
++	return off <= SMEM_SIZE - 4 ? rd32(sw.smem, off & ~3u) : 0xffffffffu;
++}
++
++static uint16_t
++sm16(uint32_t off)
++{
++	return (uint16_t)(sm32(off & ~3u) >> (8u * (off & 2u)));
++}
++
++static void
++sm_bytes(uint32_t off, char *out, size_t len)
++{
++	for (size_t i = 0; i < len; ++i) {
++		out[i] = (char)(sm32((uint32_t)(off + i) & ~3u) >> (8u * ((off + i) & 3u)));
++	}
++}
++
++/* qcom_smem.c: struct smem_header, then the partition table 4 KiB before the end. */
++static bool
++smem_scan(void)
++{
++	sw.smem_version = sm32(64 + 4 * 7) >> 16;           /* version[SBL] */
++	uint32_t initialized = sm32(192);
++	wl_log("smem: version %u initialized %u available 0x%x", sw.smem_version, initialized, sm32(196));
++	uint32_t pt = SMEM_SIZE - 0x1000u;
++	char magic[5] = { 0 };
++	sm_bytes(pt, magic, 4);
++	if (memcmp(magic, "$TOC", 4)) {
++		wl_log("smem: no partition table (magic %02x%02x%02x%02x)", (uint8_t)magic[0],
++		    (uint8_t)magic[1], (uint8_t)magic[2], (uint8_t)magic[3]);
++		return sw.smem_version == 11;
++	}
++	uint32_t n = sm32(pt + 8);
++	wl_log("smem: ptable version %u, %u entries", sm32(pt + 4), n);
++	for (uint32_t i = 0; i < n && i < 32; ++i) {
++		uint32_t e = pt + 32 + 48 * i;
++		uint32_t off = sm32(e), size = sm32(e + 4), flags = sm32(e + 8);
++		uint32_t hosts = sm32(e + 12);
++		unsigned h0 = hosts & 0xffffu, h1 = hosts >> 16;
++		if (!off || !size || off >= SMEM_SIZE || size > SMEM_SIZE - off) {
++			continue;
++		}
++		char pm[5] = { 0 };
++		sm_bytes(off, pm, 4);
++		wl_log("smem: partition %u hosts %u/%u at 0x%x size 0x%x flags 0x%x %s free 0x%x", i, h0, h1, off,
++		    size, flags, memcmp(pm, "$PRT", 4) ? "BAD" : "$PRT", sm32(off + 12));
++		if (memcmp(pm, "$PRT", 4)) {
++			continue;
++		}
++		if (h0 == SMEM_GLOBAL_HOST && h1 == SMEM_GLOBAL_HOST) {
++			sw.global_off = off;
++			sw.global_size = size;
++			sw.global_line = sm32(e + 16);
++		}
++		if ((h0 == SMEM_HOST_APPS && h1 == SMEM_HOST_MODEM) || (h0 == SMEM_HOST_MODEM && h1 == SMEM_HOST_APPS)) {
++			sw.modem_off = off;
++			sw.modem_size = size;
++			sw.modem_line = sm32(e + 16);
++		}
++	}
++	return true;
++}
++
++/* Items of one partition (smem_private_entry: canary 0xa5a5, item, size,
++ * padding_data, padding_hdr): uncached ones upwards from the header, cached
++ * ones downwards from the end. Returns the item's offset or 0. */
++static uint32_t
++smem_part_find(uint32_t part, uint32_t part_size, uint32_t line, unsigned item, uint32_t *size)
++{
++	uint32_t free_uncached = sm32(part + 12), free_cached = sm32(part + 16);
++	if (!part || free_uncached > part_size || free_cached > part_size) {
++		return 0;
++	}
++	uint32_t ehdr = line > 16 && line <= 0x1000 ? line : 16;      /* ALIGN(sizeof(entry), cacheline) */
++	for (uint32_t e = part + part_size - ehdr, guard = 0; e > part + free_cached && guard < 4096; ++guard) {
++		uint32_t w0 = sm32(e), sz = sm32(e + 4), pads = sm32(e + 8);
++		if ((w0 & 0xffffu) != 0xa5a5u || sz > part_size) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			if (size) {
++				*size = sz - (pads & 0xffffu);
++			}
++			return e - sz;
++		}
++		e -= sz + ehdr;
++	}
++	uint32_t e = part + 32, end = part + free_uncached;
++	for (unsigned guard = 0; e + 16 <= end && guard < 4096; ++guard) {
++		uint32_t w0 = sm32(e), sz = sm32(e + 4), pads = sm32(e + 8);
++		if ((w0 & 0xffffu) != 0xa5a5u) {
++			wl_log("smem: bad canary at 0x%x", e);
++			return 0;
++		}
++		uint32_t hdr = pads >> 16;
++		if ((w0 >> 16) == item) {
++			if (size) {
++				*size = sz - (pads & 0xffffu);
++			}
++			return e + 16 + hdr;
++		}
++		e += 16 + hdr + sz;
++	}
++	return 0;
++}
++
++static uint32_t
++smem_find(unsigned item, uint32_t *size)
++{
++	uint32_t at = smem_part_find(sw.modem_off, sw.modem_size, sw.modem_line, item, size);
++	if (!at) {
++		at = smem_part_find(sw.global_off, sw.global_size, sw.global_line, item, size);
++	}
++	if (!at && sw.smem_version == 11 && item < 512) {
++		uint32_t toc = 204 + 16 * item;          /* legacy: allocated, offset, size */
++		if (sm32(toc) == 1) {
++			at = sm32(toc + 4);
++			if (size) {
++				*size = sm32(toc + 8);
++			}
++		}
++	}
++	return at;
++}
++
++/* smp2p.c struct smp2p_smem_item: "$SMP", version|features, local/remote pid,
++ * total/valid entries, flags, then 16-byte names with a 32-bit value. */
++static uint32_t smp2p_last[16];
++
++static void
++smp2p_dump(unsigned item, const char *what, bool changes_only)
++{
++	uint32_t size = 0, at = smem_find(item, &size);
++	if (!at) {
++		if (!changes_only) {
++			wl_log("smp2p %s (item %u): absent", what, item);
++		}
++		return;
++	}
++	if (sm32(at) != 0x504d5324u) {
++		wl_log("smp2p %s: bad magic 0x%08x", what, sm32(at));
++		return;
++	}
++	uint32_t pids = sm32(at + 8), counts = sm32(at + 12);
++	unsigned valid = counts >> 16;
++	if (!changes_only) {
++		wl_log("smp2p %s: version/features 0x%08x pids %u->%u entries %u/%u flags 0x%x", what,
++		    sm32(at + 4), pids & 0xffffu, pids >> 16, valid, counts & 0xffffu, sm32(at + 16));
++	}
++	for (unsigned i = 0; i < valid && i < 16; ++i) {
++		uint32_t e = at + 20 + 20 * i;
++		char name[17] = { 0 };
++		sm_bytes(e, name, 16);
++		uint32_t v = sm32(e + 16);
++		if (!changes_only || v != smp2p_last[i]) {
++			wl_log("smp2p %s: %-16s 0x%08x", what, name, v);
++			smp2p_last[i] = v;
++		}
++	}
++}
++
++static void
++smem_report(bool changes_only)
++{
++	static const struct { unsigned item; const char *name; } items[] = {
++		{ SMEM_SMP2P_OUT, "smp2p apps->modem" },
++		{ SMEM_GLINK_DESC, "glink descriptor" },
++		{ SMEM_GLINK_FIFO0, "glink fifo0" },
++		{ SMEM_GLINK_FIFO1, "glink fifo1" },
++	};
++	static bool seen[4];
++	for (unsigned i = 0; i < 4; ++i) {
++		uint32_t size = 0, at = smem_find(items[i].item, &size);
++		if (!changes_only || (at != 0) != seen[i]) {
++			wl_log("smem item %u (%s): %s at 0x%x size 0x%x", items[i].item, items[i].name,
++			    at ? "present" : "absent", at, size);
++			seen[i] = at != 0;
++		}
++	}
++	smp2p_dump(SMEM_SMP2P_IN, "modem->apps", changes_only);
++	uint32_t size = 0, at = smem_find(SMEM_SSR_MSS, &size);
++	static uint32_t ssr_seen;
++	if (at && size && sm32(at) != ssr_seen) {
++		char reason[128] = { 0 };
++		sm_bytes(at, reason, size < sizeof(reason) - 1 ? size : sizeof(reason) - 1);
++		wl_log("modem SSR reason: %s", reason);
++		ssr_seen = sm32(at);
++	}
++}
++
++static void
++rails_report(void)
++{
++	static const char *const rails[] = { "cx.lvl", "mss.lvl", "ldoa9", "ldoc1", "ldoc2", "ldoc10", "ldoc11" };
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		unsigned slave = 0, naux = 0;
++		uint32_t addr = 0;
++		uint16_t aux[16];
++		int err = sweet_rpmh_cmd_db(rails[i], &slave, &addr, aux, &naux, 16);
++		if (err) {
++			wl_log("cmd-db %s: error %d", rails[i], err);
++			continue;
++		}
++		char levels[96] = { 0 };
++		size_t len = 0;
++		for (unsigned j = 0; j < naux && len + 7 < sizeof(levels); ++j) {
++			len += (size_t)snprintf(levels + len, sizeof(levels) - len, " %u", aux[j]);
++		}
++		wl_log("cmd-db %s: slave %u addr 0x%x%s%s", rails[i], slave, addr, naux ? " levels" : "", levels);
++	}
++}
++
++/* Same SCM SMCCC caller as sweet_gpu.c. */
++static int64_t
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a0, uint64_t a1, uint64_t a2,
++    uint64_t *result)
++{
++	uint64_t fn = 0x42000000ull | ((svc & 0xff) << 8) | (cmd & 0xff);
++	for (unsigned busy = 0; busy < 20; ++busy) {
++		uint64_t first = fn, session = 0;
++		register uint64_t x0 __asm__("x0");
++		register uint64_t x1 __asm__("x1");
++		register uint64_t x2 __asm__("x2");
++		register uint64_t x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4");
++		register uint64_t x5 __asm__("x5");
++		register uint64_t x6 __asm__("x6");
++		register uint64_t x7 __asm__("x7");
++		do {
++			x0 = first;
++			x1 = arginfo;
++			x2 = a0;
++			x3 = a1;
++			x4 = a2;
++			x5 = 0;
++			x6 = session;
++			x7 = 0;
++			__asm__ volatile ("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			first = x0;
++			session = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12) {
++			if (result) {
++				*result = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++	return -12;
++}
++
++static vm_offset_t qmp, qmp_bell;
++
++static bool
++qmp_wait(uint32_t off, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms; ++i) {
++		if (rd32(qmp, off) == want) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
++static void
++qmp_kick(void)
++{
++	wr32(qmp_bell, QMP_IPC, 1u << 0);
++}
++
++static void
++qmp_report(void)
++{
++	if (!qmp) {
++		qmp = ml_io_map(QMP_PA, QMP_SIZE);
++	}
++	if (!qmp) {
++		wl_log("qmp: map failed");
++		return;
++	}
++	wl_log("qmp: magic 0x%08x version %u features 0x%x", rd32(qmp, QMP_D_MAGIC), rd32(qmp, QMP_D_VERSION),
++	    rd32(qmp, QMP_D_FEATURES));
++	wl_log("qmp: ucore link 0x%08x/ack 0x%08x ch 0x%08x/ack 0x%08x mbox 0x%x+0x%x",
++	    rd32(qmp, QMP_D_UC_LINK), rd32(qmp, QMP_D_UC_LINK_ACK), rd32(qmp, QMP_D_UC_CH),
++	    rd32(qmp, QMP_D_UC_CH_ACK), rd32(qmp, QMP_D_UC_OFF), rd32(qmp, QMP_D_UC_SIZE));
++	wl_log("qmp: mcore link 0x%08x/ack 0x%08x ch 0x%08x/ack 0x%08x mbox 0x%x+0x%x",
++	    rd32(qmp, QMP_D_MC_LINK), rd32(qmp, QMP_D_MC_LINK_ACK), rd32(qmp, QMP_D_MC_CH),
++	    rd32(qmp, QMP_D_MC_CH_ACK), rd32(qmp, QMP_D_MC_OFF), rd32(qmp, QMP_D_MC_SIZE));
++}
++
++/* qcom_aoss.c qmp_open; an already open link (by an earlier boot stage) is reused. */
++static bool
++qmp_open(void)
++{
++	if (!qmp || rd32(qmp, QMP_D_MAGIC) != QMP_MAGIC || rd32(qmp, QMP_D_VERSION) != 1) {
++		wl_log("qmp: no usable descriptor");
++		return false;
++	}
++	if (!qmp_bell) {
++		qmp_bell = ml_io_map(QMP_DOORBELL_PA, 0x1000);
++	}
++	if (!qmp_bell) {
++		return false;
++	}
++	if (rd32(qmp, QMP_D_MC_CH_ACK) == QMP_UP && rd32(qmp, QMP_D_UC_CH) == QMP_UP) {
++		wl_log("qmp: channel already open");
++		return true;
++	}
++	wr32(qmp, QMP_D_UC_LINK_ACK, rd32(qmp, QMP_D_UC_LINK));
++	wr32(qmp, QMP_D_MC_LINK, QMP_UP);
++	qmp_kick();
++	if (!qmp_wait(QMP_D_MC_LINK_ACK, QMP_UP, 1000)) {
++		wl_log("qmp: link not acked");
++		return false;
++	}
++	wr32(qmp, QMP_D_MC_CH, QMP_UP);
++	qmp_kick();
++	if (!qmp_wait(QMP_D_UC_CH, QMP_UP, 1000)) {
++		wl_log("qmp: AOP channel not up");
++		return false;
++	}
++	wr32(qmp, QMP_D_UC_CH_ACK, QMP_UP);
++	qmp_kick();
++	if (!qmp_wait(QMP_D_MC_CH_ACK, QMP_UP, 1000)) {
++		wl_log("qmp: channel not acked");
++		return false;
++	}
++	wl_log("qmp: open");
++	return true;
++}
++
++static bool
++qmp_send(const char *msg)
++{
++	uint32_t off = rd32(qmp, QMP_D_MC_OFF), size = rd32(qmp, QMP_D_MC_SIZE);
++	size_t len = (strlen(msg) + 1 + 3) & ~(size_t)3;
++	if (len + 4 > size || off + size > QMP_SIZE) {
++		wl_log("qmp: message too long (%zu, mbox %u)", len, size);
++		return false;
++	}
++	size_t slen = strlen(msg);
++	for (size_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (size_t b = 0; b < 4 && i + b < slen; ++b) {
++			w |= (uint32_t)(uint8_t)msg[i + b] << (8 * b);
++		}
++		wr32(qmp, off + 4 + (uint32_t)i, w);
++	}
++	wr32(qmp, off, (uint32_t)len);
++	qmp_kick();
++	bool ok = qmp_wait(off, 0, 1000);
++	wl_log("qmp: \"%s\" %s", msg, ok ? "consumed" : "NOT consumed in 1 s");
++	return ok;
++}
++
++static bool
++wl_open(const char *path, vnode_t *vp, off_t *size, vfs_context_t ctx)
++{
++	int err = vnode_open(path, FREAD, 0, 0, vp, ctx);
++	if (!err) {
++		err = vnode_size(*vp, size, ctx);
++		if (err) {
++			(void)vnode_close(*vp, FREAD, ctx);
++		}
++	}
++	if (err) {
++		wl_log("cannot open %s: %d", path, err);
++	}
++	return !err;
++}
++
++/* Reads a whole small file (the .mdt). */
++static uint8_t *
++wl_read_small(const char *path, size_t max, size_t *len)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	uint8_t *buf = NULL;
++	if (wl_open(path, &vp, &size, ctx)) {
++		int resid = 0;
++		if (size > 0 && (size_t)size <= max && (buf = kalloc_data((vm_size_t)size, Z_WAITOK | Z_ZERO))) {
++			if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx),
++			    &resid, vfs_context_proc(ctx)) || resid) {
++				kfree_data(buf, (vm_size_t)size);
++				buf = NULL;
++			} else {
++				*len = (size_t)size;
++			}
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	(void)vfs_context_rele(ctx);
++	return buf;
++}
++
++/* Streams a segment file into the device mapping at DST: 8-byte stores, byte
++ * stores for the tail (device memory takes no unaligned access). */
++static bool
++wl_load_segment(const char *path, vm_offset_t dst, uint32_t filesz)
++{
++	const size_t chunk = 1u << 20;
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	bool ok = false;
++	uint8_t *buf = kalloc_data(chunk, Z_WAITOK);
++	if (buf && wl_open(path, &vp, &size, ctx)) {
++		if (size != (off_t)filesz) {
++			wl_log("%s: %lld bytes, want %u", path, (long long)size, filesz);
++		} else {
++			ok = true;
++			for (uint32_t pos = 0; ok && pos < filesz; pos += chunk) {
++				uint32_t n = filesz - pos < chunk ? filesz - pos : (uint32_t)chunk;
++				int resid = 0;
++				if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)n, pos, UIO_SYSSPACE, 0, vfs_context_ucred(ctx),
++				    &resid, vfs_context_proc(ctx)) || resid) {
++					wl_log("%s: read error at %u", path, pos);
++					ok = false;
++					break;
++				}
++				uint32_t i = 0;
++				for (; i + 8 <= n; i += 8) {
++					uint64_t v;
++					memcpy(&v, buf + i, 8);
++					*(volatile uint64_t *)(dst + pos + i) = v;
++				}
++				for (; i < n; ++i) {
++					*(volatile uint8_t *)(dst + pos + i) = buf[i];
++				}
++			}
++		}
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++	if (buf) {
++		kfree_data(buf, chunk);
++	}
++	(void)vfs_context_rele(ctx);
++	return ok;
++}
++
++static void
++wl_zero(vm_offset_t dst, uint32_t from, uint32_t to)
++{
++	uint32_t i = from;
++	for (; i < to && (i & 7); ++i) {
++		*(volatile uint8_t *)(dst + i) = 0;
++	}
++	for (; i + 8 <= to; i += 8) {
++		*(volatile uint64_t *)(dst + i) = 0;
++	}
++	for (; i < to; ++i) {
++		*(volatile uint8_t *)(dst + i) = 0;
++	}
++}
++
++/* The proxy votes of pil-tz / qcom_q6v5_pas: the smallest ARC level at or
++ * above TURBO (or the highest there is). */
++static bool
++wl_arc_turbo(const char *res)
++{
++	unsigned slave = 0, naux = 0;
++	uint32_t addr = 0;
++	uint16_t aux[16];
++	if (sweet_rpmh_cmd_db(res, &slave, &addr, aux, &naux, 16) || slave != 3 || !naux) {
++		wl_log("%s: no ARC levels", res);
++		return false;
++	}
++	unsigned hlvl = naux - 1;
++	for (unsigned i = 0; i < naux; ++i) {
++		if (aux[i] >= TURBO_VLVL) {
++			hlvl = i;
++			break;
++		}
++	}
++	int err = sweet_rpmh_arc_vote(res, hlvl);
++	wl_log("vote %s hlvl %u (vlvl %u): %d", res, hlvl, aux[hlvl], err);
++	return !err;
++}
++
++static bool
++wl_modem_boot(void)
++{
++	uint64_t res = 0;
++	size_t mdt_len = 0;
++	uint8_t *mdt = wl_read_small(MSS_FW_DIR "modem.mdt", MSS_MDT_MAX, &mdt_len);
++	if (!mdt) {
++		return false;
++	}
++	bool ok = false;
++	vm_offset_t meta = 0, region = 0;
++	uint32_t phnum = mdt_len >= 52 ? *(const uint16_t *)(mdt + 44) : 0;
++	uint32_t phoff = mdt_len >= 52 ? *(const uint32_t *)(mdt + 28) : 0;
++	uint32_t min_pa = ~0u, max_end = 0;
++	if (mdt_len < 52 || memcmp(mdt, "\x7f" "ELF", 4) || mdt[4] != 1 || phnum > 64 ||
++	    phoff + phnum * 32u > mdt_len) {
++		wl_log("modem.mdt: not an ELF32 image");
++		goto out;
++	}
++	for (uint32_t i = 0; i < phnum; ++i) {
++		const uint32_t *ph = (const uint32_t *)(mdt + phoff + 32 * i);
++		if (ph[0] != 1 || (ph[6] & 0x07000000u) == 0x02000000u || !ph[5]) {
++			continue;
++		}
++		min_pa = ph[3] < min_pa ? ph[3] : min_pa;
++		uint32_t end = (ph[3] + ph[5] + 0xfffu) & ~0xfffu;
++		max_end = end > max_end ? end : max_end;
++	}
++	if (min_pa != MSS_PA || max_end <= min_pa || max_end - min_pa > MSS_SIZE) {
++		wl_log("modem.mdt: segments 0x%x-0x%x outside pil_modem_mem", min_pa, max_end);
++		goto out;
++	}
++	wl_log("modem.mdt: %u program headers, image 0x%x-0x%x", phnum, min_pa, max_end);
++
++	/* Power first: AOP's load_state, then the proxy votes. */
++	if (!qmp_open() || !qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
++		goto out;
++	}
++	if (!wl_arc_turbo("cx.lvl") || !wl_arc_turbo("mss.lvl")) {
++		goto out;
++	}
++
++	if (kmem_alloc_contig(kernel_map, &meta, round_page(mdt_len), PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		goto out;
++	}
++	memcpy((void *)meta, mdt, mdt_len);
++	uint64_t meta_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)meta));
++	flush_dcache64((addr64_t)meta_pa, (unsigned)round_page(mdt_len), TRUE);
++	int64_t rc = scm_call(2, 1, 0x82, MSS_PAS_ID, meta_pa, 0, &res);      /* PAS_INIT_IMAGE */
++	wl_log("scm pas_init_image: rc %lld result %llu (metadata %zu bytes at 0x%llx)", rc, res, mdt_len, meta_pa);
++	if (rc || res) {
++		goto out;
++	}
++	rc = scm_call(2, 2, 3, MSS_PAS_ID, MSS_PA, max_end - min_pa, &res);    /* PAS_MEM_SETUP */
++	wl_log("scm pas_mem_setup(0x%x, 0x%x): rc %lld result %llu", MSS_PA, max_end - min_pa, rc, res);
++	if (rc || res) {
++		goto out;
++	}
++	region = ml_io_map(MSS_PA, MSS_SIZE);
++	if (!region) {
++		wl_log("modem region map failed");
++		goto out;
++	}
++	uint64_t t0 = mach_absolute_time();
++	uint32_t loaded = 0;
++	for (uint32_t i = 0; i < phnum; ++i) {
++		const uint32_t *ph = (const uint32_t *)(mdt + phoff + 32 * i);
++		if (ph[0] != 1 || (ph[6] & 0x07000000u) == 0x02000000u || !ph[5]) {
++			continue;
++		}
++		uint32_t off = ph[3] - min_pa, filesz = ph[4], memsz = ph[5];
++		if (filesz > memsz) {
++			wl_log("segment %u: filesz 0x%x > memsz 0x%x", i, filesz, memsz);
++			goto out;
++		}
++		if (filesz) {
++			char name[96];
++			snprintf(name, sizeof(name), MSS_FW_DIR "modem.b%02u", i);
++			if (!wl_load_segment(name, region + off, filesz)) {
++				goto out;
++			}
++			loaded += filesz;
++		}
++		wl_zero(region + off, filesz, memsz);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	wl_log("modem segments loaded: %u bytes in %llu ms", loaded, ns / 1000000);
++	t0 = mach_absolute_time();
++	rc = scm_call(2, 5, 1, MSS_PAS_ID, 0, 0, &res);                       /* PAS_AUTH_AND_RESET */
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	wl_log("scm pas_auth_and_reset: rc %lld result %llu (%llu ms)", rc, res, ns / 1000000);
++	ok = !rc && !res;
++out:
++	kfree_data(mdt, mdt_len);
++	return ok;
++}
++
++static int sweet_wlan_sleep_chan;
++
++static void
++wl_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sweet_wlan_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++wl_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	wl_sleep_ms((unsigned)sw.delay_s * 1000u);
++	wl_log("stage %d", sw.stage);
++	sw.smem = ml_io_map(SMEM_PA, SMEM_SIZE);
++	if (!sw.smem) {
++		wl_log("smem map failed");
++		return;
++	}
++	if (!smem_scan()) {
++		return;
++	}
++	smem_report(false);
++	rails_report();
++	qmp_report();
++	uint64_t res = 0;
++	int64_t rc = scm_call(2, 7, 1, MSS_PAS_ID, 0, 0, &res);           /* PAS_IS_SUPPORTED */
++	wl_log("scm pas_is_supported(%u): rc %lld result %llu", MSS_PAS_ID, rc, res);
++	size_t len = 0;
++	uint8_t *probe = wl_read_small(MSS_FW_DIR "modem.mdt", MSS_MDT_MAX, &len);
++	wl_log("firmware: modem.mdt %s (%zu bytes)", probe ? "found" : "missing", len);
++	if (probe) {
++		kfree_data(probe, len);
++	}
++	if (sw.stage < 2) {
++		wl_log("done");
++		return;
++	}
++	if (!wl_modem_boot()) {
++		wl_log("modem boot failed");
++		return;
++	}
++	for (unsigned t = 0; t < 300; ++t) {               /* 30 s */
++		wl_sleep_ms(100);
++		smem_report(true);
++	}
++	smem_report(false);
++	qmp_report();
++	wl_log("done");
++}
++
++void
++sweet_wlan_probe(void)
++{
++	thread_t thread;
++	sw.stage = 0;
++	sw.delay_s = 30;
++	PE_parse_boot_argn("sweetwlan", &sw.stage, sizeof(sw.stage));
++	PE_parse_boot_argn("sweetwlandelay", &sw.delay_s, sizeof(sw.delay_s));
++	if (sw.stage <= 0 || !wl_is_joyeuse()) {
++		return;
++	}
++	if (sw.delay_s < 0) {
++		sw.delay_s = 0;
++	}
++	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET WLAN: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
