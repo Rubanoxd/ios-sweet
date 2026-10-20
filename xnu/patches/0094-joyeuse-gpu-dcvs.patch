@@ -1,6 +1,46 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1694,7 +1694,42 @@
+@@ -1655,12 +1655,27 @@
+ gpu_gx_on(void)
+ {
+ 	return (gpu_rd(sg.gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) != 0;
++}
++
++static bool gpu_restart(const char *why);
++
++/* GX on, and the core still holding what we programmed: a GX collapse (the
++ * GMU applying a DCVS change in its boot mode did one on hardware) loses
++ * every core register, so CP_RB_BASE is the canary. */
++static bool
++gpu_core_lost(void)
++{
++	return core_rd(0x0800) != (uint32_t)(GFX_IOVA + GFX_RB_OFF);   /* CP_RB_BASE */
+ }
+ 
+ static bool
+ gpu_ensure_gx(const char *where)
+ {
+ 	if (gpu_gx_on()) {
++		if (gpu_ready && gpu_core_lost()) {
++			gpu_log("%s: GPU core lost its state (CP_RB_BASE 0x%08x)", where, core_rd(0x0800));
++			return gpu_restart("core state lost");
++		}
+ 		return true;
+ 	}
+ 	gpu_log("%s: GX is off (gx_gdscr 0x%08x rpmh_state 0x%08x sptprac 0x%08x gmu2host 0x%08x); "
+@@ -1671,7 +1686,10 @@
+ 		delay(1);
+ 	}
+ 	gpu_log("%s: GX %s", where, gpu_gx_on() ? "back on" : "still off");
+-	return gpu_gx_on();
++	if (!gpu_gx_on()) {
++		return false;
++	}
++	return !gpu_core_lost() || gpu_restart("GX came back");
+ }
+ 
+ int
+@@ -1694,7 +1712,42 @@
  	info->macrotile_mode = 0;
  	info->ubwc_version = 2;
  }
@@ -43,7 +83,7 @@
  int
  sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable)
  {
-@@ -1782,6 +1817,8 @@
+@@ -1782,6 +1835,8 @@
  		lck_mtx_unlock(gpu_mtx);
  		return ENXIO;
  	}
@@ -52,7 +92,47 @@
  	uint32_t need = 4 * count + 5 + 8;
  	uint32_t room = (core_rd(0x0806) - rb_wptr - 1) & (GFX_RB_DWORDS - 1);   /* CP_RB_RPTR */
  	if (gpu_seqno - sweet_gpu_retired() >= GPU_MAX_INFLIGHT || room < need) {
-@@ -1961,6 +1998,10 @@
+@@ -1909,6 +1964,15 @@
+ 	core_wr(0x0043, 0);
+ 	(void)core_rd(0x0043);
+ 	delay(1);
++	gpu_log("recover: GBIF %s, core reset", drained ? "drained" : "did not drain");
++	return gpu_restart(why);
++}
++
++/* hw_init, CP start and secure-mode exit on a core that lost its state
++ * (after a reset or a GX collapse); every job in flight is lost. */
++static bool
++gpu_restart(const char *why)
++{
+ 	gpu_hw_init();
+ 	gpu_irq.err_status = 0;
+ 	gpu_irq.mask = RBBM_INT_MASK;
+@@ -1916,6 +1980,13 @@
+ 	core_wr(0x0038, gpu_irq.mask);
+ 	bool ok = gpu_cp_start("recover: cp me_init");
+ 	if (ok && gpu_zap_ok) {
++		/* After a GX collapse the zap shader must be resumed
++		 * (qcom_scm_set_remote_state(SCM_GPU_ZAP_SHADER_RESUME 0, pas 13),
++		 * Linux adreno_zap_shader_load); after a soft reset it fails
++		 * harmlessly. */
++		uint64_t res = 0;
++		int64_t rc = scm_call(1, 0x0a, 2, 0, GPU_PAS_ID, 0, &res);
++		gpu_log("restart: zap resume rc %lld result %llu", rc, res);
+ 		rb_pkt7(CP_SET_SECURE_MODE, 1);
+ 		rb_out(0);
+ 		ok = rb_kick("recover: set_secure_mode 0");
+@@ -1929,8 +2000,7 @@
+ 		sweet_irq_enable(GPU_INTID, true);
+ 	}
+ 	thread_wakeup(&gpu_irq_chan);
+-	gpu_log("recover #%llu: GBIF %s, %s", gpu_recoveries, drained ? "drained" : "did not drain",
+-	    ok ? "GPU running again" : "FAILED, GPU disabled");
++	gpu_log("restart #%llu (%s): %s", gpu_recoveries, why, ok ? "GPU running again" : "FAILED, GPU disabled");
+ 	if (!ok) {
+ 		gpu_ready = false;
+ 	}
+@@ -1961,6 +2031,10 @@
  			wd_stuck = 0;
  		}
  		wd_last = sweet_gpu_retired();
@@ -63,3 +143,19 @@
  		lck_mtx_unlock(gpu_mtx);
  		uint32_t gx = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), rpmh = gpu_rd(sg.gmu, GMU_REG(0x50ec));
  		uint32_t key = (gx & GDSC_PWR_ON) | (rpmh & 0xff);
+@@ -1999,6 +2073,15 @@
+ 	delay(1000);
+ 	uint64_t cp1 = ((uint64_t)core_rd(0x0981) << 32) | core_rd(0x0980), ao1 = gmu_always_on();
+ 	gpu_log("counters over 1 ms: CP always-on %llu -> %llu, GMU always-on %llu -> %llu", cp0, cp1, ao0, ao1);
++	/* The end of Linux's hw_init: clear the GPU_SET OOB and take the GMU
++	 * out of its boot mode (BOOT_SLUMBER), or it collapses GX when asked
++	 * for a DCVS change. GX stays up at the "active" idle level. */
++	gpu_wr(sg.gmu, GMU_REG(0x5194), 1u << 24);    /* clear GPU_SET */
++	gpu_wr(sg.gmu, GMU_REG(0x5194), 1u << 30);    /* clear BOOT_SLUMBER */
++	delay(2000);
++	gpu_log("gmu out of boot mode: gx_gdscr 0x%08x rpmh_state 0x%08x, CP_RB_BASE 0x%08x",
++	    gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), gpu_rd(sg.gmu, GMU_REG(0x50ec)),
++	    gpu_gx_on() ? core_rd(0x0800) : 0);
+ 	gpu_seqno = sweet_gpu_retired();
+ 	gpu_ready = true;
+ 	thread_t watcher;
