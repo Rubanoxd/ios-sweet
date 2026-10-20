@@ -389,6 +389,13 @@ change leaves the core without its state (CP_RB_BASE 0, rptr 0) and the
 CP does not restart, even with GPU_SET and BOOT_SLUMBER cleared first as
 Linux does; so it is off by default. Every core access now checks
 CP_RB_BASE and restarts a core that lost its state.
+DCVS experiment (xnu 0095, `sweetgpudcvstest=1`, 2026-10-20): stepping
+800 -> 650 -> 355 -> 180 MHz kept the core running each time (CP_MEM_WRITE
+ok after every step); 180 -> 800 MHz lost the core state (SPTPRAC 0x28 ->
+0xa8) and the CP did not restart. So the runtime now sets one lower level at
+start and never raises it: `sweetgpulevel=N` (gpu_khz index 1..6), default
+6 = 650 MHz. Shim `shim-boot-joyeuse-gpu11.img` (0091-0095): verified,
+`dcvs: 800000 -> 650000 kHz`, sweet-gputest passes.
 Shim `shim-boot-joyeuse-gpu10.img` (0091-0094, default options), verified
 2026-10-20: sweet-gputest passes twice in a row (each connection gets its
 own 512 MiB window) and the reboot into Fastboot works.
