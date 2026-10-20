@@ -732,6 +732,24 @@ for joyeuse:
   unlinked object files for relinking. Derived frontend code includes MIT
   attribution from UniXNU/NativeMetal.
 
+Verified on device (2026-10-21):
+- `sweet-mtltest` passed 100% clean as both `root` and `mobile` (rc=0,
+  compute kernels, render pipelines, sampler states, framebuffer-read,
+  30/30 IOSurface rounds, CAMetalLayer drawable presentation).
+- System stability: `backboardd` and `SpringBoard` remain stable with
+  no crash loops across resprings with the new 35 MB bundle loaded.
+- Bloons TD 6 (`com.ninjakiwi.bloonstd6`, Unity):
+  - 0 texture rejections (all ASTC 6x6, Depth32Float, 2DArray, Cube, 3D
+    and mipmaps accepted by Turnip/metal2vulkan; previously ~91 rejected).
+  - Implemented `copyFromBuffer:...options:` and `copyFromTexture:...options:`
+    for Unity texture uploads.
+  - Implemented store actions (`setColorStoreAction:`, `setDepthStoreAction:`,
+    `setStencilStoreAction:`), heap size/alignment queries, and `presentDrawable:`
+    in `NBCommandBuffer` invoking `[drawable present]` post-GPU completion.
+  - Game engine boots, acquires the device, compiles its shader library,
+    and runs steadily.
+
+
 ## Wi-Fi: plan (2026-10-20)
 
 No Qualcomm Wi-Fi exists on XNU yet (ios-sweet, its forks and UniXNU have

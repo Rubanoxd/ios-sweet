@@ -746,6 +746,12 @@ static void waitForResource(id resource) {
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
 }
+- (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index {(void)action;(void)index;}
+- (void)setColorStoreActionOptions:(MTLStoreActionOptions)options atIndex:(NSUInteger)index {(void)options;(void)index;}
+- (void)setDepthStoreAction:(MTLStoreAction)action {(void)action;}
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)options {(void)options;}
+- (void)setStencilStoreAction:(MTLStoreAction)action {(void)action;}
+- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)options {(void)options;}
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
@@ -825,12 +831,29 @@ static void waitForResource(id resource) {
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
+ (void)options;
+ [self copyFromBuffer:s sourceOffset:o sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:z toTexture:d destinationSlice:slice destinationLevel:level destinationOrigin:dO];
+}
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
 }
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
+                options:(MTLBlitOption)options {
+ (void)options;
+ [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:o destinationBytesPerRow:row destinationBytesPerImage:image];
+}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture {(void)texture;}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {(void)texture;(void)slice;(void)level;}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture {(void)texture;}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {(void)texture;(void)slice;(void)level;}
+- (void)resetCommandsInBuffer:(id)buffer withRange:(NSRange)range {(void)buffer;(void)range;}
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
@@ -929,6 +952,30 @@ static void scheduled(void *context);
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+ if(drawable){
+  [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+   (void)cb;
+   [drawable present];
+  }];
+ }
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime {
+ if(drawable){
+  [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+   (void)cb;
+   [drawable presentAtTime:presentationTime];
+  }];
+ }
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+ if(drawable){
+  [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+   (void)cb;
+   [drawable presentAfterMinimumDuration:duration];
+  }];
+ }
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
@@ -1369,6 +1416,19 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+}
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ (void)options;
+ NSUInteger align = 256;
+ NSUInteger size = (length + align - 1) & ~(align - 1);
+ return (MTLSizeAndAlign){ .size = size, .align = align };
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)desc {
+ NSUInteger align = 65536;
+ NSUInteger bpp = 4;
+ NSUInteger size = desc ? (desc.width * desc.height * (desc.depth > 0 ? desc.depth : 1) * bpp) : 0;
+ size = (size + align - 1) & ~(align - 1);
+ return (MTLSizeAndAlign){ .size = size, .align = align };
 }
 - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
  NBResourceGroup *group=[NBResourceGroup new];

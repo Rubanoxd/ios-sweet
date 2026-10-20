@@ -145,21 +145,24 @@ is_client(void)
 		if (entryID) entryID(port, &registryID);
 	}
 	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+	setenv("TU_DARWIN_SERVICE", "NativeAdrenoGpuPublished", 0);
 
 	char candidates[4][512] = {};
-	if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof(candidates[0]) - 16)) candidates[0][0] = 0;
-	if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof(candidates[1]) - 16)) candidates[1][0] = 0;
+	if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof(candidates[0]) - 32)) candidates[0][0] = 0;
+	if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof(candidates[1]) - 32)) candidates[1][0] = 0;
 	strlcpy(candidates[2], "/var/tmp/", sizeof(candidates[2]));
 	strlcpy(candidates[3], "/tmp/", sizeof(candidates[3]));
 
 	id device = nil;
 	for (int i = 0; i < 4 && !device; ++i) {
 		if (!candidates[i][0]) continue;
-		strlcat(candidates[i], "sweet-m2v-cache", sizeof(candidates[i]));
-		mkdir(candidates[i], 0777);
-		if (access(candidates[i], W_OK) != 0) continue;
+		char cacheDir[512];
+		snprintf(cacheDir, sizeof(cacheDir), "%ssweet-m2v-cache-%u", candidates[i], (unsigned)getuid());
+		mkdir(cacheDir, 0777);
+		chmod(cacheDir, 0777);
+		if (access(cacheDir, W_OK) != 0) continue;
 		@try {
-			device = native_bridge_metal_open(TURNIP_ICD, candidates[i], registryID, NULL);
+			device = native_bridge_metal_open(TURNIP_ICD, cacheDir, registryID, NULL);
 		} @catch (NSException *e) {
 			sweet_metal_log("native_bridge_metal_open exception: %s", e.reason.UTF8String);
 			device = nil;
