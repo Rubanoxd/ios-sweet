@@ -1,0 +1,65 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1694,7 +1694,42 @@
+ 	info->macrotile_mode = 0;
+ 	info->ubwc_version = 2;
+ }
++
++/*
++ * GPU frequency (a6xx_gmu_set_freq, legacy GMU): perf index into the table
++ * sent with the HFI perf message (gpu_khz[]), DCVS OOB to make the GMU
++ * apply it. Submissions raise it to the top level; the watchdog drops it
++ * to the lowest one after a second without work, so an idle GPU does not
++ * sit at the 800 MHz boot vote. Called with gpu_mtx held.
++ */
++#define GPU_LEVEL_IDLE    1u                    /* 180 MHz */
++#define GPU_LEVEL_BUSY    (GPU_NLEVELS - 1)     /* 800 MHz */
++static unsigned gpu_level = GPU_NLEVELS - 1;    /* the boot vote */
++static uint64_t gpu_last_submit;
++static int gpu_dcvs_log = 16;
+ 
++static void
++gpu_set_level(unsigned level)
++{
++	if (level == gpu_level || !gpu_gx_on()) {
++		return;
++	}
++	gpu_wr(sg.gmu, GMU_REG(0x23fc), 0);                  /* DCVS_ACK_OPTION */
++	gpu_wr(sg.gmu, GMU_REG(0x23fd), (3u << 28) | level); /* DCVS_PERF_SETTING */
++	gpu_wr(sg.gmu, GMU_REG(0x23fe), 0xff);               /* DCVS_BW_SETTING: GMU's choice */
++	bool acked = gmu_oob("DCVS_SET", 23, 31);
++	gpu_wr(sg.gmu, GMU_REG(0x5194), 1u << 31);           /* clear the OOB */
++	uint32_t ret = gpu_rd(sg.gmu, GMU_REG(0x23ff));      /* DCVS_RETURN */
++	if (gpu_dcvs_log > 0) {
++		gpu_dcvs_log--;
++		gpu_log("dcvs: %u -> %u kHz (%s, return %u)", gpu_khz[gpu_level], gpu_khz[level],
++		    acked ? "acked" : "no ack", ret);
++	}
++	if (acked && !ret) {
++		gpu_level = level;
++	}
++}
++
+ int
+ sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable)
+ {
+@@ -1782,6 +1817,8 @@
+ 		lck_mtx_unlock(gpu_mtx);
+ 		return ENXIO;
+ 	}
++	gpu_set_level(GPU_LEVEL_BUSY);
++	gpu_last_submit = mach_absolute_time();
+ 	uint32_t need = 4 * count + 5 + 8;
+ 	uint32_t room = (core_rd(0x0806) - rb_wptr - 1) & (GFX_RB_DWORDS - 1);   /* CP_RB_RPTR */
+ 	if (gpu_seqno - sweet_gpu_retired() >= GPU_MAX_INFLIGHT || room < need) {
+@@ -1961,6 +1998,10 @@
+ 			wd_stuck = 0;
+ 		}
+ 		wd_last = sweet_gpu_retired();
++		if (!pending && gpu_level != GPU_LEVEL_IDLE &&
++		    mach_absolute_time() - gpu_last_submit > 19200000ull) {   /* 1 s at 19.2 MHz */
++			gpu_set_level(GPU_LEVEL_IDLE);
++		}
+ 		lck_mtx_unlock(gpu_mtx);
+ 		uint32_t gx = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), rpmh = gpu_rd(sg.gmu, GMU_REG(0x50ec));
+ 		uint32_t key = (gx & GDSC_PWR_ON) | (rpmh & 0xff);
