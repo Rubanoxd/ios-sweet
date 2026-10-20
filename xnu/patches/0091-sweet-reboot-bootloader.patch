@@ -1,0 +1,78 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@
+ bsd/dev/sweet_dpu.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_irq.c			standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,65 @@
++/*
++ * SWEET: reboot straight into the bootloader's Fastboot mode, so a new test
++ * kernel can be booted without anyone holding Power + Volume down:
++ *
++ *   sync; sysctl -w kern.sweet_reboot_bootloader=1      (root only)
++ *
++ * Same as the shim's reset() (shim/shim.c): ABL enters Fastboot when the
++ * IMEM restart reason (qcom,msm-imem restart_reason@65c) holds 0x77665500,
++ * then PSCI SYSTEM_RESET; PS_HOLD low if that ever returns. The caller syncs
++ * the filesystems first: nothing is flushed here.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define IMEM_PAGE           0x146aa000u
++#define IMEM_RESTART_REASON 0x65cu
++#define RESTART_BOOTLOADER  0x77665500u
++#define PSHOLD              0x0c264000u
++#define PSCI_SYSTEM_RESET   0x84000009ull
++
++static void __attribute__((noreturn))
++sweet_reboot_bootloader(void)
++{
++	vm_offset_t imem = ml_io_map(IMEM_PAGE, 0x1000);
++	vm_offset_t pshold = ml_io_map(PSHOLD, 0x1000);
++	printf("SWEET: rebooting into Fastboot\n");
++	delay(200000);                          /* let the console and USB log drain */
++	if (imem) {
++		*(volatile uint32_t *)(imem + IMEM_RESTART_REASON) = RESTART_BOOTLOADER;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	if (pshold) {
++		*(volatile uint32_t *)pshold = 0;
++	}
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++static int
++sysctl_sweet_reboot_bootloader SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (value == 1) {
++		sweet_reboot_bootloader();
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot_bootloader, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_reboot_bootloader, "I", "1: reboot into the bootloader's Fastboot mode");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
