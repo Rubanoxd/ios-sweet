@@ -1,0 +1,25 @@
+[package]
+name = "sweet-metalbridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Native Metal bridge over metal2vulkan-runtime on Turnip for joyeuse"
+
+[lib]
+name = "sweet_metalbridge"
+crate-type = ["staticlib", "cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+metal2vulkan = { path = "../../../metal2vulkan/crates/metal2vulkan" }
+metal2vulkan-runtime = { path = "../../../metal2vulkan/crates/metal2vulkan-runtime" }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "unwind"
+strip = false
+
+[workspace]

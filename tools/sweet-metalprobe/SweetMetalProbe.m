@@ -30,7 +30,9 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include "SweetMetalDevice.h"
+#include "NativeBridgeMetalFrontend.h"
 #include "turnip-job.h"
 #include <objc/runtime.h>
 
@@ -126,10 +128,6 @@ is_client(void)
 	return found;
 }
 
-@interface SweetMetalProbe (DeviceEntry)
-- (void)sweetBecomeDevice;
-@end
-
 @implementation SweetMetalProbe
 - (id)initWithAcceleratorPort:(unsigned)port
 {
@@ -138,18 +136,41 @@ is_client(void)
 		turnip_start();
 		return nil;
 	}
-	char err[256];
-	if (!sweet_metal_open(port, err, sizeof(err))) {
-		sweet_metal_log("initWithAcceleratorPort: port 0x%x, no device: %s", port, err);
+	uint64_t registryID = 0;
+	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+	if (iokit) {
+		int (*retain)(unsigned) = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain");
+		if (retain) retain(port);
+		int (*entryID)(unsigned, uint64_t *) = (int (*)(unsigned, uint64_t *))dlsym(iokit, "IORegistryEntryGetRegistryEntryID");
+		if (entryID) entryID(port, &registryID);
+	}
+	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+
+	char candidates[4][512] = {};
+	if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof(candidates[0]) - 16)) candidates[0][0] = 0;
+	if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof(candidates[1]) - 16)) candidates[1][0] = 0;
+	strlcpy(candidates[2], "/var/tmp/", sizeof(candidates[2]));
+	strlcpy(candidates[3], "/tmp/", sizeof(candidates[3]));
+
+	id device = nil;
+	for (int i = 0; i < 4 && !device; ++i) {
+		if (!candidates[i][0]) continue;
+		strlcat(candidates[i], "sweet-m2v-cache", sizeof(candidates[i]));
+		mkdir(candidates[i], 0777);
+		if (access(candidates[i], W_OK) != 0) continue;
+		@try {
+			device = native_bridge_metal_open(TURNIP_ICD, candidates[i], registryID, NULL);
+		} @catch (NSException *e) {
+			sweet_metal_log("native_bridge_metal_open exception: %s", e.reason.UTF8String);
+			device = nil;
+		}
+	}
+	if (!device) {
+		sweet_metal_log("initWithAcceleratorPort: port 0x%x, native_bridge_metal_open failed", port);
 		return nil;
 	}
-	if (!(self = [super init])) {
-		sweet_metal_log("initWithAcceleratorPort: -[_MTLDevice init] returned nil");
-		return nil;
-	}
-	[self sweetBecomeDevice];
-	sweet_metal_log("initWithAcceleratorPort: port 0x%x, returns a device (_MTLDevice is %zu bytes)", port,
-	    class_getInstanceSize(objc_getClass("_MTLDevice")));
-	return self;
+	sweet_metal_log("initWithAcceleratorPort: port 0x%x, returns device %s (_MTLDevice is %zu bytes)", port,
+	    class_getName(object_getClass(device)), class_getInstanceSize(objc_getClass("_MTLDevice")));
+	return device;
 }
 @end

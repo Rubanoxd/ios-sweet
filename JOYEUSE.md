@@ -701,6 +701,32 @@ array/cube/3D textures, more pixel formats, vertex descriptors, function
 constants), so it is the candidate to replace Iridium + sweet-mtl-vk.c
 behind SweetMetalDevice.
 
+## Metal frontend on metal2vulkan-runtime (2026-10-20)
+
+Integrated the full Metal frontend over `metal2vulkan-runtime` on Turnip
+for joyeuse:
+- `tools/sweet-metalbridge`: C ABI bridge over `metal2vulkan-runtime`
+  built for `aarch64-apple-ios` as staticlib (`libsweet_metalbridge.a`)
+  and cdylib (`libsweet_metalbridge.dylib`). Target GPU families set to
+  Apple1..Apple4 / Common1..Common2 (A11 profile). Cache maintenance uses
+  manual `dc civac` 64-byte cache line cleans + `dsb sy` (iOS `sys_dcache_flush`
+  is a no-op on non-Apple GPUs).
+- `tools/sweet-metalprobe`: `SweetMetalFrontend.mm` implements the
+  Objective-C Metal objects (`NBBuffer`, `NBTexture`, `NBQueue`,
+  `NBCommandBuffer`, `NBComputeEncoder`, `NBRenderEncoder`, `NBBlitEncoder`,
+  `NBSampler`, `NBDepthStencil`, `NBLibrary`, `NBFunction`).
+- Protocol safety & stubs: dynamically resolves protocol signatures and
+  forwards unknown selectors to safe 0/nil stubs (`forwardInvocation:`)
+  instead of throwing exceptions.
+- Compatibility: `featureProfile=5`, `indirectArgumentBufferCapabilities=1`,
+  `supportsFeatureSet:` <= 14 (A11), `newPipelineLibraryWithFilePath:` -> nil,
+  and dynamic registration of all SPI protocols (`MTLDeviceSPI`,
+  `MTLBufferSPI`, `MTLTextureSPI`, etc.).
+- `SweetMetalProbe.m`: client processes receive the `metal2vulkan-runtime`
+  device with automatic per-process shader cache in writable temp/cache
+  directories. The bundle links self-contained with no external dependencies
+  beyond system frameworks.
+
 ## Wi-Fi: plan (2026-10-20)
 
 No Qualcomm Wi-Fi exists on XNU yet (ios-sweet, its forks and UniXNU have
