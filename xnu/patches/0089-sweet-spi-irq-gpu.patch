@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_irq.c
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,143 @@
 +/*
 + * SWEET: peripheral interrupts (GIC SPIs) for the built-in drivers.
 + *
@@ -113,12 +113,11 @@
 +	}
 +	uint32_t bit = 1u << (intid % 32);
 +	sweet_irq_enable(intid, false);
-+	/* Group 1 non-secure (a secure SPI reads back 0 and stays TZ's). */
++	/* Group 1 non-secure, as Linux gic-v3 writes it. With two security
++	 * states (GICD_CTLR.DS 0) IGROUPR is RAZ/WI for non-secure accesses
++	 * (hardware: it reads 0 for the GPU's SPI), so it cannot be checked;
++	 * TZ leaves the non-secure SPIs in Group 1 itself. */
 +	gicd_wr(GICD_IGROUPR + 4 * (intid / 32), gicd_rd(GICD_IGROUPR + 4 * (intid / 32)) | bit);
-+	if (!(gicd_rd(GICD_IGROUPR + 4 * (intid / 32)) & bit)) {
-+		printf("SWEET IRQ: INTID %u is not a non-secure interrupt\n", intid);
-+		return EPERM;
-+	}
 +	uint32_t prio = gicd_rd(GICD_IPRIORITYR + (intid & ~3u));
 +	prio = (prio & ~(0xffu << (8 * (intid % 4)))) | (0xa0u << (8 * (intid % 4)));
 +	gicd_wr(GICD_IPRIORITYR + (intid & ~3u), prio);
