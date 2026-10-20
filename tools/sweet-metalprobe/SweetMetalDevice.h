@@ -1,0 +1,19 @@
+/*
+ * Shared by the plugin entry (SweetMetalProbe.m, built without ARC) and the
+ * device (SweetMetalDevice.m, ARC).
+ */
+#import <Foundation/Foundation.h>
+#include <stddef.h>
+
+@interface _MTLDevice : NSObject
+@end
+
+@interface SweetMetalProbe : _MTLDevice
+- (id)initWithAcceleratorPort:(unsigned)port;
+@end
+
+/* Appends a line to /var/tmp/sweetmetal.log (process, pid, uid). */
+void sweet_metal_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* Opens Turnip for this process' device; PORT is the accelerator service. */
+int sweet_metal_open(unsigned port, char *err, size_t len);

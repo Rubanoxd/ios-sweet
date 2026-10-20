@@ -480,6 +480,30 @@ still returns nil (`tools/sweet-metalprobe/turnip-job.c`):
   PIDs for the next minute, the GPU watchdog saw no hang.
 So a mobile-user UI process reaches the GPU through Metal's own discovery,
 with no sandbox or library-validation obstacle on this port.
-Next: stage 3, a real `MTLDevice` (UniXNU's Metal frontend over Turnip,
-AIR to NIR) returned to one client process first, never to backboardd
-until it can composite.
+
+Stage 3, first part, works (same kernel and shim, 2026-10-20): a real
+`MTLDevice` over Turnip for client processes. UniXNU's frontend sits on a
+Rust runtime this Mac cannot build for iOS, so `tools/sweet-metalprobe`
+has its own small one: `sweet-mtl-vk.c` (one Vulkan device per process,
+buffers in host-visible coherent memory, one-shot command lists with
+fill/copy and full barriers, 5 s fence timeout) and `SweetMetalDevice.m`
+(the plugin's `_MTLDevice` subclass plus buffer, queue, command-buffer and
+blit-encoder classes, shaped like UniXNU's NativeBridgeMetalFrontend.mm).
+The clients are the names in `/var/jb/etc/sweetmetal.clients`, else only
+`sweet-mtltest`; backboardd never gets a device, everyone else still gets
+nil. What Metal requires, read from the iOS 16.7 shared cache
+(`ipsw dyld disass`, cryptex image `087-86593-047.dmg`): `MTLAddDevice`
+asserts `conformsToProtocol:` `MTLDevice` and the private `MTLDeviceSPI`
+(added at runtime with `class_addProtocol`), then `-[_MTLDevice initLimits]`
+sizes its limit tables from `featureProfile` and
+`indirectArgumentBufferCapabilities`, which only the AGX plugins implement
+(A11: 5 and 1, used here); `MTLDeviceFeatureQueries` is empty in release
+builds. `_MTLDevice` is 528 bytes on iOS 16.7.
+`sweet-mtltest` (root and mobile): `device: Turnip Adreno (TM) 618
+(SweetMetal), registryID 0x100000128, unified 1`; two 16 MiB buffers, an
+unaligned fill (head and tail through staging copies) plus a copy, and a
+second command buffer that reads the first one's result: status 4/4,
+completed handlers once each, 0 wrong bytes, ~10 ms; `newLibraryWithSource:`
+returns nil with an error. SpringBoard and backboardd kept their PIDs.
+Not yet: shader libraries and pipelines (AIR lowering: UniXNU's
+kits/AirNir), compute and render encoders, textures, events, drawables.
