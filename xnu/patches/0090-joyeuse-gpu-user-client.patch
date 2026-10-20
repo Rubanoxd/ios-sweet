@@ -57,7 +57,7 @@
  static int gpu_irq_chan;
  
  /* Primary interrupt context: ack the RBBM sources, then wake the waiter. */
-@@ -1420,9 +1442,47 @@
+@@ -1420,9 +1442,49 @@
  	core_wr(0x0037, status);                      /* RBBM_INT_CLEAR_CMD */
  	gpu_irq.status |= status;
  	gpu_irq.count++;
@@ -87,6 +87,8 @@
  	thread_wakeup(&gpu_irq_chan);
  }
  
++static bool gpu_gx_on(void);
++
 +static void
 +gpu_report_errors(const char *where)
 +{
@@ -94,7 +96,7 @@
 +		gpu_log("%s: interrupt storm, GPU interrupt disabled (status 0x%08x)", where, gpu_irq.status);
 +		gpu_irq.storm = false;
 +	}
-+	if (gpu_irq.err_new) {
++	if (gpu_irq.err_new && gpu_gx_on()) {
 +		gpu_irq.err_new = false;
 +		gpu_log("%s: GPU error irq 0x%08x cp_int 0x%08x cp_hw_fault 0x%08x sqe_stat 0x%08x "
 +		    "rbbm_status 0x%08x rptr %u", where, gpu_irq.err_status, gpu_irq.cp_int,
@@ -105,7 +107,7 @@
  static bool
  gpu_stage_irq(vm_offset_t smmu)
  {
-@@ -1432,7 +1492,7 @@
+@@ -1432,7 +1494,7 @@
  		return false;
  	}
  	core_wr(0x0037, 0xffffffffu);                 /* clear anything stale */
@@ -114,7 +116,7 @@
  	volatile uint32_t *fence = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF + 0x40);
  	*fence = 0;
  	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
-@@ -1458,8 +1518,318 @@
+@@ -1458,8 +1520,381 @@
  	    gpu_irq.count - before, gpu_irq.status, *fence, core_rd(0x0806), rb_wptr);
  	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
  	return gpu_irq.count > before && *fence == 0x618;
@@ -154,6 +156,7 @@
 +uint64_t sweet_gpu_faults(void);
 +
 +static bool gpu_ready;
++static int sweet_gpu_watch_chan;
 +static int gpu_trace = 64;              /* kernel log lines left for maps and submits */
 +static vm_offset_t gfx_smmu;
 +static lck_grp_t *gpu_lck_grp;
@@ -184,8 +187,8 @@
 +	*va = gfx_pool + 0x1000 * gfx_pool_left;
 +	*pa = gfx_pool_pa + 0x1000 * gfx_pool_left;
 +	return true;
-+}
-+
+ }
+ 
 +static void
 +gfx_tlb_flush(void)
 +{
@@ -226,6 +229,33 @@
 +	return (uint64_t *)gfx_l3_va[i1][i2] + i3;
 +}
 +
++/* Every core register access stalls the bus for good if GX has collapsed
++ * (the first user client test froze the phone on its first core read,
++ * minutes after bring-up), so the runtime looks at the GX GDSC (GPUCC is
++ * in CX and always readable) first and asks the GMU again if it is off. */
++static bool
++gpu_gx_on(void)
++{
++	return (gpu_rd(sg.gpucc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) != 0;
++}
++
++static bool
++gpu_ensure_gx(const char *where)
++{
++	if (gpu_gx_on()) {
++		return true;
++	}
++	gpu_log("%s: GX is off (gx_gdscr 0x%08x rpmh_state 0x%08x sptprac 0x%08x gmu2host 0x%08x); "
++	    "GPU_SET again", where, gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), gpu_rd(sg.gmu, GMU_REG(0x50ec)),
++	    gpu_rd(sg.gmu, GMU_REG(0x50d0)), gpu_rd(sg.gmu, GMU_REG(0x5192)));
++	(void)gmu_oob("GPU_SET", 16, 24);
++	for (unsigned i = 0; i < 10000 && !gpu_gx_on(); ++i) {
++		delay(1);
++	}
++	gpu_log("%s: GX %s", where, gpu_gx_on() ? "back on" : "still off");
++	return gpu_gx_on();
++}
++
 +int
 +sweet_gpu_ready(void)
 +{
@@ -245,8 +275,8 @@
 +	info->ubwc_swizzle = 0x6;
 +	info->macrotile_mode = 0;
 +	info->ubwc_version = 2;
- }
- 
++}
++
 +int
 +sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable)
 +{
@@ -317,6 +347,10 @@
 +		return EINVAL;
 +	}
 +	lck_mtx_lock(gpu_mtx);
++	if (!gpu_ensure_gx("submit")) {
++		lck_mtx_unlock(gpu_mtx);
++		return ENXIO;
++	}
 +	uint32_t need = 4 * count + 5 + 8;
 +	uint32_t room = (core_rd(0x0806) - rb_wptr - 1) & (GFX_RB_DWORDS - 1);   /* CP_RB_RPTR */
 +	if (gpu_seqno - sweet_gpu_retired() >= GPU_MAX_INFLIGHT || room < need) {
@@ -368,7 +402,7 @@
 +		}
 +		if (!timeout_ns || mach_absolute_time() >= deadline) {
 +			gpu_report_errors("wait");
-+			if (timeout_ns >= 100000000ull) {
++			if (timeout_ns >= 100000000ull && gpu_gx_on()) {
 +				gpu_log("wait: fence %u not reached in %llu ms (retired %u, rptr %u wptr %u, "
 +				    "rbbm_status 0x%08x)", fence, timeout_ns / 1000000, sweet_gpu_retired(),
 +				    core_rd(0x0806), rb_wptr, core_rd(0x0210));
@@ -393,11 +427,17 @@
 +	if (!gpu_ready) {
 +		return 0;
 +	}
++	lck_mtx_lock(gpu_mtx);
++	if (!gpu_ensure_gx("timestamp")) {
++		lck_mtx_unlock(gpu_mtx);
++		return 0;
++	}
 +	uint32_t hi, lo;
 +	do {
 +		hi = core_rd(0x0981);
 +		lo = core_rd(0x0980);                     /* CP_ALWAYS_ON_COUNTER */
 +	} while (hi != core_rd(0x0981));
++	lck_mtx_unlock(gpu_mtx);
 +	return ((uint64_t)hi << 32) | lo;
 +}
 +
@@ -405,6 +445,27 @@
 +sweet_gpu_faults(void)
 +{
 +	return gpu_fault_count;
++}
++
++/* Logs every change of the GX/GMU power state for the first ten minutes. */
++static void
++gpu_gx_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t last = ~0u;
++	for (unsigned i = 0; i < 600; ++i) {
++		uint32_t gx = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), rpmh = gpu_rd(sg.gmu, GMU_REG(0x50ec));
++		uint32_t key = (gx & GDSC_PWR_ON) | (rpmh & 0xff);
++		if (key != last) {
++			gpu_log("watch t+%us: gx_gdscr 0x%08x rpmh_state 0x%08x sptprac 0x%08x gmu2host 0x%08x "
++			    "ao_int 0x%08x", i, gx, rpmh, gpu_rd(sg.gmu, GMU_REG(0x50d0)),
++			    gpu_rd(sg.gmu, GMU_REG(0x5192)), gpu_rd(sg.gmu, GMU_REG(0x9305)));
++			last = key;
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&sweet_gpu_watch_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
 +}
 +
 +static void
@@ -426,6 +487,10 @@
 +	gfx_l3_pa[0][(GFX_IOVA >> 21) & 0x1ff] = gfx_mem_pa + 0x2000;
 +	gpu_seqno = sweet_gpu_retired();
 +	gpu_ready = true;
++	thread_t watcher;
++	if (kernel_thread_start(gpu_gx_watch, NULL, &watcher) == KERN_SUCCESS) {
++		thread_deallocate(watcher);
++	}
 +	gpu_log("runtime ready: client va 0x%llx-0x%llx, fence %u", GPU_CLIENT_VA_START,
 +	    GPU_CLIENT_VA_END, gpu_seqno);
 +}
@@ -433,7 +498,7 @@
  static int sweet_gpu_sleep_chan;
  
  static void
-@@ -1491,7 +1861,9 @@
+@@ -1491,7 +1926,9 @@
  		if (smmu != 0) {
  			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
  			    sg.stage >= 6 && gpu_stage_cp(smmu) && sg.stage >= 7) {
