@@ -746,7 +746,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,783 @@
 +/*
 + * JOYEUSE: the Adreno 618 as an IOKit service for userspace.
 + *
@@ -759,10 +759,10 @@
 + *
 + * The GPU itself is brought up by bsd/dev/sweet_gpu.c (sweetgpu=7); this
 + * file only keeps per-client buffer objects and calls its runtime:
-+ *  - BoAlloc: IOBufferMemoryDescriptor below 2^36 (the SMMU's output size),
-+ *    zeroed and cleaned to the point of coherency (the GPU maps it
-+ *    non-cacheable). Handles are small integers: Turnip indexes a sparse
-+ *    array with them.
++ *  - BoAlloc: physically contiguous memory from a pool of DDR the kernel
++ *    does not manage (see poolAlloc), zeroed through a write-combined
++ *    mapping. Handles are small integers: Turnip indexes a sparse array
++ *    with them.
 + *  - BoMap: the client picks the GPU address inside [va_start, va_start +
 + *    va_size); each physical segment goes into the SMMU bank 0 tables.
 + *  - BoCpuMap: the token is a clientMemoryForType type; the user maps it
@@ -805,7 +805,7 @@
 +uint32_t sweet_gpu_retired(void);
 +uint64_t sweet_gpu_timestamp(void);
 +uint64_t sweet_gpu_faults(void);
-+void flush_dcache64(addr64_t addr, unsigned count, int phys);
++boolean_t pmap_valid_page(ppnum_t pn);
 +}
 +
 +/* sweetgpudebug=1: every step goes to the console (and so to the USB live
@@ -835,6 +835,87 @@
 +	IOSleep(300);
 +}
 +
++/*
++ * Buffer memory. Mapping a page of the kernel's own RAM write-combined into
++ * a process makes the pmap rewrite that page's physical-aperture PTE, and on
++ * this port that froze the phone (third sweet-gputest run: the last step
++ * was IOConnectMapMemory64). So buffers come from DDR the kernel does not
++ * manage: with the --highmem ADT XNU owns only the upper bank, and
++ * 0xb0000000-0xfd000000 of the lower one is above every fixed carve-out
++ * (it was the kernel's RAM in the low-memory layout). No physical-aperture
++ * mapping exists there, so the kernel and the client map it write-combined
++ * directly and the GPU reads it non-cacheable: no cache maintenance at all.
++ * First fit over 16 KiB pages; every buffer is physically contiguous.
++ */
++#define POOL_BASE         0xb0000000ull
++#define POOL_END          0xfd000000ull
++#define POOL_PAGE         0x4000ull
++#define POOL_PAGES        ((POOL_END - POOL_BASE) / POOL_PAGE)
++
++static IOLock *sPoolLock;
++static uint8_t sPoolMap[POOL_PAGES / 8];
++static int sPoolState;                  /* 0 unchecked, 1 usable, -1 refused */
++
++static bool
++poolUsable(void)
++{
++	if (sPoolState == 0) {
++		bool managed = pmap_valid_page((ppnum_t)(POOL_BASE >> PAGE_SHIFT)) ||
++		    pmap_valid_page((ppnum_t)((POOL_END - 1) >> PAGE_SHIFT));
++		sPoolState = managed ? -1 : 1;
++		printf("SWEET ADRENO: buffer pool 0x%llx-0x%llx %s\n", POOL_BASE, POOL_END,
++		    managed ? "is kernel RAM (no --highmem ADT?): refused" : "ready");
++	}
++	return sPoolState > 0;
++}
++
++static bool
++poolBit(uint64_t i)
++{
++	return (sPoolMap[i / 8] >> (i % 8)) & 1;
++}
++
++static void
++poolSet(uint64_t first, uint64_t count, bool used)
++{
++	for (uint64_t i = first; i < first + count; ++i) {
++		if (used) {
++			sPoolMap[i / 8] |= (uint8_t)(1u << (i % 8));
++		} else {
++			sPoolMap[i / 8] &= (uint8_t)~(1u << (i % 8));
++		}
++	}
++}
++
++static uint64_t
++poolAlloc(uint64_t bytes, uint64_t align)
++{
++	uint64_t count = (bytes + POOL_PAGE - 1) / POOL_PAGE;
++	uint64_t step = align > POOL_PAGE ? align / POOL_PAGE : 1;
++	uint64_t pa = 0;
++	IOLockLock(sPoolLock);
++	for (uint64_t first = 0; first + count <= POOL_PAGES && !pa; first += step) {
++		uint64_t i = 0;
++		while (i < count && !poolBit(first + i)) {
++			i++;
++		}
++		if (i == count) {
++			poolSet(first, count, true);
++			pa = POOL_BASE + first * POOL_PAGE;
++		}
++	}
++	IOLockUnlock(sPoolLock);
++	return pa;
++}
++
++static void
++poolFree(uint64_t pa, uint64_t bytes)
++{
++	IOLockLock(sPoolLock);
++	poolSet((pa - POOL_BASE) / POOL_PAGE, (bytes + POOL_PAGE - 1) / POOL_PAGE, false);
++	IOLockUnlock(sPoolLock);
++}
++
 +class NativeAdrenoGpuPublished : public IOService {
 +	OSDeclareDefaultStructors(NativeAdrenoGpuPublished);
 +public:
@@ -849,6 +930,10 @@
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
++	sPoolLock = IOLockAlloc();
++	if (sPoolLock == NULL) {
++		return false;
++	}
 +	setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
 +	setProperty("NativeAdrenoAbiVersion", (unsigned long long)NativeAdrenoAbiVersion, 32);
 +	registerService();
@@ -861,8 +946,9 @@
 +	OSDeclareDefaultStructors(SweetAdrenoUserClient);
 +
 +	struct Entry {
-+		IOMemoryDescriptor *md;      /* IOBufferMemoryDescriptor, or the wired import */
++		IOMemoryDescriptor *md;      /* pool buffer (physical), or the wired import */
 +		uint64_t bytes;
++		uint64_t pool_pa, pool_bytes;    /* pool buffer, 0 for an import */
 +		uint64_t iova;               /* 0 while unmapped */
 +		uint32_t last_fence;
 +		uint32_t token;              /* CPU-map lease, 0 if none */
@@ -1009,6 +1095,9 @@
 +		e->md->complete();
 +	}
 +	e->md->release();
++	if (e->pool_pa) {
++		poolFree(e->pool_pa, e->pool_bytes);
++	}
 +	bzero(e, sizeof(*e));
 +	return kIOReturnSuccess;
 +}
@@ -1168,27 +1257,35 @@
 +			ret = kIOReturnNoResources;
 +			break;
 +		}
-+		/* Below 2^36 (SMMU output), aligned as asked (at least a page). */
-+		mach_vm_address_t mask = 0xfffffffffull & ~((1ull << (a.align_log2 > 14 ? a.align_log2 : 14)) - 1);
-+		adrenoStep("BoAlloc: inTaskWithPhysicalMask 0x%llx bytes", a.bytes);
-+		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+		    kIODirectionInOut | (a.contiguous ? kIOMemoryPhysicallyContiguous : 0), a.bytes, mask);
-+		if (md == NULL) {
++		if (!poolUsable()) {
 +			ret = kIOReturnNoMemory;
 +			break;
 +		}
-+		adrenoStep("BoAlloc: md %p, bzero", md);
-+		bzero(md->getBytesNoCopy(), (size_t)a.bytes);
-+		adrenoStep("BoAlloc: clean caches");
-+		for (uint64_t off = 0; off < a.bytes;) {
-+			IOByteCount len = 0;
-+			addr64_t pa = md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
-+			if (!pa || !len) {
-+				break;
-+			}
-+			flush_dcache64(pa, (unsigned)len, TRUE);
-+			off += len;
++		uint64_t size = (a.bytes + POOL_PAGE - 1) & ~(POOL_PAGE - 1);
++		uint64_t pa = poolAlloc(size, 1ull << a.align_log2);
++		if (pa == 0) {
++			ret = kIOReturnNoMemory;
++			break;
 +		}
++		adrenoStep("BoAlloc: pool 0x%llx +0x%llx", pa, size);
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)pa,
++		    (IOByteCount)size, kIODirectionInOut);
++		IOMemoryMap *zmap = md ? md->createMappingInTask(kernel_task, 0,
++		    kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
++		if (zmap == NULL) {
++			if (md) {
++				md->release();
++			}
++			poolFree(pa, size);
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		bzero((void *)zmap->getVirtualAddress(), (size_t)size);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		zmap->release();
++		adrenoStep("BoAlloc: zeroed");
++		e->pool_pa = pa;
++		e->pool_bytes = size;
 +		e->md = md;
 +		e->bytes = a.bytes;
 +		NativeAdrenoAbiBoAllocReply r = { handle };
