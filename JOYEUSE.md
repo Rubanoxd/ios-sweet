@@ -359,7 +359,22 @@ red/green/blue triangle on a gray clear into a 256x256 RGBA8 image in
 2.9 ms; the pixels at the clear corner and near each vertex check out and
 the PPM it writes shows the interpolated triangle.
 
-Next steps: a running GPU timestamp (GMU always-on counter); hwcg and CP
+Robustness (xnu 0092, shim `shim-boot-joyeuse-gpu9.img`, 2026-10-20 on the
+phone): a watchdog thread recovers the GPU after an error interrupt or 3 s
+without progress on a pending job (halt SQE, drain GBIF, RBBM soft reset,
+hw_init, CP start, secure-mode exit; the GMU stays up). `sweet-gputest 200
+hang` submits a CP_WAIT_MEM_GTE that never ends: `recover (no progress for
+3 s) ... recover #1: GBIF drained, GPU running again`, the wait returns
+after 3.3 s, the fault count goes 0 -> 1 and the next job runs. GetTimestamp
+now reads the GMU always-on counter (CP_ALWAYS_ON_COUNTER stays constant:
+231702 -> 231702 over 1 ms, GMU 853476 -> 876366).
+Reboot into Fastboot (xnu 0091, `sync; sysctl -w
+kern.sweet_reboot_bootloader=1`): the first version (IMEM reason + PSCI
+SYSTEM_RESET) rebooted into the normal boot (Redmi logo); the second also
+writes the PMIC PON reason and a warm PS_HOLD reset, as MIUI does (not yet
+tested).
+
+Next steps: Turnip's own GPU timestamps (CP counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
 
 ## Internet over USB
