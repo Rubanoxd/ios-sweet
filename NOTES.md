@@ -17,8 +17,13 @@ See `JOYEUSE.md` "GPU" and "Turnip". Observed on the phone (fork Rubanoxd/ios-sw
   `/var/jb/usr/lib/libvulkan_freedreno.dylib`. `sweet-vkinfo`: Turnip Adreno (TM) 618, Vulkan 1.3.354,
   1 MiB fill OK. `sweet-vktest`: 1M-invocation compute shader correct (62.8 ms), triangle render pass
   correct (2.9 ms, image `logs/sweet-vktest-triangle.png`, not in git).
-Open: CP_ALWAYS_ON_COUNTER constant; no per-process GPU address spaces; GPU not yet used by iOS itself
-(no Metal). Internet over USB: `JOYEUSE.md` "Internet over USB".
+Later the same day: xnu 0092 GPU hang recovery (verified: `sweet-gputest 200 hang` -> recover #1, next job
+OK) and GMU always-on timestamp (verified); 0091 reboot-to-Fastboot sysctl (4th version, reason 2, untested;
+3rd went to MIUI Recovery = PMIC reason works); 0093 per-connection GPU VA windows; 0094 DCVS (untested).
+Newest shim `shim/out/shim-boot-joyeuse-gpu10.img`. The phone's Fastboot sometimes does not enumerate on
+USB for many minutes (connect it straight to the Mac, not through the Anker hub).
+Open: CP_ALWAYS_ON_COUNTER constant (Turnip GPU-side timestamps); no per-process GPU pagetables; GPU not
+yet used by iOS itself (Metal plan in `JOYEUSE.md`). Internet over USB: `JOYEUSE.md` "Internet over USB".
 
 ### >>> 2026-10-19 evening: joyeuse (Redmi Note 9 Pro) boots iOS to the home screen with touch <<<
 

@@ -369,10 +369,21 @@ after 3.3 s, the fault count goes 0 -> 1 and the next job runs. GetTimestamp
 now reads the GMU always-on counter (CP_ALWAYS_ON_COUNTER stays constant:
 231702 -> 231702 over 1 ms, GMU 853476 -> 876366).
 Reboot into Fastboot (xnu 0091, `sync; sysctl -w
-kern.sweet_reboot_bootloader=1`): the first version (IMEM reason + PSCI
-SYSTEM_RESET) rebooted into the normal boot (Redmi logo); the second also
-writes the PMIC PON reason and a warm PS_HOLD reset, as MIUI does (not yet
-tested).
+kern.sweet_reboot_bootloader=1`), tried on hardware: (1) IMEM reason + PSCI
+SYSTEM_RESET rebooted into the normal boot (Redmi logo): ABL reads the
+reason from the PMIC. (2) PON SOFT_RB_SPARE + warm PS_HOLD reset froze the
+phone: on a v5 arbiter an APID's write channel is chnls + 0x10000 * apid,
+not 0x80 * apid like the observer. (3) With the right channel every write
+went through (PON = APID 154: `0x88f 0x00 -> 0x02`, `0x85a 0x07 -> 0x01`,
+enable bit back on) and the phone rebooted into **MIUI Recovery**: the
+reason is read, but 1 is recovery; pm6150.dtsi has mode-bootloader 2,
+mode-recovery 1. (4) Writes 2 << 1 now; not yet tested.
+Per-connection GPU address windows (xnu 0093): one 512 MiB window per
+user-client connection (six), so two Vulkan processes do not collide.
+GPU frequency scaling (xnu 0094): the A618 of sc7180/atoll has no hardware
+clock gating in Linux, so the GPU sat at the 800 MHz boot vote; submissions
+now raise the level and the watchdog drops it to 180 MHz after 1 s idle
+(legacy DCVS OOB). Shim `shim-boot-joyeuse-gpu10.img` has 0091-0094, untested.
 
 Next steps: Turnip's own GPU timestamps (CP counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
