@@ -8,13 +8,20 @@
  * add_arrays (float) and square_add (integers and a setBytes constant)
  * over 1M elements; a render pass into a 256x256 BGRA texture: a colored
  * triangle on a cleared background, then a half-transparent white triangle
- * blended over the top-left corner (written to /var/tmp/sweet-mtltest.ppm).
+ * blended over the top-left corner (written to /var/tmp/sweet-mtltest.ppm);
+ * a texture test: an image (PNG, decoded with ImageIO) uploaded with
+ * replaceRegion, drawn with a bound linear sampler and blended by its
+ * alpha over a background, plus a small copy at 60 % with a constexpr
+ * sampler (written to /var/tmp/sweet-mtltest-texture.ppm).
  * Every result is checked on the CPU.
- *   sweet-mtltest [LIB.metallib]   (default /var/jb/usr/share/sweet-mtltest.metallib)
+ *   sweet-mtltest [LIB.metallib [IMAGE.png]]
+ *   (defaults /var/jb/usr/share/sweet-mtltest.metallib and .png)
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 
 static int fails;
 
@@ -37,6 +44,8 @@ kernel(id<MTLDevice> device, id<MTLLibrary> lib, NSString *name)
 }
 
 static void render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
+static void textured(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib, const char *png);
+static const char *gImage = "/var/jb/usr/share/sweet-mtltest.png";
 
 static void
 kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
@@ -100,6 +109,7 @@ kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
 	check(cb.status == MTLCommandBufferStatusCompleted && bad_f == 0, "add_arrays (float) on the GPU");
 	check(cb.status == MTLCommandBufferStatusCompleted && bad_u == 0, "square_add (integers, setBytes) on the GPU");
 	render(device, queue, lib);
+	textured(device, queue, lib, gImage);
 }
 
 struct vtx {
@@ -189,6 +199,171 @@ render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
 	    "half-transparent white blended over the corner");
 }
 
+static void
+writePPM(const char *path, const uint8_t *bgra, NSUInteger w, NSUInteger h)
+{
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		return;
+	}
+	fprintf(f, "P6 %lu %lu 255\n", (unsigned long)w, (unsigned long)h);
+	for (NSUInteger i = 0; i < w * h; ++i) {
+		fputc(bgra[i * 4 + 2], f);
+		fputc(bgra[i * 4 + 1], f);
+		fputc(bgra[i * 4 + 0], f);
+	}
+	fclose(f);
+}
+
+/* Premultiplied RGBA8 pixels of a PNG, scaled to W x H. */
+static uint8_t *
+loadImage(const char *path, size_t w, size_t h)
+{
+	CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+	CGImageSourceRef src = url ? CGImageSourceCreateWithURL(url, NULL) : NULL;
+	CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+	uint8_t *px = img ? calloc(w * h, 4) : NULL;
+	if (px) {
+		CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+		CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaPremultipliedLast);
+		CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+		CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+		CGContextRelease(ctx);
+		CGColorSpaceRelease(cs);
+	}
+	if (img) {
+		CGImageRelease(img);
+	}
+	if (src) {
+		CFRelease(src);
+	}
+	if (url) {
+		CFRelease(url);
+	}
+	return px;
+}
+
+static void
+textured(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib, const char *png)
+{
+	const NSUInteger TW = 480, TH = 487, W = 512, H = 512;
+	uint8_t *img = loadImage(png, TW, TH);
+	printf("image %s: %s\n", png, img ? "decoded 480x487" : "not loaded");
+	check(img != NULL, "image decoded (ImageIO)");
+	if (!img) {
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	    width:TW height:TH mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> tex = [device newTextureWithDescriptor:td];
+	[tex replaceRegion:MTLRegionMake2D(0, 0, TW, TH) mipmapLevel:0 withBytes:img bytesPerRow:TW * 4];
+	static uint8_t back[480 * 487 * 4];
+	[tex getBytes:back bytesPerRow:TW * 4 fromRegion:MTLRegionMake2D(0, 0, TW, TH) mipmapLevel:0];
+	check(tex && !memcmp(back, img, sizeof(back)), "texture upload and read-back (replaceRegion/getBytes)");
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H
+	    mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	id<MTLTexture> target = [device newTextureWithDescriptor:td];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	sd.minFilter = MTLSamplerMinMagFilterLinear;
+	sd.magFilter = MTLSamplerMinMagFilterLinear;
+	id<MTLSamplerState> linear = [device newSamplerStateWithDescriptor:sd];
+	check(linear != nil, "sampler state");
+	NSError *error = nil;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pd.colorAttachments[0].blendingEnabled = YES;       /* premultiplied alpha */
+	pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+	pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	id<MTLRenderPipelineState> bound = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment_faded"];
+	id<MTLRenderPipelineState> faded = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	printf("textured pipelines: %s\n", bound && faded ? "OK" : error.localizedDescription.UTF8String);
+	check(target && bound && faded, "textured pipelines (bound and constexpr sampler)");
+	if (!target || !bound || !faded || !linear) {
+		free(img);
+		return;
+	}
+	/* triangle strips: xy, uv (uv y down, like the image) */
+	const float big[4][4] = { { -0.9f, 0.9f, 0, 0 }, { 0.9f, 0.9f, 1, 0 }, { -0.9f, -0.9f, 0, 1 },
+		{ 0.9f, -0.9f, 1, 1 } };
+	const float small[4][4] = { { 0.45f, -0.45f, 0, 0 }, { 0.95f, -0.45f, 1, 0 }, { 0.45f, -0.95f, 0, 1 },
+		{ 0.95f, -0.95f, 1, 1 } };
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = target;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.30, 0.55, 1.0);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e setRenderPipelineState:bound];
+	[e setVertexBytes:big length:sizeof(big) atIndex:0];
+	[e setFragmentTexture:tex atIndex:0];
+	[e setFragmentSamplerState:linear atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e setRenderPipelineState:faded];
+	[e setVertexBytes:small length:sizeof(small) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+	CFTimeInterval t0 = CACurrentMediaTime();
+	[cb commit];
+	[cb waitUntilCompleted];
+	printf("textured render: status %lu, error %s, %.2f ms\n", (unsigned long)cb.status,
+	    cb.error.localizedDescription.UTF8String ?: "none", (CACurrentMediaTime() - t0) * 1e3);
+	static uint8_t px[512 * 512 * 4];
+	[target getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+	writePPM("/var/tmp/sweet-mtltest-texture.ppm", px, W, H);
+	/* The big quad maps pixel (x, y) to texel ((x + .5 - 25.6) / 460.8 * TW, ...). Compare a grid of
+	 * points whose 3x3 texel neighborhood is flat (edges blur under linear filtering) with the texel
+	 * blended over the background: premultiplied, out = texel + background * (1 - alpha). */
+	const uint8_t *corner = &px[(4 * W + 4) * 4];
+	const int bgc[3] = { corner[2], corner[1], corner[0] };   /* RGB */
+	unsigned flat = 0, good = 0;
+	for (NSUInteger y = 40; y < 470; y += 7) {
+		for (NSUInteger x = 40; x < 470; x += 7) {
+			if (x >= 360 && y >= 360) {
+				continue;       /* under the small faded copy */
+			}
+			int tx = (int)(((double)x + 0.5 - 25.6) / 460.8 * TW), ty = (int)(((double)y + 0.5 - 25.6) / 460.8 * TH);
+			if (tx < 1 || ty < 1 || tx >= (int)TW - 1 || ty >= (int)TH - 1) {
+				continue;
+			}
+			const uint8_t *t0 = &img[(ty * TW + tx) * 4];
+			BOOL uniform = YES;
+			for (int dy = -1; dy <= 1 && uniform; ++dy) {
+				for (int dx = -1; dx <= 1 && uniform; ++dx) {
+					const uint8_t *t = &img[((ty + dy) * TW + tx + dx) * 4];
+					for (int k = 0; k < 4; ++k) {
+						uniform &= abs(t[k] - t0[k]) <= 3;
+					}
+				}
+			}
+			if (!uniform) {
+				continue;
+			}
+			flat++;
+			const uint8_t *o = &px[(y * W + x) * 4];
+			int diff = 0;
+			for (int k = 0; k < 3; ++k) {
+				int want = t0[k] + bgc[k] * (255 - t0[3]) / 255;
+				diff = MAX(diff, abs((int)o[2 - k] - want));
+			}
+			good += diff <= 6;
+		}
+	}
+	printf("texture compare: %u of %u flat points match the image over the background\n", good, flat);
+	check(cb.status == MTLCommandBufferStatusCompleted && flat > 1000 && good * 100 >= flat * 98,
+	    "texture sampled at the right places (98 % of flat points)");
+	check(corner[0] > 130 && corner[0] < 150 && corner[1] > 70 && corner[1] < 85 && corner[2] < 5,
+	    "background clear color");
+	free(img);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -260,6 +435,9 @@ main(int argc, char **argv)
 		check(bad_b == 0, "fill (unaligned head and tail) + copy");
 		check(bad_a == 0, "second command buffer ran after the first");
 
+		if (argc > 2) {
+			gImage = argv[2];
+		}
 		kernels(device, queue, argc > 1 ? argv[1] : "/var/jb/usr/share/sweet-mtltest.metallib");
 		printf("%s\n", fails ? "SOME CHECKS FAILED" : "ALL OK: METAL KERNELS AND RENDERING ON TURNIP");
 		return fails != 0;

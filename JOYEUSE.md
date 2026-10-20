@@ -553,7 +553,40 @@ Rendering (2026-10-20): Metal draws on the Adreno 618.
   a half-transparent white triangle blended over the corner; pass 0.38 ms;
   pixels checked (orientation, colors, blending) as root and as mobile;
   image in `/var/tmp/sweet-mtltest.ppm`.
-Not yet: `newLibraryWithSource`, texture/sampler shader arguments, vertex
-descriptors (stage_in attributes), depth/stencil, scissor, blend color,
-indexed draws, events, IOSurface textures and drawables (what backboardd
-needs to composite on the GPU), partial threadgroups.
+
+Textures and samplers in shaders (2026-10-20): `newSamplerStateWithDescriptor:`,
+`set{Vertex,Fragment}Texture`, `set{Vertex,Fragment}SamplerState`, compute
+`setTexture`/`setSamplerState`, and constexpr samplers inside shaders.
+Iridium gives each stage its own set: binding 0 is the buffer-address UBO
+only when the function takes buffers, sampled images and samplers follow at
+Iridium's `internalIndex`; each kernel/pipeline now builds its layouts from
+the function's bindings. Iridium samples only (no storage images yet).
+Test: a PNG decoded with ImageIO, uploaded with `replaceRegion`, drawn with
+a linear sampler and blended by its alpha, plus a 60 % copy with a constexpr
+sampler: 2852 of 2852 flat sample points match the image over the
+background (image `/var/tmp/sweet-mtltest-texture.ppm`).
+Libraries now translate function by function (each metallib function has
+its own AIR module): a function Iridium cannot handle no longer takes the
+library with it (`newFunctionWithName:` returns nil for it, logged).
+
+QuartzCore (what backboardd would need), from the iOS 16.7 images:
+- `QuartzCore.framework/default.metallib` (1 MB) is AIR: 141 functions
+  (39 vertex, 95 fragment, 7 kernels: blurs, downsampling, shading, paths,
+  display overdrive...) plus `default.pipelinelib` (an AGX binary archive).
+  `CA::OGL::MetalContext::load_pipeline_state` calls
+  `newRenderPipelineStateWithName:` on that pipeline library, and
+  `compile_shader` builds specialized vertex/fragment shaders from encoded
+  "Spec" names; no MSL source compile was seen in those paths.
+- Iridium translates 32 of the 141 to valid SPIR-V (Mac and phone). The rest
+  stop at: air.* math intrinsics (floor, dot, fmin, fabs, fma, atan2,
+  saturate, conversions, sample_texture_3d), calls to non-inlined template
+  functions, half/ushort types and a few instructions (select, icmp,
+  alloca). Per-function list: `sweet-air2spv default.metallib`.
+Path to GPU compositing: extend Iridium (intrinsics, half/i16, an LLVM
+inlining pass before translation), `newRenderPipelineStateWithName:`
+(pipeline library names -> our pipelines), IOSurface textures (surface
+memory the GPU can map: the kernel's SweetSurface buffers), drawables, then
+backboardd as a client with the CPU renderer as fallback.
+Not yet: `newLibraryWithSource`, storage textures, vertex descriptors
+(stage_in attributes), depth/stencil, scissor, blend color, indexed draws,
+events, partial threadgroups.

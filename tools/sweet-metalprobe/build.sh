@@ -51,7 +51,8 @@ file "$b/SweetMetalProbe"
 
 $cc -fobjc-arc -framework Foundation -framework Metal sweet-mtlquery.m -o "$out/sweet-mtlquery"
 codesign -f -s - "$out/sweet-mtlquery"
-$cc -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore sweet-mtltest.m -o "$out/sweet-mtltest"
+$cc -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics \
+	-framework ImageIO sweet-mtltest.m -o "$out/sweet-mtltest"
 codesign -f -s - "$out/sweet-mtltest"
 $cc -c sweet-air2spv.c -o "$tmp/air2spv.o"
 clang++ -target arm64-apple-ios16.0 -isysroot "$sdk" "$tmp/air2spv.o" $iridium $llvm -o "$out/sweet-air2spv"

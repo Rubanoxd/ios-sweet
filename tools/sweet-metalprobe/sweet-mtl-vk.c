@@ -17,10 +17,13 @@
  * Rendering: textures are 2D images that live in VK_IMAGE_LAYOUT_GENERAL
  * from creation on (correct for every use here; tighter layouts later),
  * render passes are dynamic rendering, graphics pipelines take viewport,
- * scissor, topology, cull mode and front face as dynamic state. Iridium puts
- * the vertex stage's buffer addresses in set 0 and the fragment stage's in
- * set 1 (binding 0 each). Metal's y axis points up in clip space: the
- * viewport is flipped (negative height), as Indium does.
+ * scissor, topology, cull mode and front face as dynamic state. Iridium
+ * gives each stage its own descriptor set (compute and vertex 0, fragment
+ * 1): a uniform buffer of buffer addresses at binding 0 when the function
+ * takes buffers, then sampled images and samplers at their bindings. Each
+ * kernel and pipeline builds its set layouts from the function's bindings
+ * (struct smv_stage). Metal's y axis points up in clip space: the viewport
+ * is flipped (negative height), as Indium does.
  */
 #include <dlfcn.h>
 #include <pthread.h>
@@ -50,7 +53,8 @@ typedef PFN_vkVoidFunction (*PFN_icdGetInstanceProcAddr)(VkInstance, const char 
 	X(vkCreateImageView) X(vkDestroyImageView) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
 	X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) \
 	X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) X(vkCmdSetPrimitiveTopology) \
-	X(vkCmdSetCullMode) X(vkCmdSetFrontFace)
+	X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCreateSampler) X(vkDestroySampler) \
+	X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout)
 #define DECL(name) static PFN_##name name;
 FNS(DECL)
 DFNS(DECL)
@@ -61,9 +65,6 @@ static VkDevice sDev;
 static VkQueue sQueue;
 static VkPhysicalDeviceMemoryProperties sMem;
 static VkPhysicalDeviceProperties sProps;
-static VkDescriptorSetLayout sArgsLayout;
-static VkPipelineLayout sKernelLayout;
-static VkPipelineLayout sRenderLayout;     /* set 0 vertex, set 1 fragment */
 static pthread_mutex_t sQueueLock = PTHREAD_MUTEX_INITIALIZER;
 static __thread char sError[256];
 
@@ -85,12 +86,26 @@ struct smv_texture {
 	uint32_t width, height, texel;
 };
 
+struct smv_sampler {
+	VkSampler sampler;
+};
+
+/* One stage's descriptor set layout, from Iridium's bindings. */
+struct stage_layout {
+	VkDescriptorSetLayout layout;
+	int ubo;                /* binding 0 holds the buffer addresses */
+};
+
 struct smv_render_pipeline {
 	VkPipeline pipe[3];     /* point, line and triangle topology classes */
 	VkShaderModule vs, fs;
+	struct stage_layout stage[2];
+	VkPipelineLayout layout;
 };
 
 struct smv_kernel {
+	struct stage_layout stage;
+	VkPipelineLayout layout;
 	VkShaderModule module;
 	char entry[128];
 	pthread_mutex_t lock;
@@ -109,8 +124,8 @@ struct smv_cmd {
 	uint32_t staging_used;
 	int in_flight;          /* a wait timed out: never freed */
 	VkDescriptorPool sets;  /* lazily, for dispatch arguments */
-	smv_buffer **args;      /* one small uniform buffer per dispatch */
-	unsigned nargs;
+	smv_buffer **args;      /* one small uniform buffer per argument table */
+	unsigned nargs, nsets;
 };
 
 static int
@@ -177,18 +192,6 @@ smv_open(const char *icd, char *name, size_t len)
 #define DLOAD(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n);
 	DFNS(DLOAD)
 	vkGetDeviceQueue(dev, 0, 0, &sQueue);
-	VkDescriptorSetLayoutBinding arg = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL };
-	VkDescriptorSetLayoutCreateInfo dlci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1, .pBindings = &arg };
-	TRY(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &sArgsLayout));
-	VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1, .pSetLayouts = &sArgsLayout };
-	TRY(vkCreatePipelineLayout(dev, &plci, NULL, &sKernelLayout));
-	VkDescriptorSetLayout two[2] = { sArgsLayout, sArgsLayout };
-	plci.setLayoutCount = 2;
-	plci.pSetLayouts = two;
-	TRY(vkCreatePipelineLayout(dev, &plci, NULL, &sRenderLayout));
 	sDev = dev;
 	snprintf(name, len, "%s", sProps.deviceName);
 	return 1;
@@ -300,8 +303,95 @@ smv_buffer_address(smv_buffer *b)
 	return b->address;
 }
 
+static const VkDescriptorType kDescType[] = {
+	[SMV_DESC_UBO] = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	[SMV_DESC_SAMPLED_IMAGE] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+	[SMV_DESC_STORAGE_IMAGE] = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+	[SMV_DESC_SAMPLER] = VK_DESCRIPTOR_TYPE_SAMPLER,
+};
+
+static int
+stage_layout_new(const struct smv_stage *d, struct stage_layout *out)
+{
+	VkDescriptorSetLayoutBinding b[32];
+	unsigned n = 0;
+	out->ubo = 0;
+	for (unsigned i = 0; d && i < d->count; ++i) {
+		if (d->bindings[i].type > SMV_DESC_SAMPLER || n == 32) {
+			return fail("bad descriptor binding");
+		}
+		b[n++] = (VkDescriptorSetLayoutBinding){ .binding = d->bindings[i].binding,
+			.descriptorType = kDescType[d->bindings[i].type], .descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_ALL };
+		out->ubo |= d->bindings[i].type == SMV_DESC_UBO;
+	}
+	VkDescriptorSetLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = n, .pBindings = b };
+	TRY(vkCreateDescriptorSetLayout(sDev, &ci, NULL, &out->layout));
+	return 1;
+}
+
+static void
+stage_layout_free(struct stage_layout *l)
+{
+	if (l->layout) {
+		vkDestroyDescriptorSetLayout(sDev, l->layout, NULL);
+		l->layout = VK_NULL_HANDLE;
+	}
+}
+
+static int
+pipeline_layout_new(const struct stage_layout *stages, unsigned count, VkPipelineLayout *out)
+{
+	VkDescriptorSetLayout sets[2];
+	for (unsigned i = 0; i < count; ++i) {
+		sets[i] = stages[i].layout;
+	}
+	VkPipelineLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = count, .pSetLayouts = sets };
+	TRY(vkCreatePipelineLayout(sDev, &ci, NULL, out));
+	return 1;
+}
+
+smv_sampler *
+smv_sampler_new(const struct smv_sampler_desc *d)
+{
+	if (!sDev) {
+		fail("no device");
+		return NULL;
+	}
+	smv_sampler *s = calloc(1, sizeof(*s));
+	if (!s) {
+		fail("out of memory");
+		return NULL;
+	}
+	VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = (VkFilter)d->mag,
+		.minFilter = (VkFilter)d->min, .mipmapMode = (VkSamplerMipmapMode)d->mip,
+		.addressModeU = (VkSamplerAddressMode)d->address[0], .addressModeV = (VkSamplerAddressMode)d->address[1],
+		.addressModeW = (VkSamplerAddressMode)d->address[2], .anisotropyEnable = d->anisotropy > 1.0f,
+		.maxAnisotropy = d->anisotropy > 1.0f ? d->anisotropy : 1.0f, .compareEnable = d->compare_enable,
+		.compareOp = (VkCompareOp)d->compare_op, .minLod = d->lod_min, .maxLod = d->lod_max,
+		.borderColor = (VkBorderColor)d->border, .unnormalizedCoordinates = d->unnormalized };
+	VkResult r = vkCreateSampler(sDev, &ci, NULL, &s->sampler);
+	if (r != VK_SUCCESS) {
+		fail("vkCreateSampler: %d", r);
+		free(s);
+		return NULL;
+	}
+	return s;
+}
+
+void
+smv_sampler_free(smv_sampler *s)
+{
+	if (s) {
+		vkDestroySampler(sDev, s->sampler, NULL);
+		free(s);
+	}
+}
+
 smv_kernel *
-smv_kernel_new(const void *spirv, size_t bytes, const char *entry)
+smv_kernel_new(const void *spirv, size_t bytes, const char *entry, const struct smv_stage *bindings)
 {
 	if (!sDev) {
 		fail("no device");
@@ -314,12 +404,16 @@ smv_kernel_new(const void *spirv, size_t bytes, const char *entry)
 	}
 	snprintf(k->entry, sizeof(k->entry), "%s", entry);
 	pthread_mutex_init(&k->lock, NULL);
+	if (!stage_layout_new(bindings, &k->stage) || !pipeline_layout_new(&k->stage, 1, &k->layout)) {
+		smv_kernel_free(k);
+		return NULL;
+	}
 	VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes,
 		.pCode = spirv };
 	VkResult r = vkCreateShaderModule(sDev, &smci, NULL, &k->module);
 	if (r != VK_SUCCESS) {
 		fail("vkCreateShaderModule: %d", r);
-		free(k);
+		smv_kernel_free(k);
 		return NULL;
 	}
 	return k;
@@ -336,7 +430,13 @@ smv_kernel_free(smv_kernel *k)
 			vkDestroyPipeline(sDev, k->sized[i].pipe, NULL);
 		}
 	}
-	vkDestroyShaderModule(sDev, k->module, NULL);
+	if (k->module) {
+		vkDestroyShaderModule(sDev, k->module, NULL);
+	}
+	if (k->layout) {
+		vkDestroyPipelineLayout(sDev, k->layout, NULL);
+	}
+	stage_layout_free(&k->stage);
 	free(k);
 }
 
@@ -361,7 +461,7 @@ kernel_pipeline(smv_kernel *k, const uint32_t local[3])
 			.stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 			    .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = k->module, .pName = k->entry,
 			    .pSpecializationInfo = &spec },
-			.layout = sKernelLayout };
+			.layout = k->layout };
 		VkResult r = vkCreateComputePipelines(sDev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
 		if (r != VK_SUCCESS) {
 			fail("vkCreateComputePipelines %ux%ux%u: %d", local[0], local[1], local[2], r);
@@ -483,45 +583,78 @@ smv_cmd_copy(smv_cmd *c, smv_buffer *src, uint64_t src_offset, smv_buffer *dst, 
 	return 1;
 }
 
-/* A descriptor set whose binding 0 is a uniform buffer holding ADDRESSES
- * (Iridium's argument table); the buffer lives as long as the list. */
+/* One stage's descriptor set: the uniform buffer of buffer addresses (if
+ * the layout has one) and the bound textures and samplers. The address
+ * buffer lives as long as the list. */
 static int
-args_set(smv_cmd *c, const uint64_t *addresses, unsigned count, VkDescriptorSet *out)
+stage_set(smv_cmd *c, const struct stage_layout *l, const struct smv_args *a, VkDescriptorSet *out)
 {
 	if (!c->sets) {
-		VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, CMD_SETS };
+		VkDescriptorPoolSize size[] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, CMD_SETS },
+			{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, CMD_SETS }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, CMD_SETS / 4 },
+			{ VK_DESCRIPTOR_TYPE_SAMPLER, CMD_SETS } };
 		VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-			.maxSets = CMD_SETS, .poolSizeCount = 1, .pPoolSizes = &size };
+			.maxSets = CMD_SETS, .poolSizeCount = 4, .pPoolSizes = size };
 		TRY(vkCreateDescriptorPool(sDev, &dpci, NULL, &c->sets));
 	}
-	if (c->nargs == CMD_SETS) {
-		return fail("more than %d dispatches/draws in one command buffer", CMD_SETS);
+	if (c->nsets == CMD_SETS) {
+		return fail("more than %d descriptor sets in one command buffer", CMD_SETS);
 	}
-	smv_buffer *args = smv_buffer_new(count ? count * 8ull : 8, count ? addresses : NULL);
-	if (!args) {
-		return 0;
-	}
-	smv_buffer **list = realloc(c->args, (c->nargs + 1) * sizeof(*list));
-	if (!list) {
-		smv_buffer_free(args);
-		return fail("out of memory");
-	}
-	c->args = list;
-	c->args[c->nargs++] = args;
 	VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = c->sets, .descriptorSetCount = 1, .pSetLayouts = &sArgsLayout };
+		.descriptorPool = c->sets, .descriptorSetCount = 1, .pSetLayouts = &l->layout };
 	VkDescriptorSet set;
 	TRY(vkAllocateDescriptorSets(sDev, &dsai, &set));
+	c->nsets++;
 	*out = set;
-	VkDescriptorBufferInfo dbi = { args->buf, 0, VK_WHOLE_SIZE };
-	VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
-		.descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi };
-	vkUpdateDescriptorSets(sDev, 1, &w, 0, NULL);
+	VkWriteDescriptorSet w[33];
+	VkDescriptorImageInfo img[32];
+	VkDescriptorBufferInfo dbi;
+	unsigned n = 0;
+	if (l->ubo) {
+		unsigned count = a ? a->count : 0;
+		smv_buffer *args = smv_buffer_new(count ? count * 8ull : 8, count ? a->addresses : NULL);
+		if (!args) {
+			return 0;
+		}
+		smv_buffer **list = realloc(c->args, (c->nargs + 1) * sizeof(*list));
+		if (!list) {
+			smv_buffer_free(args);
+			return fail("out of memory");
+		}
+		c->args = list;
+		c->args[c->nargs++] = args;
+		dbi = (VkDescriptorBufferInfo){ args->buf, 0, VK_WHOLE_SIZE };
+		w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+			.dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.pBufferInfo = &dbi };
+	}
+	for (unsigned i = 0; a && i < a->nres && i < 32; ++i) {
+		const struct smv_bind *r = &a->res[i];
+		if (r->type == SMV_DESC_SAMPLER) {
+			if (!r->sampler) {
+				return fail("binding %u: no sampler bound", r->binding);
+			}
+			img[i] = (VkDescriptorImageInfo){ .sampler = r->sampler->sampler };
+		} else if (r->type == SMV_DESC_SAMPLED_IMAGE || r->type == SMV_DESC_STORAGE_IMAGE) {
+			if (!r->texture) {
+				return fail("binding %u: no texture bound", r->binding);
+			}
+			img[i] = (VkDescriptorImageInfo){ .imageView = r->texture->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+		} else {
+			return fail("binding %u: bad resource type", r->binding);
+		}
+		w[n++] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+			.dstBinding = r->binding, .descriptorCount = 1, .descriptorType = kDescType[r->type],
+			.pImageInfo = &img[i] };
+	}
+	if (n) {
+		vkUpdateDescriptorSets(sDev, n, w, 0, NULL);
+	}
 	return 1;
 }
 
 int
-smv_cmd_dispatch(smv_cmd *c, smv_kernel *k, const uint64_t *addresses, unsigned count, const uint32_t groups[3],
+smv_cmd_dispatch(smv_cmd *c, smv_kernel *k, const struct smv_args *args, const uint32_t groups[3],
     const uint32_t local[3])
 {
 	VkPipeline pipe = kernel_pipeline(k, local);
@@ -529,11 +662,11 @@ smv_cmd_dispatch(smv_cmd *c, smv_kernel *k, const uint64_t *addresses, unsigned 
 		return 0;
 	}
 	VkDescriptorSet set;
-	if (!args_set(c, addresses, count, &set)) {
+	if (!stage_set(c, &k->stage, args, &set)) {
 		return 0;
 	}
 	vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-	vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, sKernelLayout, 0, 1, &set, 0, NULL);
+	vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->layout, 0, 1, &set, 0, NULL);
 	vkCmdDispatch(c->cb, groups[0], groups[1], groups[2]);
 	VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
@@ -707,7 +840,9 @@ smv_texture_access(smv_texture *t, const uint32_t region[4], void *bytes, uint32
 /* ---- render pipelines and passes ---- */
 
 smv_render_pipeline *
-smv_render_pipeline_new(const void *spirv, size_t bytes, const char *vertex, const char *fragment,
+smv_render_pipeline_new(const void *vertex_spirv, size_t vertex_bytes, const char *vertex,
+    const void *fragment_spirv, size_t fragment_bytes, const char *fragment,
+    const struct smv_stage *vertex_bindings, const struct smv_stage *fragment_bindings,
     const struct smv_color_target *targets, unsigned count)
 {
 	if (!sDev) {
@@ -723,20 +858,29 @@ smv_render_pipeline_new(const void *spirv, size_t bytes, const char *vertex, con
 		fail("out of memory");
 		return NULL;
 	}
-	VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes,
-		.pCode = spirv };
+	if (!stage_layout_new(vertex_bindings, &p->stage[0]) || !stage_layout_new(fragment_bindings, &p->stage[1]) ||
+	    !pipeline_layout_new(p->stage, 2, &p->layout)) {
+		smv_render_pipeline_free(p);
+		return NULL;
+	}
+	VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = vertex_bytes, .pCode = vertex_spirv };
 	VkResult r = vkCreateShaderModule(sDev, &smci, NULL, &p->vs);
+	if (r == VK_SUCCESS) {
+		smci.codeSize = fragment_bytes;
+		smci.pCode = fragment_spirv;
+		r = vkCreateShaderModule(sDev, &smci, NULL, &p->fs);
+	}
 	if (r != VK_SUCCESS) {
 		fail("vkCreateShaderModule: %d", r);
 		smv_render_pipeline_free(p);
 		return NULL;
 	}
-	p->fs = VK_NULL_HANDLE;   /* both stages come from the library's one module */
 	VkPipelineShaderStageCreateInfo stages[2] = {
 		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
 		    .module = p->vs, .pName = vertex },
 		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-		    .module = p->vs, .pName = fragment },
+		    .module = p->fs, .pName = fragment },
 	};
 	VkFormat formats[SMV_MAX_TARGETS];
 	VkPipelineColorBlendAttachmentState blend[SMV_MAX_TARGETS];
@@ -770,7 +914,7 @@ smv_render_pipeline_new(const void *spirv, size_t bytes, const char *vertex, con
 	VkGraphicsPipelineCreateInfo gp = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rci,
 		.stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
 		.pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
-		.pColorBlendState = &cb, .pDynamicState = &dy, .layout = sRenderLayout };
+		.pColorBlendState = &cb, .pDynamicState = &dy, .layout = p->layout };
 	const VkPrimitiveTopology classes[3] = { VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
 		VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
 	for (int i = 0; i < 3; ++i) {
@@ -798,6 +942,14 @@ smv_render_pipeline_free(smv_render_pipeline *p)
 	if (p->vs) {
 		vkDestroyShaderModule(sDev, p->vs, NULL);
 	}
+	if (p->fs) {
+		vkDestroyShaderModule(sDev, p->fs, NULL);
+	}
+	if (p->layout) {
+		vkDestroyPipelineLayout(sDev, p->layout, NULL);
+	}
+	stage_layout_free(&p->stage[0]);
+	stage_layout_free(&p->stage[1]);
 	free(p);
 }
 
@@ -842,20 +994,19 @@ smv_cmd_raster(smv_cmd *c, uint32_t cull_mode, uint32_t front_face)
 }
 
 int
-smv_cmd_draw(smv_cmd *c, smv_render_pipeline *p, uint32_t topology, const uint64_t *vertex_addresses,
-    unsigned vertex_count_addresses, const uint64_t *fragment_addresses, unsigned fragment_count_addresses,
-    uint32_t first_vertex, uint32_t vertices, uint32_t instances, uint32_t first_instance)
+smv_cmd_draw(smv_cmd *c, smv_render_pipeline *p, uint32_t topology, const struct smv_args *vertex_args,
+    const struct smv_args *fragment_args, uint32_t first_vertex, uint32_t vertices, uint32_t instances,
+    uint32_t first_instance)
 {
 	VkDescriptorSet sets[2];
-	if (!args_set(c, vertex_addresses, vertex_count_addresses, &sets[0]) ||
-	    !args_set(c, fragment_addresses, fragment_count_addresses, &sets[1])) {
+	if (!stage_set(c, &p->stage[0], vertex_args, &sets[0]) || !stage_set(c, &p->stage[1], fragment_args, &sets[1])) {
 		return 0;
 	}
 	int cls = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 :
 	    (topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) ? 1 : 2;
 	vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe[cls]);
 	vkCmdSetPrimitiveTopology(c->cb, (VkPrimitiveTopology)topology);
-	vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, sRenderLayout, 0, 2, sets, 0, NULL);
+	vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets, 0, NULL);
 	vkCmdDraw(c->cb, vertices, instances, first_vertex, first_instance);
 	return 1;
 }

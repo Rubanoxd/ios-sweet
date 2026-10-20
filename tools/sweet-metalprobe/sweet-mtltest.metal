@@ -38,3 +38,26 @@ fragment float4 tri_fragment(VOut in [[stage_in]])
 {
     return in.color;
 }
+
+// A textured quad (texture test): xy position and uv per vertex, the
+// texture sampled with a bound sampler or with a constexpr one at 60 %.
+struct TOut {
+    float4 position [[position]];
+    float2 uv;
+};
+vertex TOut quad_vertex(uint vid [[vertex_id]], constant float4 *v [[buffer(0)]])
+{
+    TOut o;
+    o.position = float4(v[vid].xy, 0.0, 1.0);
+    o.uv = v[vid].zw;
+    return o;
+}
+fragment float4 quad_fragment(TOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler s [[sampler(0)]])
+{
+    return tex.sample(s, in.uv);
+}
+fragment float4 quad_fragment_faded(TOut in [[stage_in]], texture2d<float> tex [[texture(0)]])
+{
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return tex.sample(s, in.uv) * 0.6;
+}

@@ -16,9 +16,10 @@
  * textures (getBytes/replaceRegion), render pipelines (vertex + fragment of
  * one library, blending) and render encoders (color attachments with
  * load/store/clear, buffers and bytes per stage, viewport, cull, winding,
- * drawPrimitives). Not yet: newLibraryWithSource (needs the on-device MSL
- * compiler), texture/sampler arguments, vertex descriptors, depth/stencil,
- * events, heaps, drawables. Those return nil, fail the
+ * drawPrimitives), sampler states and texture/sampler shader arguments
+ * (bound or constexpr samplers). Not yet: newLibraryWithSource (needs the
+ * on-device MSL compiler), storage textures (Iridium samples only), vertex
+ * descriptors, depth/stencil, events, heaps, drawables. Those return nil, fail the
  * command buffer or, for selectors not implemented at all, are logged
  * through doesNotRecognizeSelector: before the usual exception.
  */
@@ -124,17 +125,63 @@ smError(NSString *why)
 
 /* ---- libraries, functions, compute pipelines ---- */
 @interface SMLibrary : SMObject
-@property (nonatomic, strong) NSData *spirv;
 @property (nonatomic, strong) NSDictionary<NSString *, NSNumber *> *functions; /* name -> index */
 @property (nonatomic) struct sweet_air_function *table;
+@property (nonatomic) size_t count;
 @end
+
+/* Iridium's constexpr sampler encoding (sweet-iridium.h) to Vulkan. */
+static struct smv_sampler_desc
+embeddedSamplerDesc(const struct sweet_air_sampler *e)
+{
+	static const uint32_t address[] = { VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+		VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER };
+	static const uint32_t compare[] = { VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_LESS_OR_EQUAL,
+		VK_COMPARE_OP_GREATER, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_NOT_EQUAL,
+		VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_NEVER };
+	static const uint32_t border[] = { VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+		VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
+	struct smv_sampler_desc d = { .mag = e->mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+		.min = e->min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+		.mip = e->mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+		.unnormalized = !e->normalized, .compare_enable = e->compare != 0,
+		.compare_op = compare[e->compare < 9 ? e->compare : 0], .border = border[e->border < 3 ? e->border : 0],
+		.lod_min = e->lod_min, .lod_max = e->mip == 0 ? 0.0f : e->lod_max, .anisotropy = e->anisotropy };
+	for (int i = 0; i < 3; ++i) {
+		d.address[i] = address[e->address[i] < 5 ? e->address[i] : 1];
+	}
+	return d;
+}
 
 @interface SMFunction : SMObject
 @property (nonatomic, strong) SMLibrary *library;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) const struct sweet_air_function *info;
+- (smv_sampler *)embeddedSampler:(int)index;
 @end
-@implementation SMFunction
+@implementation SMFunction {
+	smv_sampler *_embedded[8];
+}
+- (void)dealloc
+{
+	for (int i = 0; i < 8; ++i) {
+		smv_sampler_free(_embedded[i]);
+	}
+}
+- (smv_sampler *)embeddedSampler:(int)index
+{
+	if (index < 0 || (unsigned)index >= _info->samplers) {
+		return NULL;
+	}
+	@synchronized (self) {
+		if (!_embedded[index]) {
+			struct smv_sampler_desc d = embeddedSamplerDesc(&_info->sampler[index]);
+			_embedded[index] = smv_sampler_new(&d);
+		}
+		return _embedded[index];
+	}
+}
 - (NSString *)name
 {
 	return _name;
@@ -172,7 +219,7 @@ smError(NSString *why)
 @implementation SMLibrary
 - (void)dealloc
 {
-	free(_table);
+	sweet_air_free(_table, _count);
 }
 - (NSArray<NSString *> *)functionNames
 {
@@ -196,6 +243,10 @@ smError(NSString *why)
 	f.library = self;
 	f.name = name;
 	f.info = &_table[at.unsignedIntegerValue];
+	if (!f.info->spirv) {
+		sweet_metal_log("function %s was not translated: %s", f.info->name, f.info->error);
+		return nil;
+	}
 	return (id<MTLFunction>)f;
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
@@ -213,14 +264,23 @@ smError(NSString *why)
 static SMLibrary *
 newLibrary(NSData *data, NSError **error)
 {
-	char err[256];
-	size_t bytes = 0, count = 0;
-	struct sweet_air_function *table = NULL;
-	void *spv = data ? sweet_air_translate(data.bytes, data.length, &bytes, &table, &count, err, sizeof(err)) : NULL;
-	if (!spv) {
-		if (!data) {
-			snprintf(err, sizeof(err), "no library data");
+	char err[256] = "no library data";
+	size_t count = 0, good = 0, bytes = 0;
+	struct sweet_air_function *table = data ? sweet_air_translate(data.bytes, data.length, &count, err,
+	    sizeof(err)) : NULL;
+	for (size_t i = 0; table && i < count; ++i) {
+		if (table[i].spirv) {
+			good++;
+			bytes += table[i].spirv_bytes;
+		} else {
+			sweet_metal_log("not translated: %s: %s", table[i].name, table[i].error);
 		}
+	}
+	if (!table || !good) {
+		if (table) {
+			snprintf(err, sizeof(err), "none of its %zu functions could be translated", count);
+		}
+		sweet_air_free(table, count);
 		sweet_metal_log("library refused: %s", err);
 		if (error) {
 			*error = smError([NSString stringWithUTF8String:err]);
@@ -228,14 +288,16 @@ newLibrary(NSData *data, NSError **error)
 		return nil;
 	}
 	SMLibrary *lib = [SMLibrary new];
-	lib.spirv = [NSData dataWithBytesNoCopy:spv length:bytes freeWhenDone:YES];
 	lib.table = table;
+	lib.count = count;
 	NSMutableDictionary *names = [NSMutableDictionary dictionary];
 	for (size_t i = 0; i < count; ++i) {
-		names[[NSString stringWithUTF8String:table[i].name]] = @(i);
+		if (table[i].name[0]) {
+			names[[NSString stringWithUTF8String:table[i].name]] = @(i);
+		}
 	}
 	lib.functions = names;
-	sweet_metal_log("library: %zu functions, %zu bytes of SPIR-V", count, bytes);
+	sweet_metal_log("library: %zu of %zu functions translated, %zu bytes of SPIR-V", good, count, bytes);
 	if (error) {
 		*error = nil;
 	}
@@ -525,18 +587,89 @@ writeMask(MTLColorWriteMask m)
 }
 @end
 
-/* The argument table of one stage: the GPU addresses of its buffer
- * bindings, in Iridium's order. NO if the stage takes something else. */
-static BOOL
-stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64_t *out)
+/* ---- sampler states ---- */
+@interface SMSampler : SMObject
+@property (nonatomic) smv_sampler *handle;
+@end
+@implementation SMSampler
+- (void)dealloc
 {
+	smv_sampler_free(_handle);
+}
+- (BOOL)supportArgumentBuffers
+{
+	return NO;
+}
+@end
+
+/* ---- per-stage argument state, shared by the encoders ---- */
+struct stage_state {
+	uint64_t address[SWEET_AIR_MAX_BINDINGS];
+	__unsafe_unretained SMTexture *texture[SWEET_AIR_MAX_BINDINGS];     /* the command buffer retains */
+	__unsafe_unretained SMSampler *sampler[SWEET_AIR_MAX_BINDINGS];
+};
+
+/* The descriptor layout Iridium gave FN's stage. */
+static unsigned
+stageDesc(const struct sweet_air_function *f, struct smv_binding *out)
+{
+	unsigned n = 0;
+	BOOL buffers = NO;
 	for (unsigned i = 0; f && i < f->bindings; ++i) {
-		if (f->binding[i].type != SWEET_AIR_BUFFER || f->binding[i].index >= SWEET_AIR_MAX_BINDINGS) {
-			return NO;
-		}
-		out[i] = bound[f->binding[i].index];
+		buffers |= f->binding[i].type == SWEET_AIR_BUFFER;
 	}
-	return YES;
+	if (buffers) {
+		out[n++] = (struct smv_binding){ 0, SMV_DESC_UBO };
+	}
+	for (unsigned i = 0; f && i < f->bindings; ++i) {
+		if (f->binding[i].type == SWEET_AIR_TEXTURE) {
+			out[n++] = (struct smv_binding){ f->binding[i].internal,
+				f->binding[i].sampled ? SMV_DESC_SAMPLED_IMAGE : SMV_DESC_STORAGE_IMAGE };
+		} else if (f->binding[i].type == SWEET_AIR_SAMPLER) {
+			out[n++] = (struct smv_binding){ f->binding[i].internal, SMV_DESC_SAMPLER };
+		}
+	}
+	return n;
+}
+
+/* What FN's stage gets now, from the encoder's state; nil or the reason. */
+static NSString *
+stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, struct smv_bind *res,
+    struct smv_args *out)
+{
+	const struct sweet_air_function *f = fn.info;
+	*out = (struct smv_args){ .addresses = addresses, .res = res };
+	for (unsigned i = 0; f && i < f->bindings; ++i) {
+		unsigned index = f->binding[i].index;
+		switch (f->binding[i].type) {
+		case SWEET_AIR_BUFFER:
+			if (index >= SWEET_AIR_MAX_BINDINGS) {
+				return @"buffer index out of range";
+			}
+			addresses[out->count++] = st->address[index];
+			break;
+		case SWEET_AIR_TEXTURE:
+			if (index >= SWEET_AIR_MAX_BINDINGS || !st->texture[index]) {
+				return [NSString stringWithFormat:@"%@: no texture at index %u", fn.name, index];
+			}
+			res[out->nres++] = (struct smv_bind){ f->binding[i].internal,
+				f->binding[i].sampled ? SMV_DESC_SAMPLED_IMAGE : SMV_DESC_STORAGE_IMAGE,
+				st->texture[index].handle, NULL };
+			break;
+		case SWEET_AIR_SAMPLER: {
+			smv_sampler *sm = f->binding[i].embedded >= 0 ? [fn embeddedSampler:f->binding[i].embedded] :
+			    index < SWEET_AIR_MAX_BINDINGS && st->sampler[index] ? st->sampler[index].handle : NULL;
+			if (!sm) {
+				return [NSString stringWithFormat:@"%@: no sampler at index %u", fn.name, index];
+			}
+			res[out->nres++] = (struct smv_bind){ f->binding[i].internal, SMV_DESC_SAMPLER, NULL, sm };
+			break;
+		}
+		default:
+			return @"vertex inputs (stage_in attributes) are not implemented yet";
+		}
+	}
+	return nil;
 }
 
 @interface SMComputeEncoder : SMObject
@@ -544,7 +677,29 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 @end
 @implementation SMComputeEncoder {
 	SMComputePipeline *_pipeline;
-	uint64_t _address[SWEET_AIR_MAX_BINDINGS];
+	struct stage_state _st;
+}
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS || (texture && ![(id)texture isKindOfClass:[SMTexture class]])) {
+		[_commandBuffer refuse:@"compute: bad texture or index"];
+		return;
+	}
+	if (texture) {
+		[_commandBuffer use:texture];
+	}
+	_st.texture[index] = (SMTexture *)texture;
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS || (sampler && ![(id)sampler isKindOfClass:[SMSampler class]])) {
+		[_commandBuffer refuse:@"compute: bad sampler or index"];
+		return;
+	}
+	if (sampler) {
+		[_commandBuffer use:sampler];
+	}
+	_st.sampler[index] = (SMSampler *)sampler;
 }
 - (MTLDispatchType)dispatchType
 {
@@ -565,7 +720,7 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 		return;
 	}
 	if (!buffer) {
-		_address[index] = 0;
+		_st.address[index] = 0;
 		return;
 	}
 	if (![(id)buffer isKindOfClass:[SMBuffer class]]) {
@@ -574,7 +729,7 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 	}
 	SMBuffer *b = (SMBuffer *)buffer;
 	[_commandBuffer use:b];
-	_address[index] = smv_buffer_address(b.handle) + offset;
+	_st.address[index] = smv_buffer_address(b.handle) + offset;
 }
 - (void)setBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
@@ -607,19 +762,18 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 		[_commandBuffer refuse:@"dispatch without a pipeline state"];
 		return;
 	}
-	const struct sweet_air_function *f = _pipeline.function.info;
 	uint64_t addresses[SWEET_AIR_MAX_BINDINGS];
-	for (unsigned i = 0; i < f->bindings; ++i) {
-		if (f->binding[i].type != SWEET_AIR_BUFFER || f->binding[i].index >= SWEET_AIR_MAX_BINDINGS) {
-			[_commandBuffer refuse:@"compute: only buffer arguments are implemented yet"];
-			return;
-		}
-		addresses[i] = _address[f->binding[i].index];
+	struct smv_bind res[SWEET_AIR_MAX_BINDINGS];
+	struct smv_args args;
+	NSString *why = stageArgs(_pipeline.function, &_st, addresses, res, &args);
+	if (why) {
+		[_commandBuffer refuse:[@"compute: " stringByAppendingString:why]];
+		return;
 	}
 	smv_cmd *c = [_commandBuffer cmd];
 	const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
 	const uint32_t l[3] = { (uint32_t)local.width, (uint32_t)local.height, (uint32_t)local.depth };
-	if (c && !smv_cmd_dispatch(c, _pipeline.kernel, addresses, f->bindings, g, l)) {
+	if (c && !smv_cmd_dispatch(c, _pipeline.kernel, &args, g, l)) {
 		[_commandBuffer refuse:[NSString stringWithFormat:@"dispatch: %s", smv_error()]];
 	}
 }
@@ -675,7 +829,52 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 	SMRenderPipeline *_pipeline;
 	MTLCullMode _cull;
 	MTLWinding _winding;
-	uint64_t _vertex[SWEET_AIR_MAX_BINDINGS], _fragment[SWEET_AIR_MAX_BINDINGS];
+	struct stage_state _vertex, _fragment;
+}
+- (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index into:(struct stage_state *)st
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS || (texture && ![(id)texture isKindOfClass:[SMTexture class]])) {
+		[_commandBuffer refuse:@"render: bad texture or index"];
+		return;
+	}
+	if (texture) {
+		[_commandBuffer use:texture];
+	}
+	st->texture[index] = (SMTexture *)texture;
+}
+- (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index into:(struct stage_state *)st
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS || (sampler && ![(id)sampler isKindOfClass:[SMSampler class]])) {
+		[_commandBuffer refuse:@"render: bad sampler or index"];
+		return;
+	}
+	if (sampler) {
+		[_commandBuffer use:sampler];
+	}
+	st->sampler[index] = (SMSampler *)sampler;
+}
+- (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
+{
+	[self texture:texture index:index into:&_vertex];
+}
+- (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
+{
+	[self texture:texture index:index into:&_fragment];
+}
+- (void)setVertexSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
+{
+	[self sampler:sampler index:index into:&_vertex];
+}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
+{
+	[self sampler:sampler index:index into:&_fragment];
+}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)sampler lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax
+    atIndex:(NSUInteger)index
+{
+	(void)lodMin;
+	(void)lodMax;
+	[self sampler:sampler index:index into:&_fragment];
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state
 {
@@ -685,14 +884,14 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 	}
 	_pipeline = (SMRenderPipeline *)state;
 }
-- (void)bind:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index into:(uint64_t *)table
+- (void)bind:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index into:(struct stage_state *)st
 {
 	if (index >= SWEET_AIR_MAX_BINDINGS) {
 		[_commandBuffer refuse:@"render: buffer index out of range"];
 		return;
 	}
 	if (!buffer) {
-		table[index] = 0;
+		st->address[index] = 0;
 		return;
 	}
 	if (![(id)buffer isKindOfClass:[SMBuffer class]]) {
@@ -700,9 +899,9 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 		return;
 	}
 	[_commandBuffer use:buffer];
-	table[index] = smv_buffer_address(((SMBuffer *)buffer).handle) + offset;
+	st->address[index] = smv_buffer_address(((SMBuffer *)buffer).handle) + offset;
 }
-- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index into:(uint64_t *)table
+- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index into:(struct stage_state *)st
 {
 	smv_buffer *h = smv_buffer_new(length ? length : 4, bytes);
 	if (!h) {
@@ -711,23 +910,23 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 	}
 	SMBuffer *b = [SMBuffer new];
 	b.handle = h;
-	[self bind:(id<MTLBuffer>)b offset:0 index:index into:table];
+	[self bind:(id<MTLBuffer>)b offset:0 index:index into:st];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	[self bind:buffer offset:offset index:index into:_vertex];
+	[self bind:buffer offset:offset index:index into:&_vertex];
 }
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	[self bind:buffer offset:offset index:index into:_fragment];
+	[self bind:buffer offset:offset index:index into:&_fragment];
 }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	[self bytes:bytes length:length index:index into:_vertex];
+	[self bytes:bytes length:length index:index into:&_vertex];
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	[self bytes:bytes length:length index:index into:_fragment];
+	[self bytes:bytes length:length index:index into:&_fragment];
 }
 - (void)setViewport:(MTLViewport)v
 {
@@ -787,14 +986,19 @@ stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64
 		return;
 	}
 	uint64_t va[SWEET_AIR_MAX_BINDINGS], fa[SWEET_AIR_MAX_BINDINGS];
-	const struct sweet_air_function *vf = _pipeline.vertex.info, *ff = _pipeline.fragment.info;
-	if (!stageAddresses(vf, _vertex, va) || !stageAddresses(ff, _fragment, fa)) {
-		[_commandBuffer refuse:@"render: only buffer arguments are implemented yet"];
+	struct smv_bind vr[SWEET_AIR_MAX_BINDINGS], fr[SWEET_AIR_MAX_BINDINGS];
+	struct smv_args vargs, fargs;
+	NSString *why = stageArgs(_pipeline.vertex, &_vertex, va, vr, &vargs);
+	if (!why) {
+		why = stageArgs(_pipeline.fragment, &_fragment, fa, fr, &fargs);
+	}
+	if (why) {
+		[_commandBuffer refuse:[@"render: " stringByAppendingString:why]];
 		return;
 	}
 	smv_cmd *c = [_commandBuffer cmd];
-	if (c && !smv_cmd_draw(c, _pipeline.handle, (uint32_t)type, va, vf->bindings, fa, ff ? ff->bindings : 0,
-	    (uint32_t)start, (uint32_t)count, (uint32_t)instances, (uint32_t)base)) {
+	if (c && !smv_cmd_draw(c, _pipeline.handle, (uint32_t)type, &vargs, &fargs, (uint32_t)start, (uint32_t)count,
+	    (uint32_t)instances, (uint32_t)base)) {
 		[_commandBuffer refuse:[NSString stringWithFormat:@"draw: %s", smv_error()]];
 	}
 }
@@ -1119,6 +1323,7 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		{ [SMRenderPipeline class], "MTLRenderPipelineStateSPI" },
 		{ [SMRenderEncoder class], "MTLRenderCommandEncoder" },
 		{ [SMRenderEncoder class], "MTLRenderCommandEncoderSPI" },
+		{ [SMSampler class], "MTLSamplerState" }, { [SMSampler class], "MTLSamplerStateSPI" },
 	};
 	for (size_t i = 0; i < sizeof(conform) / sizeof(conform[0]); ++i) {
 		Protocol *p = objc_getProtocol(conform[i].protocol);
@@ -1304,7 +1509,9 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		return nil;
 	}
 	SMFunction *f = (SMFunction *)function;
-	smv_kernel *k = smv_kernel_new(f.library.spirv.bytes, f.library.spirv.length, f.name.UTF8String);
+	struct smv_binding b[SWEET_AIR_MAX_BINDINGS + 1];
+	struct smv_stage stage = { b, stageDesc(f.info, b) };
+	smv_kernel *k = smv_kernel_new(f.info->spirv, f.info->spirv_bytes, f.name.UTF8String, &stage);
 	if (!k) {
 		if (error) {
 			*error = smError([NSString stringWithFormat:@"kernel %@: %s", f.name, smv_error()]);
@@ -1360,6 +1567,38 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	t.options = d.resourceOptions;
 	return (id<MTLTexture>)t;
 }
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
+{
+	static const uint32_t address[] = { VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE /* mirror-clamp: not enabled */, VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+		VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER };
+	static const uint32_t border[] = { VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+		VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
+	const MTLSamplerAddressMode modes[3] = { d.sAddressMode, d.tAddressMode, d.rAddressMode };
+	struct smv_sampler_desc v = { .mag = d.magFilter == MTLSamplerMinMagFilterLinear ? VK_FILTER_LINEAR :
+		    VK_FILTER_NEAREST,
+		.min = d.minFilter == MTLSamplerMinMagFilterLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+		.mip = d.mipFilter == MTLSamplerMipFilterLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR :
+		    VK_SAMPLER_MIPMAP_MODE_NEAREST,
+		.unnormalized = !d.normalizedCoordinates, .compare_enable = d.compareFunction != MTLCompareFunctionNever,
+		.compare_op = (uint32_t)d.compareFunction,     /* same values */
+		.border = border[d.borderColor < 3 ? d.borderColor : 0], .lod_min = d.lodMinClamp,
+		.lod_max = d.mipFilter == MTLSamplerMipFilterNotMipmapped ? 0.0f : d.lodMaxClamp,
+		.anisotropy = (float)d.maxAnisotropy };
+	for (int i = 0; i < 3; ++i) {
+		v.address[i] = address[modes[i] < 6 ? modes[i] : 0];
+	}
+	smv_sampler *h = smv_sampler_new(&v);
+	if (!h) {
+		sweet_metal_log("sampler refused: %s", smv_error());
+		return nil;
+	}
+	SMSampler *sm = [SMSampler new];
+	sm.handle = h;
+	sm.label = d.label;
+	return (id<MTLSamplerState>)sm;
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
     error:(NSError **)error
 {
@@ -1369,8 +1608,6 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	    (SMFunction *)d.fragmentFunction : nil;
 	if (!vf || vf.functionType != MTLFunctionTypeVertex || !ff || ff.functionType != MTLFunctionTypeFragment) {
 		why = @"a vertex and a fragment function of this device are required";
-	} else if (vf.library != ff.library) {
-		why = @"vertex and fragment functions from different libraries are not implemented yet";
 	} else if (d.vertexDescriptor.attributes[0].format != MTLVertexFormatInvalid) {
 		why = @"vertex descriptors (stage_in attributes) are not implemented yet";
 	} else if (d.depthAttachmentPixelFormat != MTLPixelFormatInvalid ||
@@ -1398,8 +1635,10 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	}
 	smv_render_pipeline *h = NULL;
 	if (!why) {
-		h = smv_render_pipeline_new(vf.library.spirv.bytes, vf.library.spirv.length, vf.name.UTF8String,
-		    ff.name.UTF8String, targets, n);
+		struct smv_binding vb[SWEET_AIR_MAX_BINDINGS + 1], fb[SWEET_AIR_MAX_BINDINGS + 1];
+		struct smv_stage vs = { vb, stageDesc(vf.info, vb) }, fs = { fb, stageDesc(ff.info, fb) };
+		h = smv_render_pipeline_new(vf.info->spirv, vf.info->spirv_bytes, vf.name.UTF8String, ff.info->spirv,
+		    ff.info->spirv_bytes, ff.name.UTF8String, &vs, &fs, targets, n);
 		if (!h) {
 			why = [NSString stringWithUTF8String:smv_error()];
 		}

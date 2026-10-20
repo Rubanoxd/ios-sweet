@@ -1,7 +1,8 @@
 /*
  * sweet-air2spv: translates a metallib on the phone with the plugin's
- * Iridium build and prints each function's bindings; writes the SPIR-V.
- *   sweet-air2spv IN.metallib [OUT.spv]
+ * Iridium build, one function at a time, and prints each function's
+ * result and bindings; writes each SPIR-V module to OUTDIR/NAME.spv.
+ *   sweet-air2spv IN.metallib [OUTDIR]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s IN.metallib [OUT.spv]\n", argv[0]);
+		fprintf(stderr, "usage: %s IN.metallib [OUTDIR]\n", argv[0]);
 		return 2;
 	}
 	FILE *f = fopen(argv[1], "rb");
@@ -28,24 +29,35 @@ main(int argc, char **argv)
 	}
 	fclose(f);
 	char err[256];
-	size_t bytes = 0, count = 0;
-	struct sweet_air_function *fn;
-	void *spv = sweet_air_translate(lib, n, &bytes, &fn, &count, err, sizeof(err));
-	if (!spv) {
+	size_t count = 0, ok = 0;
+	struct sweet_air_function *fn = sweet_air_translate(lib, n, &count, err, sizeof(err));
+	if (!fn) {
 		printf("translation failed: %s\n", err);
 		return 1;
 	}
-	printf("SPIR-V %zu bytes, %zu functions\n", bytes, count);
 	for (size_t i = 0; i < count; ++i) {
-		printf("  %s kind %d:", fn[i].name, fn[i].kind);
+		if (!fn[i].spirv) {
+			printf("  FAIL %s: %s\n", fn[i].name, fn[i].error);
+			continue;
+		}
+		ok++;
+		printf("  OK   %s kind %d, %zu bytes:", fn[i].name, fn[i].kind, fn[i].spirv_bytes);
 		for (unsigned b = 0; b < fn[i].bindings; ++b) {
-			printf(" %s%u", fn[i].binding[b].type == SWEET_AIR_BUFFER ? "buffer" : "other", fn[i].binding[b].index);
+			static const char *const type[] = { "buffer", "texture", "sampler", "vertex-input" };
+			printf(" %s%d@%u", type[fn[i].binding[b].type & 3], (int)fn[i].binding[b].index, fn[i].binding[b].internal);
 		}
 		printf("\n");
+		if (argc > 2) {
+			char path[512];
+			snprintf(path, sizeof(path), "%s/%s.spv", argv[2], fn[i].name);
+			FILE *o = fopen(path, "wb");
+			if (o) {
+				fwrite(fn[i].spirv, 1, fn[i].spirv_bytes, o);
+				fclose(o);
+			}
+		}
 	}
-	if (argc > 2 && (f = fopen(argv[2], "wb"))) {
-		fwrite(spv, 1, bytes, f);
-		fclose(f);
-	}
-	return 0;
+	printf("%zu of %zu functions translated\n", ok, count);
+	sweet_air_free(fn, count);
+	return ok ? 0 : 1;
 }
