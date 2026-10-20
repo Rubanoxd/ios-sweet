@@ -21,8 +21,7 @@ cc="clang -target arm64-apple-ios16.0 -isysroot $sdk -Os -Wall -Wno-missing-brac
 cxx="clang++ -target arm64-apple-ios16.0 -isysroot $sdk -Os -std=c++17 -Wno-deprecated-declarations \
 	-I$top/indium/include -I$top/indium/private-include -I$top/llvm-project/llvm/include \
 	-I$top/llvm-ios/build/include -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
-llvm="-L$top/llvm-ios/build/lib -lLLVMBitReader -lLLVMCore -lLLVMBitstreamReader -lLLVMRemarks \
-	-lLLVMBinaryFormat -lLLVMSupport -lLLVMDemangle"
+llvm=$(ls "$top"/llvm-ios/build/lib/libLLVM*.a)     # ld64 resolves archives in any order
 b="$out/SweetMetalProbe.bundle"
 rm -rf "$b"
 mkdir -p "$b"

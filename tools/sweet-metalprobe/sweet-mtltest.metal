@@ -61,3 +61,10 @@ fragment float4 quad_fragment_faded(TOut in [[stage_in]], texture2d<float> tex [
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     return tex.sample(s, in.uv) * 0.6;
 }
+
+// Framebuffer read (programmable blending): the fragment reads the color
+// already in attachment 0 and writes its inverse.
+fragment float4 invert_fragment(VOut in [[stage_in]], float4 dst [[color(0)]])
+{
+    return float4(1.0 - dst.rgb, 1.0);
+}

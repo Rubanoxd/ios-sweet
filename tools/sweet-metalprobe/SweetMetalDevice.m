@@ -607,6 +607,7 @@ struct stage_state {
 	uint64_t address[SWEET_AIR_MAX_BINDINGS];
 	__unsafe_unretained SMTexture *texture[SWEET_AIR_MAX_BINDINGS];     /* the command buffer retains */
 	__unsafe_unretained SMSampler *sampler[SWEET_AIR_MAX_BINDINGS];
+	__unsafe_unretained SMTexture *target[SMV_MAX_TARGETS];             /* the pass's color attachments */
 };
 
 /* The descriptor layout Iridium gave FN's stage. */
@@ -627,6 +628,8 @@ stageDesc(const struct sweet_air_function *f, struct smv_binding *out)
 				f->binding[i].sampled ? SMV_DESC_SAMPLED_IMAGE : SMV_DESC_STORAGE_IMAGE };
 		} else if (f->binding[i].type == SWEET_AIR_SAMPLER) {
 			out[n++] = (struct smv_binding){ f->binding[i].internal, SMV_DESC_SAMPLER };
+		} else if (f->binding[i].type == SWEET_AIR_RENDER_TARGET) {
+			out[n++] = (struct smv_binding){ f->binding[i].internal, SMV_DESC_INPUT_ATTACHMENT };
 		}
 	}
 	return n;
@@ -665,6 +668,14 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 			res[out->nres++] = (struct smv_bind){ f->binding[i].internal, SMV_DESC_SAMPLER, NULL, sm };
 			break;
 		}
+		case SWEET_AIR_RENDER_TARGET:
+			if (index >= SMV_MAX_TARGETS || !st->target[index]) {
+				return [NSString stringWithFormat:@"%@: reads color attachment %u, which the pass does not have",
+				    fn.name, index];
+			}
+			res[out->nres++] = (struct smv_bind){ f->binding[i].internal, SMV_DESC_INPUT_ATTACHMENT,
+				st->target[index].handle, NULL };
+			break;
 		default:
 			return @"vertex inputs (stage_in attributes) are not implemented yet";
 		}
@@ -824,6 +835,7 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 
 @interface SMRenderEncoder : SMObject
 @property (nonatomic, strong) SMCommandBuffer *commandBuffer;
+- (void)setTarget:(SMTexture *)texture index:(unsigned)index;
 @end
 @implementation SMRenderEncoder {
 	SMRenderPipeline *_pipeline;
@@ -875,6 +887,12 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 	(void)lodMin;
 	(void)lodMax;
 	[self sampler:sampler index:index into:&_fragment];
+}
+- (void)setTarget:(SMTexture *)texture index:(unsigned)index
+{
+	if (index < SMV_MAX_TARGETS) {
+		_fragment.target[index] = texture;
+	}
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state
 {
@@ -1171,6 +1189,9 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 	}
 	SMRenderEncoder *e = [SMRenderEncoder new];
 	e.commandBuffer = self;
+	for (unsigned i = 0; i < n; ++i) {
+		[e setTarget:(SMTexture *)d.colorAttachments[i].texture index:i];
+	}
 	return (id<MTLRenderCommandEncoder>)e;
 }
 - (void)presentDrawable:(id<MTLDrawable>)drawable

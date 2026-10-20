@@ -43,8 +43,8 @@ main(int argc, char **argv)
 		ok++;
 		printf("  OK   %s kind %d, %zu bytes:", fn[i].name, fn[i].kind, fn[i].spirv_bytes);
 		for (unsigned b = 0; b < fn[i].bindings; ++b) {
-			static const char *const type[] = { "buffer", "texture", "sampler", "vertex-input" };
-			printf(" %s%d@%u", type[fn[i].binding[b].type & 3], (int)fn[i].binding[b].index, fn[i].binding[b].internal);
+			static const char *const type[] = { "buffer", "texture", "sampler", "vertex-input", "render-target", "?", "?", "?" };
+			printf(" %s%d@%u", type[fn[i].binding[b].type & 7], (int)fn[i].binding[b].index, fn[i].binding[b].internal);
 		}
 		printf("\n");
 		if (argc > 2) {

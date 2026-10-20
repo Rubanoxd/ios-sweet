@@ -24,6 +24,13 @@
  * kernel and pipeline builds its set layouts from the function's bindings
  * (struct smv_stage). Metal's y axis points up in clip space: the viewport
  * is flipped (negative height), as Indium does.
+ *
+ * Framebuffer reads ([[color(n)]] in a fragment function, Metal's
+ * programmable blending): input attachments on the pass's own color
+ * attachments through VK_KHR_dynamic_rendering_local_read, with
+ * VK_EXT_rasterization_order_attachment_access on such pipelines and a
+ * by-region barrier before each of their draws, for Metal's per-pixel
+ * ordering.
  */
 #include <dlfcn.h>
 #include <pthread.h>
@@ -94,6 +101,7 @@ struct smv_sampler {
 struct stage_layout {
 	VkDescriptorSetLayout layout;
 	int ubo;                /* binding 0 holds the buffer addresses */
+	int reads_targets;      /* has input attachments (framebuffer reads) */
 };
 
 struct smv_render_pipeline {
@@ -179,14 +187,22 @@ smv_open(const char *icd, char *name, size_t len)
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0,
 		.queueCount = 1, .pQueuePriorities = &prio };
-	VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+	VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT fro = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT,
+		.rasterizationOrderColorAttachmentAccess = VK_TRUE };
+	VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &fro,
+		.dynamicRenderingLocalRead = VK_TRUE };
+	const char *exts[] = { "VK_KHR_dynamic_rendering_local_read", "VK_EXT_rasterization_order_attachment_access" };
+	VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &flr,
 		.maintenance4 = VK_TRUE, .dynamicRendering = VK_TRUE };
 	VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 		.pNext = &f13, .bufferDeviceAddress = VK_TRUE };
 	VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12,
 		.features = { .shaderInt64 = VK_TRUE } };
 	VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2,
-		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
+		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 2,
+		.ppEnabledExtensionNames = exts };
 	VkDevice dev;
 	TRY(vkCreateDevice(pd, &dci, NULL, &dev));
 #define DLOAD(n) n = (PFN_##n)vkGetDeviceProcAddr(dev, #n);
@@ -308,6 +324,7 @@ static const VkDescriptorType kDescType[] = {
 	[SMV_DESC_SAMPLED_IMAGE] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
 	[SMV_DESC_STORAGE_IMAGE] = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 	[SMV_DESC_SAMPLER] = VK_DESCRIPTOR_TYPE_SAMPLER,
+	[SMV_DESC_INPUT_ATTACHMENT] = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
 };
 
 static int
@@ -316,14 +333,16 @@ stage_layout_new(const struct smv_stage *d, struct stage_layout *out)
 	VkDescriptorSetLayoutBinding b[32];
 	unsigned n = 0;
 	out->ubo = 0;
+	out->reads_targets = 0;
 	for (unsigned i = 0; d && i < d->count; ++i) {
-		if (d->bindings[i].type > SMV_DESC_SAMPLER || n == 32) {
+		if (d->bindings[i].type > SMV_DESC_INPUT_ATTACHMENT || n == 32) {
 			return fail("bad descriptor binding");
 		}
 		b[n++] = (VkDescriptorSetLayoutBinding){ .binding = d->bindings[i].binding,
 			.descriptorType = kDescType[d->bindings[i].type], .descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_ALL };
 		out->ubo |= d->bindings[i].type == SMV_DESC_UBO;
+		out->reads_targets |= d->bindings[i].type == SMV_DESC_INPUT_ATTACHMENT;
 	}
 	VkDescriptorSetLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.bindingCount = n, .pBindings = b };
@@ -592,9 +611,9 @@ stage_set(smv_cmd *c, const struct stage_layout *l, const struct smv_args *a, Vk
 	if (!c->sets) {
 		VkDescriptorPoolSize size[] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, CMD_SETS },
 			{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, CMD_SETS }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, CMD_SETS / 4 },
-			{ VK_DESCRIPTOR_TYPE_SAMPLER, CMD_SETS } };
+			{ VK_DESCRIPTOR_TYPE_SAMPLER, CMD_SETS }, { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, CMD_SETS } };
 		VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-			.maxSets = CMD_SETS, .poolSizeCount = 4, .pPoolSizes = size };
+			.maxSets = CMD_SETS, .poolSizeCount = 5, .pPoolSizes = size };
 		TRY(vkCreateDescriptorPool(sDev, &dpci, NULL, &c->sets));
 	}
 	if (c->nsets == CMD_SETS) {
@@ -635,7 +654,8 @@ stage_set(smv_cmd *c, const struct stage_layout *l, const struct smv_args *a, Vk
 				return fail("binding %u: no sampler bound", r->binding);
 			}
 			img[i] = (VkDescriptorImageInfo){ .sampler = r->sampler->sampler };
-		} else if (r->type == SMV_DESC_SAMPLED_IMAGE || r->type == SMV_DESC_STORAGE_IMAGE) {
+		} else if (r->type == SMV_DESC_SAMPLED_IMAGE || r->type == SMV_DESC_STORAGE_IMAGE ||
+		    r->type == SMV_DESC_INPUT_ATTACHMENT) {
 			if (!r->texture) {
 				return fail("binding %u: no texture bound", r->binding);
 			}
@@ -720,7 +740,7 @@ smv_texture_new(uint32_t width, uint32_t height, uint32_t format, uint32_t texel
 		.format = t->format, .extent = { width, height, 1 }, .mipLevels = 1, .arrayLayers = 1,
 		.samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
 		.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-		    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
 	VkResult r = vkCreateImage(sDev, &ici, NULL, &t->image);
 	if (r != VK_SUCCESS) {
@@ -906,6 +926,7 @@ smv_render_pipeline_new(const void *vertex_spirv, size_t vertex_bytes, const cha
 		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT, .minSampleShading = 1.0f };
 	VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
 	VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.flags = p->stage[1].reads_targets ? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT : 0,
 		.attachmentCount = count, .pAttachments = blend };
 	const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
 		VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE };
@@ -1004,6 +1025,13 @@ smv_cmd_draw(smv_cmd *c, smv_render_pipeline *p, uint32_t topology, const struct
 	}
 	int cls = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 :
 	    (topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) ? 1 : 2;
+	if (p->stage[1].reads_targets) {
+		/* earlier draws' color writes, visible to this draw's input attachment reads */
+		VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
+		vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+	}
 	vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe[cls]);
 	vkCmdSetPrimitiveTopology(c->cb, (VkPrimitiveTopology)topology);
 	vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets, 0, NULL);

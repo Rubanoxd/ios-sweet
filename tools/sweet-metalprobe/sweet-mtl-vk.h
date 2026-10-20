@@ -15,7 +15,7 @@ typedef struct smv_render_pipeline smv_render_pipeline;
 typedef struct smv_sampler smv_sampler;
 
 /* Descriptor bindings of one stage (Iridium's layout, sweet-iridium.h). */
-enum { SMV_DESC_UBO, SMV_DESC_SAMPLED_IMAGE, SMV_DESC_STORAGE_IMAGE, SMV_DESC_SAMPLER };
+enum { SMV_DESC_UBO, SMV_DESC_SAMPLED_IMAGE, SMV_DESC_STORAGE_IMAGE, SMV_DESC_SAMPLER, SMV_DESC_INPUT_ATTACHMENT };
 struct smv_binding {
 	uint32_t binding, type;
 };

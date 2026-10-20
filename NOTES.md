@@ -16,7 +16,8 @@ fill/copy verified on the phone as root and as mobile. Shaders: Metal kernels fr
 0 wrong. Rendering works too: textures, render pipelines (blending), render passes and draws; a triangle with a
 blended half-transparent veil renders correctly on the phone. Textures and samplers in shaders work (a PNG drawn
 with bound and constexpr samplers, 2852/2852 sample points right). Libraries translate per function. QuartzCore's
-default.metallib is AIR (141 functions); with tools/iridium-patches/0002 Iridium translates 97 (93 valid SPIR-V):
+default.metallib is AIR (141 functions); with tools/iridium-patches/0002-0003 Iridium translates 123 (119 valid SPIR-V;
+inlining pass, framebuffer reads via dynamic-rendering local read, verified on the phone):
 see JOYEUSE.md "QuartzCore" for the remaining gaps (framebuffer reads, inlining, imageblocks, control flow) and the
 path to backboardd GPU compositing. Mac USB network: `networksetup -setmanual "Sweet iOS (USB Ethernet)"
 192.168.7.1 255.255.255.0` (no sudo, persists) when the sudo usbnet script is not running.

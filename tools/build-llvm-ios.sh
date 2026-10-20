@@ -1,7 +1,9 @@
 #!/bin/sh
-# Cross-builds the few LLVM libraries the Metal plugin's AIR translator
-# (Darling's Iridium) needs: Core and BitReader with their C APIs and
-# dependencies; no targets, no tools; for iOS 16 arm64 with the Theos SDK.
+# Cross-builds the LLVM libraries the Metal plugin's AIR translator
+# (Darling's Iridium) needs: Core and BitReader with their C APIs, and ipo
+# for the always-inliner Iridium runs before translating (iridium-patches
+# 0003), with their dependencies; no targets, no tools; for iOS 16 arm64
+# with the Theos SDK.
 # LLVM 14 on purpose: AIR has typed pointers and Iridium reads pointee types
 # (LLVMGetElementType on pointers), which LLVM 17+ no longer has.
 # Layout next to this repo (outside git):
@@ -32,5 +34,6 @@ cmake -S "$src" -B "$build" -G Ninja \
 	-DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
 	-DLLVM_INCLUDE_TOOLS=OFF -DLLVM_INCLUDE_UTILS=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_DOCS=OFF \
 	-DLLVM_ENABLE_BINDINGS=OFF -DLLVM_ENABLE_OCAMLDOC=OFF -DLLVM_BUILD_UTILS=OFF -DCMAKE_MACOSX_BUNDLE=OFF
-ninja -C "$build" LLVMBitReader LLVMCore LLVMSupport LLVMBinaryFormat LLVMBitstreamReader LLVMRemarks LLVMDemangle
+ninja -C "$build" LLVMBitReader LLVMCore LLVMSupport LLVMBinaryFormat LLVMBitstreamReader LLVMRemarks LLVMDemangle \
+	LLVMipo
 ls -l "$build"/lib/libLLVM*.a

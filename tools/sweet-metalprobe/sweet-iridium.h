@@ -19,7 +19,10 @@ extern "C" {
 
 enum { SWEET_AIR_MAX_BINDINGS = 31 };
 enum sweet_air_kind { SWEET_AIR_VERTEX = 1, SWEET_AIR_FRAGMENT = 2, SWEET_AIR_KERNEL = 3 };
-enum sweet_air_binding { SWEET_AIR_BUFFER, SWEET_AIR_TEXTURE, SWEET_AIR_SAMPLER, SWEET_AIR_VERTEX_INPUT };
+/* RENDER_TARGET: a fragment function's [[color(n)]] argument (iridium-patches
+ * 0003), an input attachment reading color attachment n */
+enum sweet_air_binding { SWEET_AIR_BUFFER, SWEET_AIR_TEXTURE, SWEET_AIR_SAMPLER, SWEET_AIR_VERTEX_INPUT,
+	SWEET_AIR_RENDER_TARGET };
 
 struct sweet_air_function {
 	char name[128];

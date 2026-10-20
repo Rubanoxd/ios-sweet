@@ -12,7 +12,9 @@
  * a texture test: an image (PNG, decoded with ImageIO) uploaded with
  * replaceRegion, drawn with a bound linear sampler and blended by its
  * alpha over a background, plus a small copy at 60 % with a constexpr
- * sampler (written to /var/tmp/sweet-mtltest-texture.ppm).
+ * sampler (written to /var/tmp/sweet-mtltest-texture.ppm); a framebuffer
+ * read: a cleared target, a triangle that writes 1 - the color it reads from
+ * the attachment, and a second overlapping one that inverts again.
  * Every result is checked on the CPU.
  *   sweet-mtltest [LIB.metallib [IMAGE.png]]
  *   (defaults /var/jb/usr/share/sweet-mtltest.metallib and .png)
@@ -46,6 +48,7 @@ kernel(id<MTLDevice> device, id<MTLLibrary> lib, NSString *name)
 static void render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
 static void textured(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib, const char *png);
 static const char *gImage = "/var/jb/usr/share/sweet-mtltest.png";
+static void framebufferRead(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
 
 static void
 kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
@@ -110,6 +113,7 @@ kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
 	check(cb.status == MTLCommandBufferStatusCompleted && bad_u == 0, "square_add (integers, setBytes) on the GPU");
 	render(device, queue, lib);
 	textured(device, queue, lib, gImage);
+	framebufferRead(device, queue, lib);
 }
 
 struct vtx {
@@ -362,6 +366,62 @@ textured(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib, co
 	check(corner[0] > 130 && corner[0] < 150 && corner[1] > 70 && corner[1] < 85 && corner[2] < 5,
 	    "background clear color");
 	free(img);
+}
+
+static void
+framebufferRead(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+	const NSUInteger W = 64, H = 64;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	    width:W height:H mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	id<MTLTexture> tex = [device newTextureWithDescriptor:td];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"invert_fragment"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	NSError *error = nil;
+	id<MTLRenderPipelineState> invert = pd.fragmentFunction ? [device newRenderPipelineStateWithDescriptor:pd error:&error] : nil;
+	printf("framebuffer-read pipeline: %s\n", invert ? "OK" : (pd.fragmentFunction ? error.localizedDescription.UTF8String :
+	    "invert_fragment not translated"));
+	check(tex && invert, "framebuffer-read pipeline ([[color(0)]] argument)");
+	if (!tex || !invert) {
+		return;
+	}
+	/* left half and top-left quarter: one triangle covers x < 0 (whole height), the other y > 0 (whole width) */
+	const struct vtx a[3] = { { { -1, -1 }, { 0, 0 }, { 0, 0, 0, 1 } }, { { 0, -1 }, { 0, 0 }, { 0, 0, 0, 1 } },
+		{ { 0, 3 }, { 0, 0 }, { 0, 0, 0, 1 } } };
+	const struct vtx b[3] = { { { -1, 0 }, { 0, 0 }, { 0, 0, 0, 1 } }, { { 3, 0 }, { 0, 0 }, { 0, 0, 0, 1 } },
+		{ { -1, 1 }, { 0, 0 }, { 0, 0, 0, 1 } } };
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = tex;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1.0);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e setRenderPipelineState:invert];
+	[e setVertexBytes:a length:sizeof(a) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e setVertexBytes:b length:sizeof(b) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	static uint8_t px[64 * 64 * 4];
+	[tex getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+	/* RGBA at (x, y), y from the top. Draw a covers the band right of the line (-1,-1)-(0,3) and left of
+	 * x = 0; draw b the band above y = 0 and below the line (3,0)-(-1,1). (8,8): only b (inverted);
+	 * (8,56): only a (inverted); (24,24): both (inverted twice: the clear color); (56,56): none */
+	const uint8_t *onlyB = &px[(8 * W + 8) * 4], *onlyA = &px[(56 * W + 8) * 4], *both = &px[(24 * W + 24) * 4],
+	    *none = &px[(56 * W + 56) * 4];
+	printf("framebuffer read: status %lu %s; RGBA only-b %u,%u,%u only-a %u,%u,%u both %u,%u,%u none %u,%u,%u\n",
+	    (unsigned long)cb.status, cb.error.localizedDescription.UTF8String ?: "", onlyB[0], onlyB[1], onlyB[2],
+	    onlyA[0], onlyA[1], onlyA[2], both[0], both[1], both[2], none[0], none[1], none[2]);
+#define NEAR(p, r, g, bb) (abs((p)[0] - (r)) <= 2 && abs((p)[1] - (g)) <= 2 && abs((p)[2] - (bb)) <= 2)
+	check(cb.status == MTLCommandBufferStatusCompleted && NEAR(none, 64, 128, 191) && NEAR(onlyA, 191, 127, 64) &&
+	    NEAR(onlyB, 191, 127, 64) && NEAR(both, 64, 128, 191),
+	    "framebuffer read: inverted once where one draw covers, restored where both do");
 }
 
 int

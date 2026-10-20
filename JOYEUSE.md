@@ -595,11 +595,22 @@ QuartzCore (what backboardd would need), from the iOS 16.7 images:
   the plugin's own build translates the same 97 (2026-10-20), and
   sweet-mtltest still passes. Turnip has not compiled these yet (that
   happens at pipeline creation, once QuartzCore asks for them).
-  Still missing (44): framebuffer reads `[[color(n)]]` / air.render_target
-  (16; Turnip has dynamicRenderingLocalRead, the way to do it), calls to
-  non-inlined template functions (12; needs an LLVM inlining pass before
-  Iridium), imageblocks (4, tile shading), and control flow Iridium does
-  not structure (switch, loops/forward references, alloca: ~12).
+  `0003-inline-framebuffer-read.patch`: Iridium now runs LLVM's
+  always-inliner on each module (internal helper functions marked
+  alwaysinline; needs LLVMipo, also cross-built), reads `[[color(n)]]`
+  arguments as input attachments (SubpassData, InputAttachmentIndex n, read
+  with OpImageRead at (0,0)), and handles air.all/any: 123 of 141
+  translated, 119 valid. The runtime side of framebuffer reads:
+  VK_KHR_dynamic_rendering_local_read (the pass's color attachments are the
+  input attachments, images keep the GENERAL layout and get the
+  input-attachment usage) and VK_EXT_rasterization_order_attachment_access
+  on pipelines that read, plus a by-region barrier before each of their
+  draws. Verified on the phone (sweet-mtltest, root and mobile): a fragment
+  that writes 1 - [[color(0)]], drawn twice with overlap: inverted where one
+  draw covers, the clear color again where both do. Still missing (18): imageblocks (4, tile shading), texture
+  read/write/size queries (5), globals (2), and control flow Iridium does
+  not structure (switch, loops/forward references, alloca: ~7; 4 more
+  translate but fail "Selection must be structured").
 Path to GPU compositing: extend Iridium (intrinsics, half/i16, an LLVM
 inlining pass before translation), `newRenderPipelineStateWithName:`
 (pipeline library names -> our pipelines), IOSurface textures (surface

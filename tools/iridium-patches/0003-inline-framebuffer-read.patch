@@ -1,0 +1,173 @@
+--- a/include/iridium/iridium.hpp
++++ b/include/iridium/iridium.hpp
+@@ -21,6 +21,7 @@
+ 		Texture,
+ 		Sampler,
+ 		VertexInput,
++		RenderTarget,   // SWEET: [[color(n)]] read in a fragment function (an input attachment)
+ 	};
+ 
+ 	enum class TextureAccessType {
+--- a/private-include/iridium/dynamic-llvm.hpp
++++ b/private-include/iridium/dynamic-llvm.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <llvm-c/BitReader.h>
+ #include <llvm-c/Core.h>
++#include <llvm-c/Transforms/IPO.h>
+ 
+ #include <dlfcn.h>
+ 
+@@ -59,6 +60,19 @@
+ 
+ 		#define IRIDIUM_DYNAMICLLVM_FUNCTION_FOREACH(_macro) \
+ 			_macro(LLVMBasicBlockAsValue) \
++			_macro(LLVMGetFirstFunction) \
++			_macro(LLVMGetNextFunction) \
++			_macro(LLVMIsDeclaration) \
++			_macro(LLVMGetLinkage) \
++			_macro(LLVMGetModuleContext) \
++			_macro(LLVMGetEnumAttributeKindForName) \
++			_macro(LLVMCreateEnumAttribute) \
++			_macro(LLVMAddAttributeAtIndex) \
++			_macro(LLVMRemoveEnumAttributeAtIndex) \
++			_macro(LLVMCreatePassManager) \
++			_macro(LLVMAddAlwaysInlinerPass) \
++			_macro(LLVMRunPassManager) \
++			_macro(LLVMDisposePassManager) \
+ 			_macro(LLVMGetNumArgOperands) \
+ 			_macro(LLVMGetICmpPredicate) \
+ 			_macro(LLVMVectorType) \
+--- a/private-include/iridium/spirv.hpp
++++ b/private-include/iridium/spirv.hpp
+@@ -42,6 +42,7 @@
+ 			DescriptorSet = 34,
+ 			Offset = 35,
+ 					Flat = 14,
++					InputAttachmentIndex = 43,
+ 		};
+ 
+ 		enum class BuiltinID: uint32_t {
+@@ -86,6 +87,7 @@
+ 			Int16 = 22,
+ 			Int8 = 39,
+ 			PhysicalStorageBufferAddresses = 5347,
++					InputAttachment = 40,
+ 		};
+ 
+ 		struct Decoration {
+@@ -549,6 +551,7 @@
+ 			FUnordGreaterThanEqual = 191,
+ 			Not = 200,
+ 					CompositeConstruct = 80,
++					ImageRead = 98,
+ 		};
+ 
+ 		enum class GLSLOpcode: uint16_t {
+--- a/src/iridium/air.cpp
++++ b/src/iridium/air.cpp
+@@ -30,6 +30,30 @@
+ 
+ 	_module = LLVMSupport::Module(moduleRef, DynamicLLVM::LLVMDisposeModule);
+ 
++	// SWEET: the Metal compiler leaves helper functions (templates called by
++	// several entry points) out of line; Iridium translates one function, so
++	// inline every internal definition into it first.
++	{
++		auto ctx = DynamicLLVM::LLVMGetModuleContext(moduleRef);
++		auto always = DynamicLLVM::LLVMGetEnumAttributeKindForName("alwaysinline", sizeof("alwaysinline") - 1);
++		auto never = DynamicLLVM::LLVMGetEnumAttributeKindForName("noinline", sizeof("noinline") - 1);
++		bool any = false;
++		for (auto f = DynamicLLVM::LLVMGetFirstFunction(moduleRef); f; f = DynamicLLVM::LLVMGetNextFunction(f)) {
++			if (DynamicLLVM::LLVMIsDeclaration(f) || DynamicLLVM::LLVMGetLinkage(f) != LLVMInternalLinkage) {
++				continue;
++			}
++			DynamicLLVM::LLVMRemoveEnumAttributeAtIndex(f, LLVMAttributeFunctionIndex, never);
++			DynamicLLVM::LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex, DynamicLLVM::LLVMCreateEnumAttribute(ctx, always, 0));
++			any = true;
++		}
++		if (any) {
++			auto pm = DynamicLLVM::LLVMCreatePassManager();
++			DynamicLLVM::LLVMAddAlwaysInlinerPass(pm);
++			DynamicLLVM::LLVMRunPassManager(pm, moduleRef);
++			DynamicLLVM::LLVMDisposePassManager(pm);
++		}
++	}
++
+ 	_function = DynamicLLVM::LLVMGetNamedFunction(_module.get(), _name.c_str());
+ 
+ 	if (!_function) {
+@@ -410,6 +434,13 @@
+ 	if (op == "saturate" && count == 1) {
+ 		return builder.encodeGLSL(GLSLOpcode::FClamp, type, { args[0], sweetConstLike(builder, llvmType, 0), sweetConstLike(builder, llvmType, 1) });
+ 	}
++	if ((op == "all" || op == "any") && count == 1) {
++		auto argType = DynamicLLVM::LLVMTypeOf(DynamicLLVM::LLVMGetOperand(inst, 0));
++		if (DynamicLLVM::LLVMGetTypeKind(argType) != LLVMVectorTypeKind) {
++			return builder.encodeOp(Opcode::CopyObject, type, { args[0] });
++		}
++		return builder.encodeOp(op == "all" ? Opcode::All : Opcode::Any, type, { args[0] });
++	}
+ 	if (op == "dot" && count == 2) {
+ 		return builder.encodeArithBinop(Opcode::Dot, type, args[0], args[1]);
+ 	}
+@@ -1230,6 +1261,59 @@
+ 
+ 			++internalBindingIndex;
+ 		}
++	}
++
++	// SWEET: framebuffer reads ([[color(n)]] arguments of fragment functions):
++	// input attachments, read once at the start of the function
++	for (size_t i = 0; i < parameterOperands.size(); ++i) {
++		std::vector<LLVMValueRef> parameterInfo(DynamicLLVM::LLVMGetMDNodeNumOperands(parameterOperands[i]));
++		DynamicLLVM::LLVMGetMDNodeOperands(parameterOperands[i], parameterInfo.data());
++		if (llvmMDStringToStringView(parameterInfo[1]) != "air.render_target" || funcInfo.type != FunctionType::Fragment) {
++			continue;
++		}
++		auto argIndex = DynamicLLVM::LLVMConstIntGetZExtValue(parameterInfo[0]);
++		auto attachment = static_cast<uint32_t>(DynamicLLVM::LLVMConstIntGetZExtValue(parameterInfo[2]));
++		auto llparam = DynamicLLVM::LLVMGetParam(_function, argIndex);
++		auto paramType = DynamicLLVM::LLVMTypeOf(llparam);
++
++		builder.requireCapability(SPIRV::Capability::InputAttachment);
++		auto imageType = builder.declareType(SPIRV::Type(SPIRV::Type::ImageTag {}, floatType, floatType, SPIRV::Dim::eSubpassData, 0, false, false, 2, SPIRV::ImageFormat::Unknown));
++		auto imagePtrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::UniformConstant, imageType, 8));
++		auto var = builder.addGlobalVariable(imagePtrType, SPIRV::StorageClass::UniformConstant);
++		builder.addDecoration(var, SPIRV::Decoration { SPIRV::DecorationType::DescriptorSet, { 1u } });
++		builder.addDecoration(var, SPIRV::Decoration { SPIRV::DecorationType::Binding, { static_cast<uint32_t>(internalBindingIndex) } });
++		builder.addDecoration(var, SPIRV::Decoration { SPIRV::DecorationType::InputAttachmentIndex, { attachment } });
++		builder.referenceGlobalVariable(var);
++		funcInfo.bindings.push_back(BindingInfo { BindingType::RenderTarget, attachment, internalBindingIndex, TextureAccessType::Read, SIZE_MAX });
++		++internalBindingIndex;
++
++		auto image = builder.encodeLoad(imageType, var);
++		auto ivec2Type = builder.declareType(SPIRV::Type(SPIRV::Type::VectorTag {}, 2, intType, 8, 8));
++		auto zero = builder.declareConstantScalar<int32_t>(0);
++		auto origin = builder.declareConstantComposite(ivec2Type, { zero, zero });
++		SPIRV::ResultID value = builder.encodeOp(SPIRV::Opcode::ImageRead, vec4Type, { image, origin });
++		auto type = llvmTypeToSPIRVType(builder, paramType);
++		if (type != vec4Type) {
++			// half4, float, float2...: shape and width of the argument
++			auto kindOf = DynamicLLVM::LLVMGetTypeKind(paramType);
++			auto elem = kindOf == LLVMVectorTypeKind ? DynamicLLVM::LLVMGetElementType(paramType) : paramType;
++			unsigned n = kindOf == LLVMVectorTypeKind ? DynamicLLVM::LLVMGetVectorSize(paramType) : 1;
++			if (n == 1) {
++				value = builder.encodeCompositeExtract(floatType, value, { 0 });
++			} else if (n != 4) {
++				std::vector<uint32_t> lanes;
++				for (unsigned k = 0; k < n; ++k) {
++					lanes.push_back(k);
++				}
++				auto vecType = builder.declareType(SPIRV::Type(SPIRV::Type::VectorTag {}, n, floatType, 4 * n, n == 2 ? 8 : 16));
++				value = builder.encodeVectorShuffle(vecType, value, value, lanes);
++			}
++			if (DynamicLLVM::LLVMGetTypeKind(elem) == LLVMHalfTypeKind) {
++				value = builder.encodeFConvert(type, value);
++			}
++		}
++		builder.associateExistingResultID(value, reinterpret_cast<uintptr_t>(llparam));
++		builder.setResultType(value, type);
+ 	}
+ 
+ 	// assign an ID to each block
