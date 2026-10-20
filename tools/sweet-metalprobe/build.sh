@@ -7,7 +7,8 @@
 # The device needs Turnip at /var/jb/usr/lib/libvulkan_freedreno.dylib.
 #   tools/sweet-metalprobe/build.sh [OUTDIR]
 # Also builds into OUTDIR: sweet-mtlquery (what MTLCreateSystemDefaultDevice
-# returns), sweet-mtltest (the client test) with sweet-mtltest.metallib, and
+# returns), sweet-mtltest (the client test) with sweet-mtltest.metallib,
+# sweet-carender (QuartzCore's CARenderer on the device), and
 # sweet-air2spv (Iridium on the phone). The metallib needs Apple's metal
 # compiler: $METAL, or the MetalToolchain asset of this Mac, mounted at
 # ../../../metal-toolchain. Install: OUTDIR/SweetMetalProbe.bundle into
@@ -54,6 +55,9 @@ codesign -f -s - "$out/sweet-mtlquery"
 $cc -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics \
 	-framework ImageIO -framework IOSurface sweet-mtltest.m -o "$out/sweet-mtltest"
 codesign -f -s - "$out/sweet-mtltest"
+$cc -fobjc-arc -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics \
+	sweet-carender.m -o "$out/sweet-carender"
+codesign -f -s - "$out/sweet-carender"
 $cc -c sweet-air2spv.c -o "$tmp/air2spv.o"
 clang++ -target arm64-apple-ios16.0 -isysroot "$sdk" "$tmp/air2spv.o" $iridium $llvm -o "$out/sweet-air2spv"
 codesign -f -s - "$out/sweet-air2spv"

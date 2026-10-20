@@ -56,10 +56,87 @@ smError(NSString *why)
 @interface SMObject : NSObject
 @property (atomic, copy) NSString *label;
 @end
+/*
+ * Selectors a Metal protocol of the object declares but this file does not
+ * implement yet: rather than the usual exception, they answer zero/nil and
+ * are logged once each ("stubbed"), so a client like QuartzCore runs on and
+ * one run names every gap. The type encoding comes from the protocol.
+ */
+static const char *
+protocolTypes(Class cls, SEL sel)
+{
+	for (Class c = cls; c; c = class_getSuperclass(c)) {
+		unsigned n = 0;
+		Protocol *__unsafe_unretained *list = class_copyProtocolList(c, &n);
+		for (unsigned i = 0; i < n; ++i) {
+			for (int required = 1; required >= 0; --required) {
+				struct objc_method_description d = protocol_getMethodDescription(list[i], sel, required, YES);
+				if (d.types) {
+					free(list);
+					return d.types;
+				}
+			}
+			/* protocols the protocol adopts (MTLResource, MTLCommandEncoder, ...) */
+			unsigned m = 0;
+			Protocol *__unsafe_unretained *inner = protocol_copyProtocolList(list[i], &m);
+			for (unsigned k = 0; k < m; ++k) {
+				for (int required = 1; required >= 0; --required) {
+					struct objc_method_description d = protocol_getMethodDescription(inner[k], sel, required, YES);
+					if (d.types) {
+						free(inner);
+						free(list);
+						return d.types;
+					}
+				}
+			}
+			free(inner);
+		}
+		free(list);
+	}
+	return NULL;
+}
+
+static NSMutableSet *gStubbed;
+
+static void
+stubbed(id self, NSInvocation *inv)
+{
+	NSString *key = [NSString stringWithFormat:@"%s -%s", class_getName(object_getClass(self)),
+	    sel_getName(inv.selector)];
+	@synchronized ([NSObject class]) {
+		if (!gStubbed) {
+			gStubbed = [NSMutableSet set];
+		}
+		if (![gStubbed containsObject:key]) {
+			[gStubbed addObject:key];
+			sweet_metal_log("stubbed %s", key.UTF8String);
+		}
+	}
+	NSUInteger len = inv.methodSignature.methodReturnLength;
+	if (len) {
+		void *zero = calloc(1, len);
+		[inv setReturnValue:zero];
+		free(zero);
+	}
+}
+
 @implementation SMObject
 - (id<MTLDevice>)device
 {
 	return gDevice;
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	NSMethodSignature *sig = [super methodSignatureForSelector:selector];
+	if (!sig) {
+		const char *types = protocolTypes(object_getClass(self), selector);
+		sig = types ? [NSMethodSignature signatureWithObjCTypes:types] : nil;
+	}
+	return sig;
+}
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	stubbed(self, inv);
 }
 - (void)doesNotRecognizeSelector:(SEL)selector
 {
@@ -357,6 +434,7 @@ newLibrary(NSData *data, NSError **error)
 
 @interface SMQueue : SMObject
 @property (nonatomic, strong) dispatch_queue_t serial;
+@property (atomic, strong) dispatch_queue_t submissionQueue, completionQueue;   /* SPI, kept, not used */
 @end
 
 @interface SMBlitEncoder : SMObject
@@ -617,6 +695,13 @@ writeMask(MTLColorWriteMask m)
 {
 	return 0;
 }
+@end
+
+/* ---- depth/stencil states: kept; passes have no depth/stencil attachments yet ---- */
+@interface SMDepthStencil : SMObject
+@property (nonatomic) BOOL active;      /* tests or writes depth or stencil */
+@end
+@implementation SMDepthStencil
 @end
 
 /* ---- sampler states ---- */
@@ -1011,9 +1096,22 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state
 {
-	if (state) {
-		[_commandBuffer refuse:@"render: depth/stencil is not implemented yet"];
+	if ([(id)state isKindOfClass:[SMDepthStencil class]] && ((SMDepthStencil *)state).active) {
+		static int logged;
+		if (logged++ < 4) {
+			sweet_metal_log("depth/stencil state with tests ignored (no depth/stencil attachments yet)");
+		}
 	}
+}
+- (void)setStencilReferenceValue:(uint32_t)value
+{
+	(void)value;
+}
+- (void)setDepthBias:(float)bias slopeScale:(float)scale clamp:(float)clamp
+{
+	(void)bias;
+	(void)scale;
+	(void)clamp;
 }
 - (void)setScissorRect:(MTLScissorRect)rect
 {
@@ -1420,6 +1518,7 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		{ [SMRenderEncoder class], "MTLRenderCommandEncoder" },
 		{ [SMRenderEncoder class], "MTLRenderCommandEncoderSPI" },
 		{ [SMSampler class], "MTLSamplerState" }, { [SMSampler class], "MTLSamplerStateSPI" },
+		{ [SMDepthStencil class], "MTLDepthStencilState" }, { [SMDepthStencil class], "MTLDepthStencilStateSPI" },
 	};
 	for (size_t i = 0; i < sizeof(conform) / sizeof(conform[0]); ++i) {
 		Protocol *p = objc_getProtocol(conform[i].protocol);
@@ -1514,6 +1613,19 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 {
 	sweet_metal_log("missing device -%s", sel_getName(selector));
 	[super doesNotRecognizeSelector:selector];
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector
+{
+	NSMethodSignature *sig = [super methodSignatureForSelector:selector];
+	if (!sig) {
+		const char *types = protocolTypes(object_getClass(self), selector);
+		sig = types ? [NSMethodSignature signatureWithObjCTypes:types] : nil;
+	}
+	return sig;
+}
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	stubbed(self, inv);
 }
 - (id<MTLCommandQueue>)newCommandQueue
 {
@@ -1696,6 +1808,14 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	t.usage = d.usage;
 	t.options = d.resourceOptions;
 	return (id<MTLTexture>)t;
+}
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d
+{
+	SMDepthStencil *st = [SMDepthStencil new];
+	st.label = d.label;
+	st.active = d.depthCompareFunction != MTLCompareFunctionAlways || d.depthWriteEnabled ||
+	    d.frontFaceStencil != nil || d.backFaceStencil != nil;
+	return (id<MTLDepthStencilState>)st;
 }
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
 {
