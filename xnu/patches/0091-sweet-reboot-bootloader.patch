@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_reboot.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,194 @@
 +/*
 + * SWEET: reboot straight into the bootloader's Fastboot mode, so a new test
 + * kernel can be booted without anyone holding Power + Volume down:
@@ -22,7 +22,7 @@
 + * PMIC. So this does what MIUI's msm-poweroff + qpnp-power-on do for
 + * "reboot bootloader" (the stock DT: restart@c264000 qcom,pshold, pm6150
 + * power-on@800 qcom,system-reset):
-+ *  1. PON SOFT_RB_SPARE (0x88f) bits 7:1 = PON_RESTART_REASON_BOOTLOADER (1)
++ *  1. PON SOFT_RB_SPARE (0x88f) bits 7:1 = bootloader reason (2)
 + *  2. PS_HOLD reset type = warm reset (PS_HOLD_RST_CTL 0x85a = 1, with the
 + *     enable bit in PS_HOLD_RST_CTL2 0x85b dropped around the change), so the
 + *     PMIC keeps the reason
@@ -159,7 +159,9 @@
 +	printf("SWEET: rebooting into Fastboot\n");
 +	delay(200000);                          /* each step's line must reach the USB log */
 +	if (rb_spmi_init()) {
-+		(void)rb_spmi_rmw(PON_SOFT_RB_SPARE, 0xfe, 1u << 1);    /* BOOTLOADER */
++		/* reason << 1; pm6150.dtsi: mode-bootloader 2, mode-recovery 1
++		 * (writing 1 rebooted into MIUI Recovery) */
++		(void)rb_spmi_rmw(PON_SOFT_RB_SPARE, 0xfe, 2u << 1);
 +		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL2, 0x80, 0x00);
 +		delay(1000);                                    /* >= 10 sleep-clock cycles */
 +		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL, 0x0f, 0x01);     /* warm reset */
