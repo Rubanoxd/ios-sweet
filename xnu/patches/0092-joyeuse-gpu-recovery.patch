@@ -1,0 +1,261 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1284,38 +1284,12 @@
+ 	}
+ }
+ 
+-static bool
+-gpu_stage_cp(vm_offset_t smmu)
++static bool gpu_zap_ok;
++
++static void
++gpu_hw_init(void)
+ {
+-	gpu_core = ml_io_map(0x05000000u, 0x40000);
+-	uint8_t *sqe = NULL;
+-	size_t sqe_len = 0;
+-	if (!gpu_core || gpu_load_file("/usr/share/firmware/joyeuse/gpu/a630_sqe.fw", &sqe, &sqe_len)) {
+-		return false;
+-	}
+-	/* adreno_fw_create_bo drops the first dword; a6xx_ucode_check_version
+-	 * wants a630 microcode >= 0x190 (or a patched one). */
+-	uint32_t ver = *(const uint32_t *)(sqe + 4);
+-	gpu_log("a630_sqe.fw: %zu bytes, version 0x%03x", sqe_len, ver & 0xfff);
+-	if (sqe_len - 4 > 0x8000 || ((ver & 0xfff) < 0x190 && !((ver & 0xf) == 0xa))) {
+-		kfree_data(sqe, sqe_len);
+-		return false;
+-	}
+-	if (kmem_alloc_contig(kernel_map, &gfx_mem, GMU_TABLES + GFX_MEM_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		kfree_data(sqe, sqe_len);
+-		return false;
+-	}
+-	gfx_mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gfx_mem));
+-	memcpy((void *)(gfx_mem + GMU_TABLES + GFX_SQE_OFF), sqe + 4, sqe_len - 4);
+-	kfree_data(sqe, sqe_len);
+-	gpu_gfx_tables();
+-	flush_dcache64((addr64_t)gfx_mem_pa, GMU_TABLES + GFX_MEM_SIZE, TRUE);
+-	if (!gpu_smmu_bank(smmu, SMMU_GFX_IDX, SMMU_GFX_SID, gfx_mem_pa)) {
+-		return false;
+-	}
+-
+-	/* hw_init (a6xx_gpu.c) for a618: no hwcg, CP protect or UBWC yet. */
++	/* hw_init (a6xx_gpu.c) for a618: no hwcg or CP protect yet. */
+ 	core_wr(0x3c45, 0);                       /* GBIF_HALT */
+ 	(void)core_rd(0x3c45);
+ 	core_wr(0x0016, 0);                       /* RBBM_GBIF_HALT */
+@@ -1354,6 +1328,12 @@
+ 	core_wr(0x0534, 0);                       /* RBBM_NC_MODE_CNTL */
+ 	core_wr(0x0038, 0);                       /* RBBM_INT_0_MASK: polled */
+ 
++}
++
++/* SQE microcode, ring, CP start and a6xx_cp_init. */
++static bool
++gpu_cp_start(const char *what)
++{
+ 	core_wr64(0x0830, GFX_IOVA + GFX_SQE_OFF);   /* CP_SQE_INSTR_BASE */
+ 	core_wr64(0x0800, GFX_IOVA + GFX_RB_OFF);    /* CP_RB_BASE */
+ 	core_wr(0x0802, 12u | (2u << 8) | (1u << 27));  /* CP_RB_CNTL: 32 KiB, NO_UPDATE */
+@@ -1368,7 +1348,43 @@
+ 	for (unsigned i = 0; i < 5; ++i) {
+ 		rb_out(0);
+ 	}
+-	if (!rb_kick("cp me_init")) {
++	return rb_kick(what);
++
++}
++
++static bool
++gpu_stage_cp(vm_offset_t smmu)
++{
++	gpu_core = ml_io_map(0x05000000u, 0x40000);
++	uint8_t *sqe = NULL;
++	size_t sqe_len = 0;
++	if (!gpu_core || gpu_load_file("/usr/share/firmware/joyeuse/gpu/a630_sqe.fw", &sqe, &sqe_len)) {
++		return false;
++	}
++	/* adreno_fw_create_bo drops the first dword; a6xx_ucode_check_version
++	 * wants a630 microcode >= 0x190 (or a patched one). */
++	uint32_t ver = *(const uint32_t *)(sqe + 4);
++	gpu_log("a630_sqe.fw: %zu bytes, version 0x%03x", sqe_len, ver & 0xfff);
++	if (sqe_len - 4 > 0x8000 || ((ver & 0xfff) < 0x190 && !((ver & 0xf) == 0xa))) {
++		kfree_data(sqe, sqe_len);
++		return false;
++	}
++	if (kmem_alloc_contig(kernel_map, &gfx_mem, GMU_TABLES + GFX_MEM_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		kfree_data(sqe, sqe_len);
++		return false;
++	}
++	gfx_mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gfx_mem));
++	memcpy((void *)(gfx_mem + GMU_TABLES + GFX_SQE_OFF), sqe + 4, sqe_len - 4);
++	kfree_data(sqe, sqe_len);
++	gpu_gfx_tables();
++	flush_dcache64((addr64_t)gfx_mem_pa, GMU_TABLES + GFX_MEM_SIZE, TRUE);
++	if (!gpu_smmu_bank(smmu, SMMU_GFX_IDX, SMMU_GFX_SID, gfx_mem_pa)) {
++		return false;
++	}
++
++	gpu_hw_init();
++	if (!gpu_cp_start("cp me_init")) {
+ 		gpu_smmu_faults(smmu, SMMU_GFX_IDX);
+ 		return false;
+ 	}
+@@ -1378,6 +1394,7 @@
+ 	int zap = 1;
+ 	PE_parse_boot_argn("sweetgpuzap", &zap, sizeof(zap));
+ 	if (zap && gpu_zap_load()) {
++		gpu_zap_ok = true;
+ 		rb_pkt7(CP_SET_SECURE_MODE, 1);
+ 		rb_out(0);
+ 		if (!rb_kick("cp set_secure_mode 0")) {
+@@ -1835,41 +1852,119 @@
+ 	}
+ }
+ 
+-uint64_t
+-sweet_gpu_timestamp(void)
++/* The GMU's always-on counter (19.2 MHz, CX: readable with GX off).
++ * CP_ALWAYS_ON_COUNTER read the same value every time on hardware. */
++static uint64_t
++gmu_always_on(void)
+ {
+-	if (!gpu_ready) {
+-		return 0;
+-	}
+-	lck_mtx_lock(gpu_mtx);
+-	if (!gpu_ensure_gx("timestamp")) {
+-		lck_mtx_unlock(gpu_mtx);
+-		return 0;
+-	}
+ 	uint32_t hi, lo;
+ 	do {
+-		hi = core_rd(0x0981);
+-		lo = core_rd(0x0980);                     /* CP_ALWAYS_ON_COUNTER */
+-	} while (hi != core_rd(0x0981));
+-	lck_mtx_unlock(gpu_mtx);
++		hi = gpu_rd(sg.gmu, GMU_REG(0x5089));
++		lo = gpu_rd(sg.gmu, GMU_REG(0x5088));
++	} while (hi != gpu_rd(sg.gmu, GMU_REG(0x5089)));
+ 	return ((uint64_t)hi << 32) | lo;
+ }
+ 
+ uint64_t
++sweet_gpu_timestamp(void)
++{
++	return gpu_ready ? gmu_always_on() : 0;
++}
++
++uint64_t
+ sweet_gpu_faults(void)
+ {
+ 	return gpu_fault_count;
+ }
+ 
+-/* Logs every change of the GX/GMU power state for the first ten minutes. */
++/*
++ * Hang recovery, lighter than Linux's a6xx_recover (which power-cycles CX
++ * and reboots the GMU): halt the SQE, drain the GBIF
++ * (a6xx_bus_clear_pending_transactions), pulse RBBM_SW_RESET_CMD
++ * (a6xx_gpu_sw_reset), then hw_init, the CP start and the secure-mode exit
++ * again. The GMU and the SMMU tables stay. Every job in flight is retired
++ * as lost and the fault count moves, which Turnip reports as device lost.
++ * Called with gpu_mtx held.
++ */
++static uint64_t gpu_recoveries;
++
++static bool
++gpu_recover(const char *why)
++{
++	gpu_log("recover (%s): rptr %u wptr %u rbbm_status 0x%08x int0 0x%08x cp_hw_fault 0x%08x "
++	    "cp_int 0x%08x, fence %u of %u", why, core_rd(0x0806), rb_wptr, core_rd(0x0210),
++	    core_rd(0x0201), core_rd(0x0821), core_rd(0x0823), sweet_gpu_retired(), gpu_seqno);
++	gpu_smmu_faults(gfx_smmu, SMMU_GFX_IDX);
++	core_wr(0x0808, 3);                           /* CP_SQE_CNTL: halt */
++	core_wr(0x0016, 1);                           /* RBBM_GBIF_HALT: GX side */
++	bool drained = gpu_wait(gpu_core, 0x0017 << 2, 1, 1, 1000);
++	core_wr(0x3c45, 1);                           /* GBIF_HALT: client requests */
++	drained &= gpu_wait(gpu_core, 0x3c46 << 2, 1, 1, 1000);
++	core_wr(0x3c45, 2);                           /* GBIF_HALT: AXI arbiter */
++	drained &= gpu_wait(gpu_core, 0x3c46 << 2, 2, 2, 1000);
++	core_wr(0x3c45, 0);
++	core_wr(0x0043, 1);                           /* RBBM_SW_RESET_CMD */
++	(void)core_rd(0x0043);
++	delay(100);
++	core_wr(0x0043, 0);
++	(void)core_rd(0x0043);
++	delay(1);
++	gpu_hw_init();
++	gpu_irq.err_status = 0;
++	gpu_irq.mask = RBBM_INT_MASK;
++	core_wr(0x0037, 0xffffffffu);                 /* RBBM_INT_CLEAR_CMD */
++	core_wr(0x0038, gpu_irq.mask);
++	bool ok = gpu_cp_start("recover: cp me_init");
++	if (ok && gpu_zap_ok) {
++		rb_pkt7(CP_SET_SECURE_MODE, 1);
++		rb_out(0);
++		ok = rb_kick("recover: set_secure_mode 0");
++	}
++	*(volatile uint32_t *)(gfx_mem + GMU_TABLES + GPU_FENCE_OFF) = gpu_seqno;
++	flush_dcache64((addr64_t)(gfx_mem_pa + GMU_TABLES + GPU_FENCE_OFF), 64, TRUE);
++	gpu_fault_count++;
++	gpu_recoveries++;
++	if (gpu_irq.storm) {
++		gpu_irq.storm = false;
++		sweet_irq_enable(GPU_INTID, true);
++	}
++	thread_wakeup(&gpu_irq_chan);
++	gpu_log("recover #%llu: GBIF %s, %s", gpu_recoveries, drained ? "drained" : "did not drain",
++	    ok ? "GPU running again" : "FAILED, GPU disabled");
++	if (!ok) {
++		gpu_ready = false;
++	}
++	return ok;
++}
++
++/* Once a second, forever: recovers a GPU that reported an error or made no
++ * progress on a pending job for 3 s, and logs every change of the GX/GMU
++ * power state for the first ten minutes. */
+ static void
+ gpu_gx_watch(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint32_t last = ~0u;
+-	for (unsigned i = 0; i < 600; ++i) {
++	uint32_t last = ~0u, wd_last = 0, wd_stuck = 0;
++	for (unsigned i = 0; gpu_ready; ++i) {
++		lck_mtx_lock(gpu_mtx);
++		uint32_t retired = sweet_gpu_retired();
++		bool pending = gpu_seqno != retired;
++		if (gpu_gx_on() && gpu_irq.err_status) {
++			gpu_report_errors("watchdog");
++			(void)gpu_recover("GPU error interrupt");
++			wd_stuck = 0;
++		} else if (pending && retired == wd_last && ++wd_stuck >= 3) {
++			if (gpu_ensure_gx("watchdog")) {
++				(void)gpu_recover("no progress for 3 s");
++			}
++			wd_stuck = 0;
++		} else if (!pending || retired != wd_last) {
++			wd_stuck = 0;
++		}
++		wd_last = sweet_gpu_retired();
++		lck_mtx_unlock(gpu_mtx);
+ 		uint32_t gx = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), rpmh = gpu_rd(sg.gmu, GMU_REG(0x50ec));
+ 		uint32_t key = (gx & GDSC_PWR_ON) | (rpmh & 0xff);
+-		if (key != last) {
++		if (i < 600 && key != last) {
+ 			gpu_log("watch t+%us: gx_gdscr 0x%08x rpmh_state 0x%08x sptprac 0x%08x gmu2host 0x%08x "
+ 			    "ao_int 0x%08x", i, gx, rpmh, gpu_rd(sg.gmu, GMU_REG(0x50d0)),
+ 			    gpu_rd(sg.gmu, GMU_REG(0x5192)), gpu_rd(sg.gmu, GMU_REG(0x9305)));
+@@ -1900,6 +1995,10 @@
+ 	gfx_l2_pa[0] = gfx_mem_pa + 0x1000;
+ 	gfx_l3_va[0][(GFX_IOVA >> 21) & 0x1ff] = gfx_mem + 0x2000;
+ 	gfx_l3_pa[0][(GFX_IOVA >> 21) & 0x1ff] = gfx_mem_pa + 0x2000;
++	uint64_t cp0 = ((uint64_t)core_rd(0x0981) << 32) | core_rd(0x0980), ao0 = gmu_always_on();
++	delay(1000);
++	uint64_t cp1 = ((uint64_t)core_rd(0x0981) << 32) | core_rd(0x0980), ao1 = gmu_always_on();
++	gpu_log("counters over 1 ms: CP always-on %llu -> %llu, GMU always-on %llu -> %llu", cp0, cp1, ao0, ao1);
+ 	gpu_seqno = sweet_gpu_retired();
+ 	gpu_ready = true;
+ 	thread_t watcher;

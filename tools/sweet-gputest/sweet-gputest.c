@@ -6,8 +6,10 @@
  * CP_MEM_WRITE, submit, wait for the fence, check the value; then a burst of
  * submissions to time the fences. Run as root on the phone.
  *
- *   sweet-gputest [JOBS [notime] [slow]]   default 200 jobs in the burst;
- *       notime skips GetTimestamp, slow announces every call and pauses 1 s
+ *   sweet-gputest [JOBS [notime] [slow] [hang]]   default 200 jobs in the
+ *       burst; notime skips GetTimestamp, slow announces every call and
+ *       pauses 1 s, hang then submits a job that never ends and checks the
+ *       kernel recovers the GPU (fault count moves, a new job runs)
  *
  * Built without an iOS SDK (tools/sweet-gputest/build.sh): IOKit is reached
  * through dlopen/dlsym; the ABI header is the kernel's
@@ -155,12 +157,14 @@ int
 main(int argc, const char **argv)
 {
 	unsigned jobs = argc > 1 ? (unsigned)atoi(argv[1]) : 200;
-	int timestamps = 1;
+	int timestamps = 1, hang = 0;
 	for (int i = 2; i < argc; ++i) {
 		if (argv[i][0] == 'n') {
 			timestamps = 0;          /* notime */
 		} else if (argv[i][0] == 's') {
 			slow = 1;                /* slow */
+		} else if (argv[i][0] == 'h') {
+			hang = 1;                /* hang */
 		}
 	}
 	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
@@ -272,8 +276,46 @@ main(int argc, const char **argv)
 	NativeAdrenoAbiStatus st = { 0, 0 };
 	call(NativeAdrenoMethodGetStatus, 0, 0, &st, sizeof(st));
 	uint32_t last_value = data.cpu[1];       /* before the close unmaps it */
+	int recovered = 1;
+	if (hang) {
+		/* CP_WAIT_MEM_GTE on data[2] (0) for 0x7fffffff: the CP waits forever. */
+		data.cpu[2] = 0;
+		ib.cpu[128] = pkt7(0x14, 4);
+		ib.cpu[129] = 0;
+		ib.cpu[130] = (uint32_t)(data.iova + 8);
+		ib.cpu[131] = (uint32_t)((data.iova + 8) >> 32);
+		ib.cpu[132] = 0x7fffffffu;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		NativeAdrenoAbiStatus s0 = { 0, 0 }, s1 = { 0, 0 };
+		call(NativeAdrenoMethodGetStatus, 0, 0, &s0, sizeof(s0));
+		s.buffers[0].iova = ib.iova + 4 * 128;
+		s.buffers[0].bytes = 20;
+		kr = call(NativeAdrenoMethodSubmit, &s, sizeof(s), &sr, sizeof(sr));
+		uint64_t h0 = mach_absolute_time();
+		NativeAdrenoAbiWaitFence hw = { sr.fence, 10000000000ull };
+		kern_return_t hk = call(NativeAdrenoMethodWaitFence, &hw, sizeof(hw), 0, 0);
+		uint64_t h1 = mach_absolute_time();
+		call(NativeAdrenoMethodGetStatus, 0, 0, &s1, sizeof(s1));
+		printf("hang: submit 0x%x fence %llu, wait 0x%x after %llu ms, faults %llu -> %llu\n", kr, sr.fence,
+		    hk, (h1 - h0) / 19200, s0.faults, s1.faults);
+		/* and the GPU works again */
+		data.cpu[0] = 0;
+		ib.cpu[0] = pkt7(0x3d, 3);
+		ib.cpu[1] = (uint32_t)data.iova;
+		ib.cpu[2] = (uint32_t)(data.iova >> 32);
+		ib.cpu[3] = 0x0bacf00du;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		s.buffers[0].iova = ib.iova;
+		s.buffers[0].bytes = 16;
+		kr = call(NativeAdrenoMethodSubmit, &s, sizeof(s), &sr, sizeof(sr));
+		w.fence = sr.fence;
+		kern_return_t ak = call(NativeAdrenoMethodWaitFence, &w, sizeof(w), 0, 0);
+		recovered = hk == 0 && s1.faults > s0.faults && ak == 0 && data.cpu[0] == 0x0bacf00du;
+		printf("after recovery: submit 0x%x wait 0x%x, GPU wrote 0x%08x (want 0x0bacf00d): %s\n", kr, ak,
+		    data.cpu[0], recovered ? "RECOVERED" : "NOT RECOVERED");
+	}
 	printf("burst: %u jobs, wait 0x%x, last value %u, %u busy retries, %llu us; gpu clock %llu -> %llu, "
 	    "faults %llu\n", jobs, kr, last_value, busy, ticks * 10 / 192, t0.ticks, t1.ticks, st.faults);
 	IOServiceClose(conn);
-	return got == 0x600df00du && last_value == jobs ? 0 : 2;
+	return got == 0x600df00du && last_value == jobs && recovered ? 0 : 2;
 }
