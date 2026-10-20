@@ -740,6 +740,22 @@ So the order is:
    then watch SMP2P (items 435 in / 428 out) and the SSR reason (item 421).
    `sweetwlan=1` only reads SMEM (0x80900000), cmd-db, the AOP QMP
    descriptor (0xc300000) and PAS support.
+   **Verified on the phone (2026-10-21, xnu 0097 at 2e01cf7, CI 39505303242,
+   shim `shim-boot-joyeuse-wlan2.img`): THE MODEM BOOTS.** AOP QMP opens
+   and consumes `load_state`; cx.lvl / mss.lvl ACTIVE votes at hlvl 6 / 7
+   (vlvl 384) complete; `pas_init_image` and `pas_mem_setup(0x86000000,
+   0x8400000)` return 0; 62 MB of segments load in 0.8 s through 1 MiB
+   `ml_io_map_unmappable` windows (one 132 MiB `ml_io_map` panics in
+   kmem_alloc, and `ml_io_unmap` of an `ml_io_map` entry panics as
+   "permanent VM map entry"); `pas_auth_and_reset` returns 0 in 249 ms.
+   Then the modem allocates its GLINK descriptor (item 478) and its FIFO
+   (480), and its SMP2P item 435 (version 1, features 1, 0 valid
+   entries); the SSR reason item holds the boot placeholder "SFR Init:
+   wdog or kernel error suspected." (no crash text). It now waits for the
+   apps side: GLINK FIFO 479 and SMP2P item 428. Stage 1 also showed: SMEM
+   v12, apps partitions 0/1 (modem, 0x7c000 at 0xfb000), 0/2, 0/5, 0/10
+   and the global one; partitions of other host pairs stall an apps read
+   (XPU), so only apps' are touched.
 2. **IPC**: GLINK over SMEM (items 478-480, APCS IPC bit 12, SPI 449) and
    QRTR; in user space the Linaro services the modem expects: rmtfs (EFS in
    RAM copies, never writing modemst1/2 or fsg), tqftpserv (serves

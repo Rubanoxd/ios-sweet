@@ -95,3 +95,26 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+void con_rect(int x, int y, int w, int h, uint32_t c)
+{
+	for (int yy = y; yy < y + h && yy < FB_H; yy++) {
+		volatile uint32_t *line = con_fb + yy * (FB_STRIDE / 4);
+		for (int xx = x; xx < x + w && xx < FB_W; xx++)
+			line[xx] = c;
+	}
+}
+
+void con_text(int x, int y, const char *s, int scale, uint32_t fg, uint32_t bg)
+{
+	for (; *s; s++, x += 8 * scale) {
+		char ch = *s < 0x20 || *s > 0x7e ? '?' : *s;
+		const unsigned char *g = font8x16[ch - 0x20];
+		if (x + 8 * scale > FB_W || y + 16 * scale > FB_H)
+			return;
+		for (int gy = 0; gy < 16; gy++)
+			for (int gx = 0; gx < 8; gx++)
+				con_rect(x + gx * scale, y + gy * scale, scale, scale,
+					 (g[gy] & (0x80 >> gx)) ? fg : bg);
+	}
+}

@@ -20,3 +20,6 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+/* Filled rectangle, and text at pixel X, Y in SCALE-times-size glyphs. */
+void con_rect(int x, int y, int w, int h, uint32_t c);
+void con_text(int x, int y, const char *s, int scale, uint32_t fg, uint32_t bg);
