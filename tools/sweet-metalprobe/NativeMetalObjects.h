@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Derived from UniXNU/NativeMetal, Copyright (c) 2026 NativeMetal contributors, MIT License */
 /* C ABI of the bridge's Metal objects (NativeMetalObjects.rs): the metal2vulkan runtime's device, resources, states, queues, command buffers
  * and encoders as opaque handles, for the Objective-C frontend (NativeBridgeMetalFrontend.mm). Enumerations and option words are Metal's raw
  * values. A call that fails returns 0/NULL and leaves its reason in nmb_last_error() (per thread). Every handle is released once with its

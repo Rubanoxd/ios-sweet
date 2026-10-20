@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Derived from UniXNU/NativeMetal, Copyright (c) 2026 NativeMetal contributors, MIT License
 //! Native Metal bridge: the metal2vulkan runtime (the Metal API on Vulkan) over Turnip, behind a C ABI the Objective-C
 //! Metal frontend and the plugin's self-test call. Turnip is opened as the runtime's Vulkan "loader" (it exports
 //! vkGetInstanceProcAddr; iPadOS has no Khronos loader). The pinned runtime is GPL-2.0-or-later OR LGPL-3.0-or-later and is

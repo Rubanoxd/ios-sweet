@@ -726,6 +726,11 @@ for joyeuse:
   device with automatic per-process shader cache in writable temp/cache
   directories. The bundle links self-contained with no external dependencies
   beyond system frameworks.
+- Licensing: `metal2vulkan-runtime` is linked statically (GPL-2.0+ or
+  LGPL-3.0+). For private use this requires no action; if binaries are
+  ever distributed, they must either be licensed under GPL or provide the
+  unlinked object files for relinking. Derived frontend code includes MIT
+  attribution from UniXNU/NativeMetal.
 
 ## Wi-Fi: plan (2026-10-20)
 

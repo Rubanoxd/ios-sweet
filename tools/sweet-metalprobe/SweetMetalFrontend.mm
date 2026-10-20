@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Derived from UniXNU/NativeMetal, Copyright (c) 2026 NativeMetal contributors, MIT License
 // Native Metal API frontend over the bridge (bridge/NativeMetalObjects.h): the metal2vulkan runtime on Turnip, on the Adreno 740 through
 // NativeAdreno. Same shape as the offline frontend: the device is a dynamically allocated subclass of the target's own _MTLDevice that
 // only adds this file's implementations; every other object is an own class answering the Metal protocol methods it implements.

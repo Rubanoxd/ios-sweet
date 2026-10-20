@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Derived from UniXNU/NativeMetal, Copyright (c) 2026 NativeMetal contributors, MIT License
 // Entry points of the native Metal frontend over the bridge (NativeBridgeMetalFrontend.mm).
 #pragma once
 #include <stddef.h>

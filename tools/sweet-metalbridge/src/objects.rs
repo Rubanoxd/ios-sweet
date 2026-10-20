@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Derived from UniXNU/NativeMetal, Copyright (c) 2026 NativeMetal contributors, MIT License
 //! The bridge's Metal objects behind a C ABI (NativeMetalObjects.h): the metal2vulkan runtime's device, resources, states, queues,
 //! command buffers and encoders as boxed handles for the Objective-C frontend. Raw Metal enumerations go through the runtime's own
 //! checked conversions; a value it does not know fails the call (never a substitute). Failures leave their reason in a per-thread
