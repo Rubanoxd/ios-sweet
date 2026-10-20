@@ -7,11 +7,14 @@
  * UniXNU's NativeBridgeMetalFrontend.mm (MIT, github.com/UniXNU/UniXNU at
  * dec4c7b), written anew over a small C runtime instead of their Rust one.
  *
- * Implemented: buffers (shared memory, zeroed), command queues, command
- * buffers (commit order per queue, scheduled/completed handlers, status,
- * error, waitUntilCompleted), blit fillBuffer and copyFromBuffer. Not yet:
- * libraries and pipelines (AIR has no lowering yet), textures, render and
- * compute encoders, events, heaps, drawables. Those return nil, fail the
+ * Implemented: buffers (shared memory, zeroed, with GPU addresses),
+ * command queues, command buffers (commit order per queue, scheduled and
+ * completed handlers, status, error, waitUntilCompleted), blit fillBuffer
+ * and copyFromBuffer, libraries from metallibs (AIR translated to SPIR-V by
+ * Darling's Iridium, sweet-iridium.h), kernel functions, compute pipelines
+ * and compute encoders (buffers, setBytes, uniform dispatches). Not yet:
+ * newLibraryWithSource (needs the on-device MSL compiler), textures,
+ * samplers, render encoders, events, heaps, drawables. Those return nil, fail the
  * command buffer or, for selectors not implemented at all, are logged
  * through doesNotRecognizeSelector: before the usual exception.
  */
@@ -22,6 +25,7 @@
 #include <objc/runtime.h>
 #include "SweetMetalDevice.h"
 #include "sweet-mtl-vk.h"
+#include "sweet-iridium.h"
 
 #define TURNIP_ICD "/var/jb/usr/lib/libvulkan_freedreno.dylib"
 enum { kGpuTimeoutMs = 5000 };
@@ -112,6 +116,158 @@ smError(NSString *why)
 }
 @end
 
+/* ---- libraries, functions, compute pipelines ---- */
+@interface SMLibrary : SMObject
+@property (nonatomic, strong) NSData *spirv;
+@property (nonatomic, strong) NSDictionary<NSString *, NSNumber *> *functions; /* name -> index */
+@property (nonatomic) struct sweet_air_function *table;
+@end
+
+@interface SMFunction : SMObject
+@property (nonatomic, strong) SMLibrary *library;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic) const struct sweet_air_function *info;
+@end
+@implementation SMFunction
+- (NSString *)name
+{
+	return _name;
+}
+- (MTLFunctionType)functionType
+{
+	return (MTLFunctionType)_info->kind;    /* Iridium's kinds are Metal's values */
+}
+- (MTLFunctionOptions)options
+{
+	return MTLFunctionOptionNone;
+}
+- (NSDictionary *)functionConstantsDictionary
+{
+	return @{};
+}
+- (NSArray *)vertexAttributes
+{
+	return nil;
+}
+- (NSArray *)stageInputAttributes
+{
+	return nil;
+}
+- (NSInteger)patchControlPointCount
+{
+	return -1;
+}
+- (MTLPatchType)patchType
+{
+	return MTLPatchTypeNone;
+}
+@end
+
+@implementation SMLibrary
+- (void)dealloc
+{
+	free(_table);
+}
+- (NSArray<NSString *> *)functionNames
+{
+	return _functions.allKeys;
+}
+- (MTLLibraryType)type
+{
+	return MTLLibraryTypeExecutable;
+}
+- (NSString *)installName
+{
+	return nil;
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+{
+	NSNumber *at = name ? _functions[name] : nil;
+	if (!at) {
+		return nil;
+	}
+	SMFunction *f = [SMFunction new];
+	f.library = self;
+	f.name = name;
+	f.info = &_table[at.unsignedIntegerValue];
+	return (id<MTLFunction>)f;
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
+    error:(NSError **)error
+{
+	(void)values;
+	id<MTLFunction> f = [self newFunctionWithName:name];
+	if (!f && error) {
+		*error = smError([NSString stringWithFormat:@"no function %@", name]);
+	}
+	return f;
+}
+@end
+
+static SMLibrary *
+newLibrary(NSData *data, NSError **error)
+{
+	char err[256];
+	size_t bytes = 0, count = 0;
+	struct sweet_air_function *table = NULL;
+	void *spv = data ? sweet_air_translate(data.bytes, data.length, &bytes, &table, &count, err, sizeof(err)) : NULL;
+	if (!spv) {
+		if (!data) {
+			snprintf(err, sizeof(err), "no library data");
+		}
+		sweet_metal_log("library refused: %s", err);
+		if (error) {
+			*error = smError([NSString stringWithUTF8String:err]);
+		}
+		return nil;
+	}
+	SMLibrary *lib = [SMLibrary new];
+	lib.spirv = [NSData dataWithBytesNoCopy:spv length:bytes freeWhenDone:YES];
+	lib.table = table;
+	NSMutableDictionary *names = [NSMutableDictionary dictionary];
+	for (size_t i = 0; i < count; ++i) {
+		names[[NSString stringWithUTF8String:table[i].name]] = @(i);
+	}
+	lib.functions = names;
+	sweet_metal_log("library: %zu functions, %zu bytes of SPIR-V", count, bytes);
+	if (error) {
+		*error = nil;
+	}
+	return lib;
+}
+
+@interface SMComputePipeline : SMObject
+@property (nonatomic, strong) SMFunction *function;
+@property (nonatomic) smv_kernel *kernel;
+@end
+@implementation SMComputePipeline
+- (void)dealloc
+{
+	smv_kernel_free(_kernel);
+}
+- (NSUInteger)maxTotalThreadsPerThreadgroup
+{
+	return 1024;
+}
+- (NSUInteger)threadExecutionWidth
+{
+	return 64;
+}
+- (NSUInteger)staticThreadgroupMemoryLength
+{
+	return 0;
+}
+- (BOOL)supportIndirectCommandBuffers
+{
+	return NO;
+}
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)dimensions
+{
+	(void)dimensions;
+	return 0;
+}
+@end
+
 /* ---- command buffers and encoders ---- */
 @class SMQueue;
 @interface SMCommandBuffer : SMObject
@@ -178,6 +334,135 @@ smError(NSString *why)
 - (void)endEncoding
 {
 	_commandBuffer = nil;
+}
+@end
+
+@interface SMComputeEncoder : SMObject
+@property (nonatomic, strong) SMCommandBuffer *commandBuffer;
+@end
+@implementation SMComputeEncoder {
+	SMComputePipeline *_pipeline;
+	uint64_t _address[SWEET_AIR_MAX_BINDINGS];
+}
+- (MTLDispatchType)dispatchType
+{
+	return MTLDispatchTypeSerial;
+}
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)state
+{
+	if (![(id)state isKindOfClass:[SMComputePipeline class]]) {
+		[_commandBuffer refuse:@"compute: foreign pipeline state"];
+		return;
+	}
+	_pipeline = (SMComputePipeline *)state;
+}
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS) {
+		[_commandBuffer refuse:@"compute: buffer index out of range"];
+		return;
+	}
+	if (!buffer) {
+		_address[index] = 0;
+		return;
+	}
+	if (![(id)buffer isKindOfClass:[SMBuffer class]]) {
+		[_commandBuffer refuse:@"compute: foreign buffer"];
+		return;
+	}
+	SMBuffer *b = (SMBuffer *)buffer;
+	[_commandBuffer use:b];
+	_address[index] = smv_buffer_address(b.handle) + offset;
+}
+- (void)setBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	(void)offset;
+	(void)index;
+	[_commandBuffer refuse:@"compute: setBufferOffset is not implemented yet"];
+}
+- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained *)buffers offsets:(const NSUInteger *)offsets
+    withRange:(NSRange)range
+{
+	for (NSUInteger i = 0; i < range.length; ++i) {
+		[self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
+	}
+}
+/* setBytes: a small buffer of its own, kept by the command buffer. */
+- (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	smv_buffer *h = smv_buffer_new(length ? length : 4, bytes);
+	if (!h) {
+		[_commandBuffer refuse:[NSString stringWithFormat:@"setBytes: %s", smv_error()]];
+		return;
+	}
+	SMBuffer *b = [SMBuffer new];
+	b.handle = h;
+	[self setBuffer:(id<MTLBuffer>)b offset:0 atIndex:index];
+}
+- (void)dispatchGroups:(MTLSize)groups local:(MTLSize)local
+{
+	if (!_pipeline) {
+		[_commandBuffer refuse:@"dispatch without a pipeline state"];
+		return;
+	}
+	const struct sweet_air_function *f = _pipeline.function.info;
+	uint64_t addresses[SWEET_AIR_MAX_BINDINGS];
+	for (unsigned i = 0; i < f->bindings; ++i) {
+		if (f->binding[i].type != SWEET_AIR_BUFFER || f->binding[i].index >= SWEET_AIR_MAX_BINDINGS) {
+			[_commandBuffer refuse:@"compute: only buffer arguments are implemented yet"];
+			return;
+		}
+		addresses[i] = _address[f->binding[i].index];
+	}
+	smv_cmd *c = [_commandBuffer cmd];
+	const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+	const uint32_t l[3] = { (uint32_t)local.width, (uint32_t)local.height, (uint32_t)local.depth };
+	if (c && !smv_cmd_dispatch(c, _pipeline.kernel, addresses, f->bindings, g, l)) {
+		[_commandBuffer refuse:[NSString stringWithFormat:@"dispatch: %s", smv_error()]];
+	}
+}
+- (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)local
+{
+	[self dispatchGroups:groups local:local];
+}
+/* Iridium's kernels have no out-of-grid check yet: only grids that are a
+ * whole number of threadgroups. */
+- (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)local
+{
+	if (!local.width || !local.height || !local.depth || threads.width % local.width ||
+	    threads.height % local.height || threads.depth % local.depth) {
+		[_commandBuffer refuse:@"dispatchThreads: partial threadgroups are not implemented yet"];
+		return;
+	}
+	[self dispatchGroups:MTLSizeMake(threads.width / local.width, threads.height / local.height,
+	    threads.depth / local.depth) local:local];
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope
+{
+	(void)scope;    /* every dispatch ends with a full barrier */
+}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
+{
+	(void)usage;
+	if ([(id)resource isKindOfClass:[SMBuffer class]]) {
+		[_commandBuffer use:(SMBuffer *)resource];
+	}
+}
+- (void)pushDebugGroup:(NSString *)string
+{
+	(void)string;
+}
+- (void)popDebugGroup
+{
+}
+- (void)insertDebugSignpost:(NSString *)string
+{
+	(void)string;
+}
+- (void)endEncoding
+{
+	_commandBuffer = nil;
+	_pipeline = nil;
 }
 @end
 
@@ -257,8 +542,13 @@ smError(NSString *why)
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder
 {
-	[self refuse:@"compute encoders are not implemented yet"];
-	return nil;
+	if (self.committed) {
+		[self refuse:@"computeCommandEncoder after commit"];
+		return nil;
+	}
+	SMComputeEncoder *e = [SMComputeEncoder new];
+	e.commandBuffer = self;
+	return (id<MTLComputeCommandEncoder>)e;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type
 {
@@ -410,6 +700,12 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		{ [SMQueue class], "MTLCommandQueue" }, { [SMQueue class], "MTLCommandQueueSPI" },
 		{ [SMCommandBuffer class], "MTLCommandBuffer" }, { [SMCommandBuffer class], "MTLCommandBufferSPI" },
 		{ [SMBlitEncoder class], "MTLBlitCommandEncoder" }, { [SMBlitEncoder class], "MTLBlitCommandEncoderSPI" },
+		{ [SMComputeEncoder class], "MTLComputeCommandEncoder" },
+		{ [SMComputeEncoder class], "MTLComputeCommandEncoderSPI" },
+		{ [SMLibrary class], "MTLLibrary" }, { [SMLibrary class], "MTLLibrarySPI" },
+		{ [SMFunction class], "MTLFunction" }, { [SMFunction class], "MTLFunctionSPI" },
+		{ [SMComputePipeline class], "MTLComputePipelineState" },
+		{ [SMComputePipeline class], "MTLComputePipelineStateSPI" },
 	};
 	for (size_t i = 0; i < sizeof(conform) / sizeof(conform[0]); ++i) {
 		Protocol *p = objc_getProtocol(conform[i].protocol);
@@ -536,37 +832,96 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 {
 	return bytes ? [self sweetBuffer:length bytes:bytes options:options] : nil;
 }
-- (id<MTLLibrary>)sweetNoLibrary:(NSError **)error
-{
-	if (error) {
-		*error = smError(@"shader libraries are not implemented yet (no AIR lowering)");
-	}
-	return nil;
-}
-- (id<MTLLibrary>)newDefaultLibrary
-{
-	return [self sweetNoLibrary:NULL];
-}
-- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error
-{
-	(void)bundle;
-	return [self sweetNoLibrary:error];
-}
+/* Source needs the on-device MSL front end (MTLCompilerService); only
+ * compiled metallibs for now. */
 - (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error
 {
 	(void)source;
 	(void)options;
-	return [self sweetNoLibrary:error];
+	if (error) {
+		*error = smError(@"newLibraryWithSource is not implemented yet: use a metallib");
+	}
+	return nil;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error
 {
-	(void)data;
-	return [self sweetNoLibrary:error];
+	const void *bytes = NULL;
+	size_t size = 0;
+	dispatch_data_t mapped = data ? dispatch_data_create_map(data, &bytes, &size) : nil;
+	NSData *copy = mapped ? [NSData dataWithBytes:bytes length:size] : nil;
+	return (id<MTLLibrary>)newLibrary(copy, error);
+}
+- (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error
+{
+	NSData *data = path ? [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error] : nil;
+	return data ? (id<MTLLibrary>)newLibrary(data, error) : nil;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error
 {
-	(void)url;
-	return [self sweetNoLibrary:error];
+	if (!url.isFileURL) {
+		if (error) {
+			*error = smError(@"a file URL is required");
+		}
+		return nil;
+	}
+	return [self newLibraryWithFile:url.path error:error];
+}
+- (id<MTLLibrary>)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error
+{
+	NSString *path = [bundle pathForResource:@"default" ofType:@"metallib"];
+	if (!path) {
+		if (error) {
+			*error = smError(@"the bundle has no default.metallib");
+		}
+		return nil;
+	}
+	return [self newLibraryWithFile:path error:error];
+}
+- (id<MTLLibrary>)newDefaultLibrary
+{
+	return [self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:NULL];
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error
+{
+	if (![(id)function isKindOfClass:[SMFunction class]] ||
+	    ((SMFunction *)function).functionType != MTLFunctionTypeKernel) {
+		if (error) {
+			*error = smError(@"not a kernel function of this device");
+		}
+		return nil;
+	}
+	SMFunction *f = (SMFunction *)function;
+	smv_kernel *k = smv_kernel_new(f.library.spirv.bytes, f.library.spirv.length, f.name.UTF8String);
+	if (!k) {
+		if (error) {
+			*error = smError([NSString stringWithFormat:@"kernel %@: %s", f.name, smv_error()]);
+		}
+		return nil;
+	}
+	SMComputePipeline *p = [SMComputePipeline new];
+	p.function = f;
+	p.kernel = k;
+	if (error) {
+		*error = nil;
+	}
+	return (id<MTLComputePipelineState>)p;
+}
+- (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function
+    options:(MTLPipelineOption)options reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
+    error:(NSError **)error
+{
+	(void)options;
+	if (reflection) {
+		*reflection = nil;
+	}
+	return [self newComputePipelineStateWithFunction:function error:error];
+}
+- (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function
+    completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler
+{
+	NSError *error = nil;
+	id<MTLComputePipelineState> p = [self newComputePipelineStateWithFunction:function error:&error];
+	handler(p, error);
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {

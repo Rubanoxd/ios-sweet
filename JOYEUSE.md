@@ -505,5 +505,35 @@ unaligned fill (head and tail through staging copies) plus a copy, and a
 second command buffer that reads the first one's result: status 4/4,
 completed handlers once each, 0 wrong bytes, ~10 ms; `newLibraryWithSource:`
 returns nil with an error. SpringBoard and backboardd kept their PIDs.
-Not yet: shader libraries and pipelines (AIR lowering: UniXNU's
-kits/AirNir), compute and render encoders, textures, events, drawables.
+
+Shaders, compute (2026-10-20): Metal kernels run on the Adreno 618.
+- AIR -> SPIR-V is Darling's Iridium (github.com/darlinghq/indium,
+  `src/iridium`, 0BSD), cloned next to this repo as `indium/` (8423a7d) with
+  `tools/iridium-patches/0001-integer-binops.patch` (integer add..xor, which
+  Iridium lacked, and its wrong SDiv opcode). Turnip then lowers the SPIR-V
+  to NIR and ir3 (`spirv_to_nir`).
+- Iridium needs typed pointers (`LLVMGetElementType` on pointer types; AIR
+  has them, LLVM 17+ drops them), so it runs on LLVM 14.0.6:
+  `tools/build-llvm-ios.sh` cross-builds Core/BitReader/Support for iOS
+  (host tblgen: Homebrew `llvm@14`); `iridium-static-llvm.cpp` replaces its
+  dlopen of libLLVM. UniXNU's AirNir was not used: vertex/fragment only.
+- Iridium's ABI: set 0 binding 0 is a uniform buffer of 64-bit buffer
+  device addresses (one per buffer argument), threadgroup size from spec
+  constants 0..2 (`LocalSizeId`). So the device is Vulkan 1.3 with
+  bufferDeviceAddress, shaderInt64 and maintenance4; every MTLBuffer has a
+  GPU address; a dispatch writes its argument addresses into a small UBO
+  and uses a pipeline specialized per threadgroup size.
+- Metal side: `newLibraryWithData/File/URL`, `newDefaultLibrary`,
+  `newFunctionWithName:`, `newComputePipelineStateWithFunction:`, compute
+  encoder (`setBuffer`, `setBytes`, `dispatchThreadgroups`, and
+  `dispatchThreads` for whole threadgroups only: Iridium has no
+  out-of-grid check).
+- `sweet-mtltest` with `sweet-mtltest.metallib` (`sweet-mtltest.metal`,
+  built by build.sh with the metal compiler of this Mac's MetalToolchain
+  asset): library translated on the phone in 4-27 ms, `add_arrays` (float)
+  and `square_add` (integers + setBytes) over 1M elements: 0 wrong, both
+  dispatches 2.6-3.3 ms, as root and as mobile. `sweet-air2spv` runs
+  Iridium alone on the phone.
+Not yet: `newLibraryWithSource` (MSL front end on the phone), textures,
+samplers, render pipelines and encoders (Iridium has vertex/fragment
+support: next for graphics), events, drawables, partial threadgroups.

@@ -1,0 +1,72 @@
+diff --git a/private-include/iridium/spirv.hpp b/private-include/iridium/spirv.hpp
+index 95cd3de..7d7516e 100644
+--- a/private-include/iridium/spirv.hpp
++++ b/private-include/iridium/spirv.hpp
+@@ -485,7 +485,7 @@ namespace Iridium {
+ 			IMul = 132,
+ 			FMul = 133,
+ 			UDiv = 134,
+-			SDiv = 133,
++			SDiv = 135,
+ 			FDiv = 136,
+ 			UMod = 137,
+ 			SRem = 138,
+@@ -493,6 +493,12 @@ namespace Iridium {
+ 			FRem = 140,
+ 			FMod = 141,
+ 			Dot = 148,
++			ShiftRightLogical = 194,
++			ShiftRightArithmetic = 195,
++			ShiftLeftLogical = 196,
++			BitwiseOr = 197,
++			BitwiseXor = 198,
++			BitwiseAnd = 199,
+ 			FOrdLessThan = 184,
+ 			FOrdGreaterThan = 186,
+ 			Phi = 245,
+diff --git a/src/iridium/air.cpp b/src/iridium/air.cpp
+index 21c501f..7f4370e 100644
+--- a/src/iridium/air.cpp
++++ b/src/iridium/air.cpp
+@@ -1234,7 +1234,20 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+ 				case LLVMFMul:
+ 				case LLVMFDiv:
+ 				case LLVMFAdd:
+-				case LLVMFSub: {
++				case LLVMFSub:
++				case LLVMAdd:
++				case LLVMSub:
++				case LLVMMul:
++				case LLVMUDiv:
++				case LLVMSDiv:
++				case LLVMURem:
++				case LLVMSRem:
++				case LLVMShl:
++				case LLVMLShr:
++				case LLVMAShr:
++				case LLVMAnd:
++				case LLVMOr:
++				case LLVMXor: {
+ 					auto op1 = DynamicLLVM::LLVMGetOperand(inst, 0);
+ 					auto op2 = DynamicLLVM::LLVMGetOperand(inst, 1);
+ 					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
+@@ -1246,6 +1259,19 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
+ 						case LLVMFDiv: binop = SPIRV::Opcode::FDiv; break;
+ 						case LLVMFAdd: binop = SPIRV::Opcode::FAdd; break;
+ 						case LLVMFSub: binop = SPIRV::Opcode::FSub; break;
++						case LLVMAdd: binop = SPIRV::Opcode::IAdd; break;
++						case LLVMSub: binop = SPIRV::Opcode::ISub; break;
++						case LLVMMul: binop = SPIRV::Opcode::IMul; break;
++						case LLVMUDiv: binop = SPIRV::Opcode::UDiv; break;
++						case LLVMSDiv: binop = SPIRV::Opcode::SDiv; break;
++						case LLVMURem: binop = SPIRV::Opcode::UMod; break;
++						case LLVMSRem: binop = SPIRV::Opcode::SRem; break;
++						case LLVMShl: binop = SPIRV::Opcode::ShiftLeftLogical; break;
++						case LLVMLShr: binop = SPIRV::Opcode::ShiftRightLogical; break;
++						case LLVMAShr: binop = SPIRV::Opcode::ShiftRightArithmetic; break;
++						case LLVMAnd: binop = SPIRV::Opcode::BitwiseAnd; break;
++						case LLVMOr: binop = SPIRV::Opcode::BitwiseOr; break;
++						case LLVMXor: binop = SPIRV::Opcode::BitwiseXor; break;
+ 						default:
+ 							break;
+ 					}

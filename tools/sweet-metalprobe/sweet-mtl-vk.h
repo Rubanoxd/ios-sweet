@@ -9,6 +9,7 @@
 
 typedef struct smv_buffer smv_buffer;
 typedef struct smv_cmd smv_cmd;
+typedef struct smv_kernel smv_kernel;
 
 const char *smv_error(void);
 
@@ -20,12 +21,21 @@ smv_buffer *smv_buffer_new(uint64_t length, const void *bytes);
 void smv_buffer_free(smv_buffer *b);
 void *smv_buffer_contents(smv_buffer *b);
 uint64_t smv_buffer_length(smv_buffer *b);
+uint64_t smv_buffer_address(smv_buffer *b);
+
+/* A compute kernel: Iridium SPIR-V and its entry point name. */
+smv_kernel *smv_kernel_new(const void *spirv, size_t bytes, const char *entry);
+void smv_kernel_free(smv_kernel *k);
 
 /* A command list in recording state. */
 smv_cmd *smv_cmd_new(void);
 int smv_cmd_fill(smv_cmd *c, smv_buffer *b, uint64_t offset, uint64_t length, uint8_t value);
 int smv_cmd_copy(smv_cmd *c, smv_buffer *src, uint64_t src_offset, smv_buffer *dst, uint64_t dst_offset,
     uint64_t length);
+/* Dispatches GROUPS threadgroups of LOCAL threads; ADDRESSES are the GPU
+ * addresses of the kernel's buffer bindings, in Iridium's binding order. */
+int smv_cmd_dispatch(smv_cmd *c, smv_kernel *k, const uint64_t *addresses, unsigned count, const uint32_t groups[3],
+    const uint32_t local[3]);
 /* Ends, submits and waits (at most TIMEOUT_MS); then the list is spent. */
 int smv_cmd_run(smv_cmd *c, uint32_t timeout_ms);
 void smv_cmd_free(smv_cmd *c);

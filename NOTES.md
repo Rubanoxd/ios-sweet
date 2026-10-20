@@ -11,7 +11,9 @@ See `JOYEUSE.md` "Metal". xnu **0096** (commit fdb1a6c, CI 39456547147, `xnu/out
 it runs a Turnip compute job (verified OK after a respring) and returns nil, so the UI stays on the CPU
 renderer. Stage 3 (first part, commit below): `MTLCreateSystemDefaultDevice` in `sweet-mtltest` returns a
 real device on Turnip ("Turnip Adreno (TM) 618 (SweetMetal)"): buffers, queues, command buffers and blit
-fill/copy verified on the phone as root and as mobile. Next: shaders (AIR -> NIR), compute encoder.
+fill/copy verified on the phone as root and as mobile. Shaders: Metal kernels from a metallib run on the GPU
+(AIR -> SPIR-V by Darling's Iridium on LLVM 14 for iOS, then Turnip): add_arrays/square_add over 1M elements,
+0 wrong. Next: render pipelines (Iridium vertex/fragment), textures, then drawables toward compositing.
 
 ### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<
 
