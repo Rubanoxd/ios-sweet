@@ -272,6 +272,17 @@ long-descriptor FORMAT field). iOS keeps running.
    bw table and test accepted; GPU_SET OOB acked; core `rbbm_status
    0x00000001`, no CP fault.
 
+6. `sweetgpu=6` (xnu 0088, shim `shim-boot-joyeuse-gpu6.img`): the GPU's
+   SMMU context (bank 0 for stream 0, the DT's `gfx3d_user`), the a618 part
+   of hw_init, `a630_sqe.fw` (version 0x19a), a 32 KiB ring, CP start and
+   CP_ME_INIT, then the zap shader through the SCM PAS calls (pas id 13,
+   `pil_gpu_mem` 0x93b15000) and a CP_MEM_WRITE test. First hardware run
+   (2026-10-20): **the CP runs**: `cp me_init: idle (rptr 9 wptr 9)`, no
+   fault. `pas_is_supported(13)` answered 0, and the fallback write to
+   `RBBM_SECVID_TRUST_CNTL` stalled the probe thread for good (iOS kept
+   running). The second build tries the PAS calls anyway and never touches
+   that register (`sweetgpuzap=0` skips the zap).
+
 Next steps: the GPU's own SMMU context (stream 0) and the a6xx hw_init
 register setup, then the zap shader (`a615_zap` via the SCM PAS calls), the
 SQE microcode and the first ring.
