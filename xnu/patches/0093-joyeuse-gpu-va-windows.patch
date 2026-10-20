@@ -1,0 +1,106 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -167,6 +167,39 @@
+ 	IOLockUnlock(sPoolLock);
+ }
+ 
++/*
++ * One GPU address space is shared by every connection (no per-process
++ * pagetables yet), and Turnip places its buffers from the va_start it is
++ * given, so two processes on the same range collide. Each connection gets
++ * its own 512 MiB window of the client range instead; six fit.
++ */
++#define VA_WINDOW         0x20000000ull
++#define VA_SLOTS          6
++static uint8_t sVaSlots[VA_SLOTS];
++
++static int
++vaSlotTake(void)
++{
++	IOLockLock(sPoolLock);
++	int slot = -1;
++	for (int i = 0; i < VA_SLOTS && slot < 0; ++i) {
++		if (!sVaSlots[i]) {
++			sVaSlots[i] = 1;
++			slot = i;
++		}
++	}
++	IOLockUnlock(sPoolLock);
++	return slot;
++}
++
++static void
++vaSlotGive(int slot)
++{
++	IOLockLock(sPoolLock);
++	sVaSlots[slot] = 0;
++	IOLockUnlock(sPoolLock);
++}
++
+ class NativeAdrenoGpuPublished : public IOService {
+ 	OSDeclareDefaultStructors(NativeAdrenoGpuPublished);
+ public:
+@@ -212,6 +245,7 @@
+ 	IOLock *fLock;
+ 	Entry *fEntries;
+ 	bool fQueues[NativeAdrenoAbiMaxQueues];
++	int fSlot;                   /* GPU address window, -1 if none */
+ 
+ 	Entry *lookup(uint64_t handle);
+ 	IOReturn mapSegments(Entry *e, uint64_t iova, bool writable);
+@@ -240,6 +274,7 @@
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	fSlot = -1;
+ 	fLock = IOLockAlloc();
+ 	fEntries = IONewZero(Entry, kSweetAdrenoMaxObjects);
+ 	return fLock != NULL && fEntries != NULL;
+@@ -252,6 +287,11 @@
+ 		return false;
+ 	}
+ 	fQueues[0] = true;          /* queue 0 exists from open() */
++	fSlot = vaSlotTake();
++	if (fSlot < 0) {
++		printf("SWEET ADRENO: no free GPU address window (%d clients)\n", VA_SLOTS);
++		return false;
++	}
+ 	return true;
+ }
+ 
+@@ -271,6 +311,10 @@
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+ 	}
++	if (fSlot >= 0) {
++		vaSlotGive(fSlot);
++		fSlot = -1;
++	}
+ 	IOUserClient::free();
+ }
+ 
+@@ -441,8 +485,8 @@
+ 		d.gmem_bytes = gi.gmem_bytes;
+ 		d.gmem_base = gi.gmem_base;
+ 		d.uche_trap_base = gi.uche_trap_base;
+-		d.va_start = gi.va_start;
+-		d.va_size = gi.va_size;
++		d.va_start = gi.va_start + VA_WINDOW * (uint64_t)fSlot;   /* this connection's window */
++		d.va_size = VA_WINDOW;
+ 		d.highest_bank_bit = gi.highest_bank_bit;
+ 		d.ubwc_swizzle = gi.ubwc_swizzle;
+ 		d.macrotile_mode = gi.macrotile_mode;
+@@ -597,6 +641,13 @@
+ 			break;
+ 		}
+ 		adrenoStep("BoMap: handle %llu at 0x%llx", m.handle, m.iova);
++		struct sweet_gpu_info gi;
++		sweet_gpu_get_info(&gi);
++		uint64_t win = gi.va_start + VA_WINDOW * (uint64_t)fSlot;
++		if (m.iova < win || m.iova + e->bytes > win + VA_WINDOW || m.iova + e->bytes < m.iova) {
++			ret = kIOReturnBadArgument;          /* outside this connection's window */
++			break;
++		}
+ 		ret = mapSegments(e, m.iova, (m.permissions & 2) != 0);
+ 		adrenoStep("BoMap: 0x%x", ret);
+ 		if (ret == kIOReturnSuccess) {
