@@ -1,0 +1,25 @@
+[package]
+name = "sweet-m2v"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "metal2vulkan self-test on Turnip for the joyeuse port"
+
+# metal2vulkan (GPL-2.0-or-later OR LGPL-3.0-or-later) is not vendored: clone
+# https://github.com/steelbrain/metal2vulkan beside ios-sweet (see build.sh).
+[dependencies]
+metal2vulkan = { path = "../../../metal2vulkan/crates/metal2vulkan" }
+metal2vulkan-runtime = { path = "../../../metal2vulkan/crates/metal2vulkan-runtime" }
+libc = "0.2"
+
+[[bin]]
+name = "sweet-m2vtest"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "unwind"
+
+[workspace]

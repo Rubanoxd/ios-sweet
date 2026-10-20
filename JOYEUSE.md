@@ -665,3 +665,38 @@ backboardd as a client with the CPU renderer as fallback.
 Not yet: `newLibraryWithSource`, storage textures, vertex descriptors
 (stage_in attributes), depth/stencil, scissor, blend color, indexed draws,
 events, partial threadgroups.
+
+## metal2vulkan on Turnip (2026-10-20)
+
+UniXNU's Metal (GPU-composited desktop on the Adreno 740 of sheng) does not
+use Iridium: NativeMetal (MIT) is a frontend over
+[steelbrain/metal2vulkan](https://github.com/steelbrain/metal2vulkan)
+(GPL-2.0-or-later OR LGPL-3.0-or-later, Rust 1.98+, no LLVM): an AIR reader
+and SPIR-V emitter of its own plus the Metal API on Vulkan (devices,
+queues, encoders, buffers, textures, heaps, events; 958 of the SDK's 2135
+Metal items, typed refusals for the rest). `tools/sweet-m2v` builds
+`sweet-m2vtest`, NativeMetal's bridge self-test adapted (dc civac instead
+of `sys_dcache_flush`, a no-op on arm64; Turnip opened directly with
+`TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`). `build.sh` needs metal2vulkan
+cloned beside ios-sweet (tested at a2c440b), rustup with aarch64-apple-ios,
+Homebrew llvm-as 15+ for the fixture (opaque pointers) and the theos
+iPhoneOS SDK; the iOS link goes through a clang wrapper so build scripts
+keep linking for the Mac. Output: a 24 MB static binary.
+
+Verified on the phone (root, 2026-10-20), first run:
+- device: "Turnip Adreno (TM) 618" in 0.68 s; fixture library 40 ms.
+- compute (`scale_and_offset`, 1000 floats, a partial threadgroup split
+  into specialized dispatches): OK.
+- render (quad into a private RGBA8 texture, blit readback): OK.
+- import (render target over host pages without a copy): OK. metal2vulkan
+  shadows such textures (copies into an image before each use and back
+  after each write) where our runtime renders straight into a linear image.
+- QuartzCore `default.metallib`: 141 functions read; 3 of 7 kernels and 13
+  of 21 name-paired vertex/fragment pipelines built in 1.3 s. The 4 refused
+  kernels are tile functions (`tile_downsample_*`, Apple TBDR only); the 8
+  refused pairs want a vertex descriptor or a third color attachment the
+  test does not give (descriptor refusals, not translation failures).
+It answers what our Iridium path lacks for 3D (depth/stencil, mipmaps,
+array/cube/3D textures, more pixel formats, vertex descriptors, function
+constants), so it is the candidate to replace Iridium + sweet-mtl-vk.c
+behind SweetMetalDevice.
