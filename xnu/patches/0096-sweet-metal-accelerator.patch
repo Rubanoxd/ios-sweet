@@ -1,0 +1,123 @@
+--- a/iokit/Kernel/arm/SweetMetal.cpp
++++ b/iokit/Kernel/arm/SweetMetal.cpp
+@@ -0,0 +1,96 @@
++/*
++ * SWEET: the accelerator service iOS' Metal discovery looks for (boot-arg
++ * sweetmetal=1; nothing is published without it).
++ *
++ * Metal.framework (MTLCreateSystemDefaultDevice and friends) matches the
++ * IOKit class IOAcceleratorES, reads its MetalPluginName property, loads
++ * /System/Library/Extensions/<MetalPluginName>.bundle, takes the class named
++ * by MetalPluginClassName or else the bundle's principal class, requires it
++ * to be a _MTLDevice subclass and calls -initWithAcceleratorPort: with the
++ * service. On Apple hardware IOAcceleratorES is the IOGPUFamily base class;
++ * SWEET has no closed kexts, so the name is free and this built-in class
++ * takes it. MetalPluginName defaults to SweetMetalProbe (boot-arg
++ * sweetmetalplugin=<name> to change it), the diagnostic bundle of
++ * tools/sweet-metalprobe, which logs who loads it and returns nil, so
++ * every process keeps the CPU renderer.
++ *
++ * For the diagnosis every property read from a user process and every
++ * IOServiceOpen are printed (`SWEET MTL: ...`, at most 64 lines); opens are
++ * refused: there is no IOGPU user client yet.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	using IOService::copyProperty;
++	OSPtr<OSObject> copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
++	using IOService::newUserClient;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static volatile SInt32 sMetalLines;
++
++static bool
++metalLine(void)
++{
++	return OSIncrementAtomic(&sMetalLines) < 64;
++}
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	unsigned int enable = 0;
++	if (!PE_parse_boot_argn("sweetmetal", &enable, sizeof(enable)) || enable == 0) {
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	char plugin[64] = "SweetMetalProbe";
++	(void)PE_parse_boot_argn("sweetmetalplugin", plugin, sizeof(plugin));
++	plugin[sizeof(plugin) - 1] = 0;
++	setProperty("MetalPluginName", plugin);
++	setProperty("MetalPluginClassName", plugin);
++	registerService();
++	printf("SWEET MTL: IOAcceleratorES published, MetalPluginName %s\n", plugin);
++	return true;
++}
++
++OSPtr<OSObject>
++IOAcceleratorES::copyProperty(const char *aKey) const
++{
++	OSPtr<OSObject> value = IOService::copyProperty(aKey);
++	if (aKey && proc_selfpid() != 0 && metalLine()) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET MTL: %s[%d] reads %s (%s)\n", name, proc_selfpid(), aKey, value ? "set" : "none");
++	}
++	return value;
++}
++
++IOReturn
++IOAcceleratorES::newUserClient(__unused task_t owningTask, __unused void *securityID, UInt32 type,
++    __unused OSDictionary *properties, IOUserClient **handler)
++{
++	if (metalLine()) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET MTL: %s[%d] opens type 0x%x (refused)\n", name, proc_selfpid(), (unsigned)type);
++	}
++	*handler = NULL;
++	return kIOReturnUnsupported;
++}
++#endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = NativeAdrenoGpuPublished;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetMetal.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
