@@ -394,3 +394,27 @@ The phone reaches the internet through the Mac (2026-10-20: ping, DNS and
    original kept in `/var/jb/var/sweet/launchd.plist.orig`; checked across
 a reboot).
 `route`, `ifconfig` and `netstat` come from Procursus `network-cmds`.
+
+## Metal: what iOS needs (notes, 2026-10-20)
+
+Nothing here runs yet; this is the plan for making iOS itself use the GPU.
+- Discovery: Metal.framework looks up the IOKit service `IOAcceleratorES`,
+  reads its `MetalPluginName` property, loads that bundle and calls its
+  principal class' `initWithAcceleratorPort:`. backboardd already asks for
+  `IOAcceleratorES` all the time on this port (`IOK backboardd: matching
+  ... IOAcceleratorES -> 0 found`), so publishing one is the entry point.
+- Sandbox: the processes that use Metal (SpringBoard, backboardd, apps) may
+  only `IOServiceOpen` a user client of class `AGXDeviceUserClient`, and
+  the profile filters external-method selectors. UniXNU names its
+  connection class so and tunnels every ABI method through one admitted
+  selector (Turnip backend: `TU_DARWIN_SERVICE` / open type 0x4147). Our
+  "SWEET Sandbox" MAC policy (0050) is permissive, so this may matter less
+  here; to be checked.
+- UniXNU's plugin stage 1 (`NativeAdrenoMetalPlugin.mm`) only runs a GPU
+  test from inside SpringBoard and returns nil, so the CPU renderer keeps
+  working; their Metal frontend (Metal on Turnip, AIR to NIR) is written
+  but unproven on hardware.
+- Plan: (1) an opt-in `IOAcceleratorES` service with `MetalPluginName`
+  pointing at a test bundle that logs and returns nil, to see who loads it
+  and under which sandbox; (2) Turnip from inside SpringBoard; (3) only then
+  a real MTLDevice.
