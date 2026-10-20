@@ -10,17 +10,27 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_reboot.c
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,184 @@
 +/*
 + * SWEET: reboot straight into the bootloader's Fastboot mode, so a new test
 + * kernel can be booted without anyone holding Power + Volume down:
 + *
 + *   sync; sysctl -w kern.sweet_reboot_bootloader=1      (root only)
 + *
-+ * Same as the shim's reset() (shim/shim.c): ABL enters Fastboot when the
-+ * IMEM restart reason (qcom,msm-imem restart_reason@65c) holds 0x77665500,
-+ * then PSCI SYSTEM_RESET; PS_HOLD low if that ever returns. The caller syncs
-+ * the filesystems first: nothing is flushed here.
++ * The IMEM restart reason plus PSCI SYSTEM_RESET alone (the shim's reset())
++ * rebooted joyeuse into the normal boot: ABL reads the reason from the
++ * PMIC. So this does what MIUI's msm-poweroff + qpnp-power-on do for
++ * "reboot bootloader" (the stock DT: restart@c264000 qcom,pshold, pm6150
++ * power-on@800 qcom,system-reset):
++ *  1. PON SOFT_RB_SPARE (0x88f) bits 7:1 = PON_RESTART_REASON_BOOTLOADER (1)
++ *  2. PS_HOLD reset type = warm reset (PS_HOLD_RST_CTL 0x85a = 1, with the
++ *     enable bit in PS_HOLD_RST_CTL2 0x85b dropped around the change), so the
++ *     PMIC keeps the reason
++ *  3. IMEM restart_reason@65c = 0x77665500
++ *  4. PS_HOLD low (0x0c264000); PSCI SYSTEM_RESET if that does nothing.
++ * PMIC access: the SPMI arbiter v5 (spmi@c440000: core, chnls 0xc600000,
++ * obsrvr 0xe600000, cnfg 0xc40a000, EE 0), pm6150 SID 0, PON peripheral only.
++ * The caller syncs the filesystems first: nothing is flushed here.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -36,23 +46,132 @@
 +#define PSHOLD              0x0c264000u
 +#define PSCI_SYSTEM_RESET   0x84000009ull
 +
++#define SPMI_CORE           0x0c440000u
++#define SPMI_CHNLS          0x0c600000u
++#define SPMI_OBS            0x0e600000u
++#define SPMI_CNFG           0x0c40a000u
++#define PON_PPID            0x008u     /* SID 0, peripheral 0x08 */
++#define PON_PS_HOLD_RST_CTL  0x85au
++#define PON_PS_HOLD_RST_CTL2 0x85bu
++#define PON_SOFT_RB_SPARE    0x88fu
++
++static vm_offset_t rb_core, rb_chnls, rb_obs, rb_cnfg;
++static unsigned rb_apid;
++
++static uint32_t
++rb_rd(vm_offset_t base, unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++rb_wr(vm_offset_t base, unsigned off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* The PON peripheral's APID, owned by EE 0 (needed for writes). */
++static bool
++rb_spmi_init(void)
++{
++	rb_core = ml_io_map(SPMI_CORE, 0x2000);
++	rb_chnls = ml_io_map(SPMI_CHNLS, 0x10000);
++	rb_obs = ml_io_map(SPMI_OBS, 0x10000);
++	rb_cnfg = ml_io_map(SPMI_CNFG, 0x1000);
++	if (!rb_core || !rb_chnls || !rb_obs || !rb_cnfg) {
++		return false;
++	}
++	unsigned count = rb_rd(rb_core, 4) & 0x7ffu;
++	for (unsigned i = 0; i < count && i < 512; ++i) {
++		uint32_t map = rb_rd(rb_core, 0x900u + 4u * i);
++		if (map && ((map >> 8) & 0xfffu) == PON_PPID && (rb_rd(rb_cnfg, 0x700u + 4u * i) & 7u) == 0) {
++			rb_apid = i;
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++rb_spmi_wait(vm_offset_t ch)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = rb_rd(ch, 0x08);
++		if (status & 1u) {
++			return !(status & 0x0eu);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++rb_spmi_read(unsigned addr, uint8_t *v)
++{
++	vm_offset_t ch = rb_obs + 0x80u * rb_apid;
++	rb_wr(ch, 0x00, (1u << 27) | ((addr & 0xffu) << 4));         /* EXT_READL, 1 byte */
++	if (!rb_spmi_wait(ch)) {
++		return false;
++	}
++	*v = (uint8_t)rb_rd(ch, 0x18);
++	return true;
++}
++
++static bool
++rb_spmi_write(unsigned addr, uint8_t v)
++{
++	vm_offset_t ch = rb_chnls + 0x80u * rb_apid;                 /* EE 0 */
++	rb_wr(ch, 0x10, v);                                         /* WDATA0 */
++	rb_wr(ch, 0x00, (0u << 27) | ((addr & 0xffu) << 4));         /* EXT_WRITEL, 1 byte */
++	return rb_spmi_wait(ch);
++}
++
++static bool
++rb_spmi_rmw(unsigned addr, uint8_t mask, uint8_t val)
++{
++	uint8_t old = 0;
++	if (!rb_spmi_read(addr, &old)) {
++		return false;
++	}
++	bool ok = rb_spmi_write(addr, (uint8_t)((old & ~mask) | (val & mask)));
++	uint8_t now = 0;
++	(void)rb_spmi_read(addr, &now);
++	printf("SWEET: PMIC 0x%03x 0x%02x -> 0x%02x (%s)\n", addr, old, now, ok ? "ok" : "write failed");
++	return ok;
++}
++
 +static void __attribute__((noreturn))
 +sweet_reboot_bootloader(void)
 +{
 +	vm_offset_t imem = ml_io_map(IMEM_PAGE, 0x1000);
 +	vm_offset_t pshold = ml_io_map(PSHOLD, 0x1000);
 +	printf("SWEET: rebooting into Fastboot\n");
-+	delay(200000);                          /* let the console and USB log drain */
++	if (rb_spmi_init()) {
++		(void)rb_spmi_rmw(PON_SOFT_RB_SPARE, 0xfe, 1u << 1);    /* BOOTLOADER */
++		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL2, 0x80, 0x00);
++		delay(1000);                                    /* >= 10 sleep-clock cycles */
++		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL, 0x0f, 0x01);     /* warm reset */
++		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL2, 0x80, 0x80);
++	} else {
++		printf("SWEET: no SPMI channel for the PON; IMEM reason only\n");
++	}
 +	if (imem) {
 +		*(volatile uint32_t *)(imem + IMEM_RESTART_REASON) = RESTART_BOOTLOADER;
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(300000);                          /* let the console and USB log drain */
++	if (pshold) {
++		*(volatile uint32_t *)pshold = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(500000);
++	}
 +	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
 +	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
 +	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
-+	if (pshold) {
-+		*(volatile uint32_t *)pshold = 0;
-+	}
 +	for (;;) {
 +		__asm__ volatile ("wfe");
 +	}
