@@ -1,12 +1,9 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -2050,7 +2050,62 @@
- 		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
- 		(void)assert_wait_deadline(&sweet_gpu_watch_chan, THREAD_UNINT, deadline);
- 		thread_block(THREAD_CONTINUE_NULL);
-+	}
-+}
-+
+@@ -2053,7 +2053,62 @@
+ 	}
+ }
+ 
 +/*
 + * sweetgpudcvstest=1: one DCVS experiment after bring-up. For each level,
 + * change the perf level, read the core state at once and 50 ms later, run
@@ -27,7 +24,7 @@
 +	return *scratch == value;
 +}
 +
-+static void
+ static void
 +gpu_dcvs_test(void)
 +{
 +	static const unsigned levels[] = { 6, 3, 1, 7 };
@@ -57,13 +54,16 @@
 +				break;
 +			}
 +		}
- 	}
++	}
 +	lck_mtx_unlock(gpu_mtx);
 +	gpu_dcvs = saved;
- }
- 
- static void
-@@ -2092,6 +2147,11 @@
++}
++
++static void
+ gpu_runtime_start(vm_offset_t smmu)
+ {
+ 	gfx_smmu = smmu;
+@@ -2092,6 +2147,26 @@
  	}
  	gpu_seqno = sweet_gpu_retired();
  	gpu_ready = true;
@@ -71,6 +71,21 @@
 +	PE_parse_boot_argn("sweetgpudcvstest", &dcvstest, sizeof(dcvstest));
 +	if (dcvstest) {
 +		gpu_dcvs_test();
++	} else {
++		/* Fixed GPU level, set once and only downwards: on hardware every
++		 * step down (650, 355, 180 MHz) kept the core running, the step
++		 * back up to 800 MHz lost its state. sweetgpulevel=N picks the
++		 * gpu_khz[] index (1..7), default 6 = 650 MHz. */
++		int level = 6;
++		PE_parse_boot_argn("sweetgpulevel", &level, sizeof(level));
++		if (level >= 1 && (unsigned)level < GPU_LEVEL_BUSY) {
++			lck_mtx_lock(gpu_mtx);
++			int saved = gpu_dcvs;
++			gpu_dcvs = 1;
++			gpu_set_level((unsigned)level);
++			gpu_dcvs = saved;
++			lck_mtx_unlock(gpu_mtx);
++		}
 +	}
  	thread_t watcher;
  	if (kernel_thread_start(gpu_gx_watch, NULL, &watcher) == KERN_SUCCESS) {
