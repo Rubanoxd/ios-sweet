@@ -16,8 +16,10 @@ fill/copy verified on the phone as root and as mobile. Shaders: Metal kernels fr
 0 wrong. Rendering works too: textures, render pipelines (blending), render passes and draws; a triangle with a
 blended half-transparent veil renders correctly on the phone. Textures and samplers in shaders work (a PNG drawn
 with bound and constexpr samplers, 2852/2852 sample points right). Libraries translate per function. QuartzCore's
-default.metallib is AIR (141 functions); Iridium handles 32 so far: see JOYEUSE.md "QuartzCore" for the gaps and
-the path to backboardd GPU compositing.
+default.metallib is AIR (141 functions); with tools/iridium-patches/0002 Iridium translates 97 (93 valid SPIR-V):
+see JOYEUSE.md "QuartzCore" for the remaining gaps (framebuffer reads, inlining, imageblocks, control flow) and the
+path to backboardd GPU compositing. Mac USB network: `networksetup -setmanual "Sweet iOS (USB Ethernet)"
+192.168.7.1 255.255.255.0` (no sudo, persists) when the sudo usbnet script is not running.
 
 ### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<
 

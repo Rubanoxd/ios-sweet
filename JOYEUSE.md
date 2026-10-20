@@ -577,11 +577,29 @@ QuartzCore (what backboardd would need), from the iOS 16.7 images:
   `newRenderPipelineStateWithName:` on that pipeline library, and
   `compile_shader` builds specialized vertex/fragment shaders from encoded
   "Spec" names; no MSL source compile was seen in those paths.
-- Iridium translates 32 of the 141 to valid SPIR-V (Mac and phone). The rest
-  stop at: air.* math intrinsics (floor, dot, fmin, fabs, fma, atan2,
-  saturate, conversions, sample_texture_3d), calls to non-inlined template
-  functions, half/ushort types and a few instructions (select, icmp,
-  alloca). Per-function list: `sweet-air2spv default.metallib`.
+- Iridium as released translated 32 of the 141 to valid SPIR-V.
+  `tools/iridium-patches/0002-quartzcore-coverage.patch` (on top of 0001)
+  brings it to 97 translated, 93 valid for Vulkan 1.3 (`spirv-val`): every
+  fcmp/icmp predicate (scalar and vector), select, sext/trunc/fpext,
+  float<->int conversions, fneg, freeze, ptrtoint/inttoptr, i1 as real bool
+  (logical and/or/xor, bool constants, zext/sitofp of bools), a generic
+  air.* library table (floor..atan2, fma, mix, step, clamp, saturate, dot,
+  length, min/max/clamp/abs for ints, air.convert.*), 3D/1D/array/MS/depth
+  texture classes, Flat on integer fragment inputs, same-width int casts as
+  bitcasts, 16-bit builtins, and the builtins instance_id,
+  thread_position_in_threadgroup, threadgroup_position_in_grid,
+  threads_per_threadgroup, thread_index_in_threadgroup,
+  threadgroups_per_grid, thread_index_in_quadgroup, front_facing,
+  point_coord. Measured with a host build of the same glue
+  (`sweet-air2spv`) and `spirv-val --target-env vulkan1.3`; on the phone
+  the plugin's own build translates the same 97 (2026-10-20), and
+  sweet-mtltest still passes. Turnip has not compiled these yet (that
+  happens at pipeline creation, once QuartzCore asks for them).
+  Still missing (44): framebuffer reads `[[color(n)]]` / air.render_target
+  (16; Turnip has dynamicRenderingLocalRead, the way to do it), calls to
+  non-inlined template functions (12; needs an LLVM inlining pass before
+  Iridium), imageblocks (4, tile shading), and control flow Iridium does
+  not structure (switch, loops/forward references, alloca: ~12).
 Path to GPU compositing: extend Iridium (intrinsics, half/i16, an LLVM
 inlining pass before translation), `newRenderPipelineStateWithName:`
 (pipeline library names -> our pipelines), IOSurface textures (surface

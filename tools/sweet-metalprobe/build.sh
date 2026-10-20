@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds SweetMetalProbe.bundle (see SweetMetalProbe.m) for iOS 16 arm64
 # with the Theos SDK and Mesa's Vulkan headers (see tools/build-turnip-ios.sh
-# for the layout). Shaders: Darling's Iridium (../../../indium, patched with
-# tools/iridium-patches) over LLVM 14 for iOS (tools/build-llvm-ios.sh).
+# for the layout). Shaders: Darling's Iridium (../../../indium at 8423a7d,
+# with tools/iridium-patches/0001 and 0002 applied in order) over LLVM 14 for
+# iOS (tools/build-llvm-ios.sh).
 # The device needs Turnip at /var/jb/usr/lib/libvulkan_freedreno.dylib.
 #   tools/sweet-metalprobe/build.sh [OUTDIR]
 # Also builds into OUTDIR: sweet-mtlquery (what MTLCreateSystemDefaultDevice
