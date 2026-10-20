@@ -282,9 +282,16 @@ long-descriptor FORMAT field). iOS keeps running.
    `RBBM_SECVID_TRUST_CNTL` stalled the probe thread for good (iOS kept
    running). The second build tries the PAS calls anyway and never touches
    that register (`sweetgpuzap=0` skips the zap).
+   Second run (2026-10-20): **the GPU executes commands.** TrustZone takes
+   the zap even though `pas_is_supported` says 0: `pas_init_image` (6860
+   bytes of metadata), `pas_mem_setup(0x93b15000, 0x1000)` and
+   `pas_auth_and_reset` all return 0; `CP_SET_SECURE_MODE 0` drains;
+   `CP_MEM_WRITE` drains and the CPU reads `0xcafe0618` back from memory
+   written by the GPU through SMMU bank 0; no SMMU fault, no CP fault.
 
-Next steps: the GPU's own SMMU context (stream 0) and the a6xx hw_init
-register setup, then the zap shader (`a615_zap` via the SCM PAS calls), the
+Next steps: interrupts (RBBM, GMU) instead of polling, hwcg, CP protect
+and UBWC from hw_init, then a kernel GPU service with a KGSL-like user
+client (buffers, submit, fences) for Turnip (`a615_zap` via the SCM PAS calls), the
 SQE microcode and the first ring.
 
 ## Internet over USB
