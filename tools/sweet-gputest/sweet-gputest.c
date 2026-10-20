@@ -271,8 +271,9 @@ main(int argc, const char **argv)
 	}
 	NativeAdrenoAbiStatus st = { 0, 0 };
 	call(NativeAdrenoMethodGetStatus, 0, 0, &st, sizeof(st));
-	printf("burst: %u jobs, wait 0x%x, last value %u, %u busy retries, %llu us; gpu clock +%llu, faults %llu\n",
-	    jobs, kr, data.cpu[1], busy, ticks * 10 / 192, t1.ticks - t0.ticks, st.faults);   /* 19.2 MHz */
+	uint32_t last_value = data.cpu[1];       /* before the close unmaps it */
+	printf("burst: %u jobs, wait 0x%x, last value %u, %u busy retries, %llu us; gpu clock %llu -> %llu, "
+	    "faults %llu\n", jobs, kr, last_value, busy, ticks * 10 / 192, t0.ticks, t1.ticks, st.faults);
 	IOServiceClose(conn);
-	return got == 0x600df00du && data.cpu[1] == jobs ? 0 : 2;
+	return got == 0x600df00du && last_value == jobs ? 0 : 2;
 }

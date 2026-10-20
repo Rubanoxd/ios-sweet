@@ -312,9 +312,23 @@ long-descriptor FORMAT field). iOS keeps running.
    as `/var/jb/usr/bin/sweet-gputest`) checks the whole path from a user
    process: one CP_MEM_WRITE through an IB, then a burst of jobs.
 
-Next steps: run sweet-gputest on gpu8; build Turnip with UniXNU's
+   Hardware (2026-10-20): **a user process drives the GPU.**
+   `sweet-gputest`: buffers at GPU 0x40000000/0x40100000, mapped into the
+   process, an IB with CP_MEM_WRITE submitted through the user client:
+   `GPU wrote 0x600df00d ... OK`; a burst of 50 jobs (IRQ fence each) in
+   2.1 ms with no busy retry and no fault. Two earlier runs froze the phone
+   (no panic on screen): the step trace (`sweetgpudebug=1`, `sweet-gputest
+   N notime slow`) showed the last step was IOConnectMapMemory64 of a
+   buffer made of kernel RAM, write-combined; changing a managed page's
+   cache mode rewrites its physical-aperture PTE and hangs this port. The
+   buffers now come from DDR the kernel does not manage (0xb0000000 -
+   0xfd000000 with the `--highmem` ADT), mapped write-combined everywhere.
+   Open: `CP_ALWAYS_ON_COUNTER` does not count (GetTimestamp is constant).
+
+Next steps: build Turnip with UniXNU's
 `turnip-darwin-kmd.patch` for iOS (needs an iOS SDK, which this Mac lacks)
-and run it with `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`; hwcg and CP
+and run it with `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`; a running
+GPU timestamp (GMU always-on counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
 
 ## Internet over USB
