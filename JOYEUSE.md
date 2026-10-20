@@ -291,8 +291,7 @@ long-descriptor FORMAT field). iOS keeps running.
 
 Next steps: interrupts (RBBM, GMU) instead of polling, hwcg, CP protect
 and UBWC from hw_init, then a kernel GPU service with a KGSL-like user
-client (buffers, submit, fences) for Turnip (`a615_zap` via the SCM PAS calls), the
-SQE microcode and the first ring.
+client (buffers, submit, fences) for Turnip.
 
 ## Internet over USB
 
