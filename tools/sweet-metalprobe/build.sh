@@ -1,6 +1,8 @@
 #!/bin/sh
 # Builds SweetMetalProbe.bundle (see SweetMetalProbe.m) for iOS 16 arm64
-# with the Theos SDK (see tools/build-turnip-ios.sh for the layout).
+# with the Theos SDK and Mesa's Vulkan headers (see tools/build-turnip-ios.sh
+# for the layout); the Turnip job needs the ICD at
+# /var/jb/usr/lib/libvulkan_freedreno.dylib on the phone.
 #   tools/sweet-metalprobe/build.sh [OUTDIR]
 # Also builds OUTDIR/sweet-mtlquery (prints what MTLCreateSystemDefaultDevice
 # returns). Install: copy OUTDIR/SweetMetalProbe.bundle to /System/Library/Extensions
@@ -13,9 +15,13 @@ b="$out/SweetMetalProbe.bundle"
 rm -rf "$b"
 mkdir -p "$b"
 cp Info.plist "$b/Info.plist"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+glslangValidator -V --target-env vulkan1.1 --vn spv_compute_comp -o "$tmp/compute_comp.h" \
+	../sweet-vktest/compute.comp >/dev/null
 clang -target arm64-apple-ios16.0 -isysroot "$top/sdk/theos-sdks/iPhoneOS16.5.sdk" -Os -Wall \
-	-fno-objc-arc -bundle -framework Foundation -framework Metal \
-	SweetMetalProbe.m -o "$b/SweetMetalProbe"
+	-Wno-missing-braces -fno-objc-arc -bundle -framework Foundation -framework Metal \
+	-I "$top/mesa/src/include" -I "$tmp" SweetMetalProbe.m turnip-job.c -o "$b/SweetMetalProbe"
 codesign -f -s - "$b"
 file "$b/SweetMetalProbe"
 clang -target arm64-apple-ios16.0 -isysroot "$top/sdk/theos-sdks/iPhoneOS16.5.sdk" -Os -Wall \

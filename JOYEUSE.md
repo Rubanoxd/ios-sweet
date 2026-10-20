@@ -465,5 +465,21 @@ returns). Installed as `/System/Library/Extensions/SweetMetalProbe.bundle`
 - None of them called `IOServiceOpen` on the accelerator before the plugin:
   the open is the plugin's job (`_MTLDevice`'s IOGPU path does it in the
   original plugins).
-Next: stage 2, the plugin opens our GPU user client and runs a Turnip
-compute job from inside SpringBoard, still returning nil.
+
+Stage 2 works (same kernel and shim, 2026-10-20). On its first
+`initWithAcceleratorPort:` in SpringBoard (or `sweet-mtlquery`) the plugin
+starts a thread that loads Turnip (`/var/jb/usr/lib/libvulkan_freedreno.dylib`),
+opens our GPU user client, runs sweet-vktest's compute shader over 64K
+uints, checks every word, destroys device and instance, logs one line and
+still returns nil (`tools/sweet-metalprobe/turnip-job.c`):
+- `sweet-mtlquery[282] uid 0: turnip OK: Turnip Adreno (TM) 618: compute
+  65536 words OK (0 bad), device 151.6 ms, ir3 19.5 ms, run 0.74 ms`
+- after a respring (`killall SpringBoard`, so it loads the new bundle):
+  `SpringBoard[293] uid 501: turnip OK: ... 65536 words OK (0 bad), device
+  33.4 ms, ir3 3.3 ms, run 0.29 ms`; SpringBoard and backboardd kept their
+  PIDs for the next minute, the GPU watchdog saw no hang.
+So a mobile-user UI process reaches the GPU through Metal's own discovery,
+with no sandbox or library-validation obstacle on this port.
+Next: stage 3, a real `MTLDevice` (UniXNU's Metal frontend over Turnip,
+AIR to NIR) returned to one client process first, never to backboardd
+until it can composite.

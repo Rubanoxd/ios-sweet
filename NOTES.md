@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-10-20: joyeuse Metal discovery reaches our plugin; SpringBoard runs Turnip <<<
+
+See `JOYEUSE.md` "Metal". xnu **0096** (commit fdb1a6c, CI 39456547147, `xnu/out-0096`): opt-in
+(`sweetmetal=1`) built-in `IOAcceleratorES` with `MetalPluginName` = SweetMetalProbe. Shim
+`shim/out/shim-boot-joyeuse-metal1.img` = gpu11 cmdline + `sweetmetal=1`. Bundle `tools/sweet-metalprobe`
+(installed on the phone in `/System/Library/Extensions`): backboardd and SpringBoard load it; in SpringBoard
+it runs a Turnip compute job (verified OK after a respring) and returns nil, so the UI stays on the CPU
+renderer. Next: stage 3, a real MTLDevice for one client process.
+
 ### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<
 
 See `JOYEUSE.md` "GPU" and "Turnip". Observed on the phone (fork Rubanoxd/ios-sweet, branch joyeuse):
