@@ -1,0 +1,77 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2050,7 +2050,62 @@
+ 		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+ 		(void)assert_wait_deadline(&sweet_gpu_watch_chan, THREAD_UNINT, deadline);
+ 		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/*
++ * sweetgpudcvstest=1: one DCVS experiment after bring-up. For each level,
++ * change the perf level, read the core state at once and 50 ms later, run
++ * a CP_MEM_WRITE if the state survived, restart the core if not.
++ */
++static bool
++gpu_memwrite_probe(uint32_t value)
++{
++	volatile uint32_t *scratch = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF);
++	*scratch = 0;
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++	rb_pkt7(CP_MEM_WRITE, 3);
++	rb_out(GFX_IOVA + GFX_SCRATCH_OFF);
++	rb_out(0);
++	rb_out(value);
++	(void)rb_kick("dcvstest mem_write");
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++	return *scratch == value;
++}
++
++static void
++gpu_dcvs_test(void)
++{
++	static const unsigned levels[] = { 6, 3, 1, 7 };
++	int saved = gpu_dcvs;
++	gpu_dcvs = 1;
++	lck_mtx_lock(gpu_mtx);
++	for (unsigned i = 0; i < sizeof(levels) / sizeof(levels[0]); ++i) {
++		unsigned want = levels[i];
++		gpu_set_level(want);
++		uint32_t gx0 = gpu_rd(sg.gpucc, GPUCC_GX_GDSCR);
++		uint32_t base0 = gpu_gx_on() ? core_rd(0x0800) : 0;
++		delay(50000);
++		bool on = gpu_gx_on();
++		uint32_t base1 = on ? core_rd(0x0800) : 0, rptr = on ? core_rd(0x0806) : 0;
++		uint32_t rbbm = on ? core_rd(0x0210) : 0;
++		gpu_log("dcvstest %u kHz: level %u, gx 0x%08x -> 0x%08x, CP_RB_BASE 0x%08x -> 0x%08x, rptr %u "
++		    "wptr %u rbbm 0x%08x sptprac 0x%08x rpmh 0x%08x", gpu_khz[want], gpu_level, gx0,
++		    gpu_rd(sg.gpucc, GPUCC_GX_GDSCR), base0, base1, rptr, rb_wptr, rbbm,
++		    gpu_rd(sg.gmu, GMU_REG(0x50d0)), gpu_rd(sg.gmu, GMU_REG(0x50ec)));
++		if (on && !gpu_core_lost()) {
++			gpu_log("dcvstest %u kHz: mem_write %s", gpu_khz[want],
++			    gpu_memwrite_probe(0xd0c50000u | want) ? "ok" : "FAILED");
++		} else {
++			gpu_log("dcvstest %u kHz: restart %s", gpu_khz[want],
++			    on && gpu_restart("dcvstest") ? "ok" : "failed");
++			if (!gpu_ready) {
++				break;
++			}
++		}
+ 	}
++	lck_mtx_unlock(gpu_mtx);
++	gpu_dcvs = saved;
+ }
+ 
+ static void
+@@ -2092,6 +2147,11 @@
+ 	}
+ 	gpu_seqno = sweet_gpu_retired();
+ 	gpu_ready = true;
++	int dcvstest = 0;
++	PE_parse_boot_argn("sweetgpudcvstest", &dcvstest, sizeof(dcvstest));
++	if (dcvstest) {
++		gpu_dcvs_test();
++	}
+ 	thread_t watcher;
+ 	if (kernel_thread_start(gpu_gx_watch, NULL, &watcher) == KERN_SUCCESS) {
+ 		thread_deallocate(watcher);
