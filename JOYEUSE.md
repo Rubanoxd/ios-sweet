@@ -754,3 +754,33 @@ Firmware: from the MIUI ROM's `NON-HLOS.bin` (a FAT image with 4 KiB
 sectors; `mdir`/`mcopy` from mtools read it, hdiutil does not):
 `image/modem.mdt`, `modem.b00`-`b29`, `wlanmdsp.mbn`, `bdwlan.*`. Xiaomi's
 blobs: on the phone in `/usr/share/firmware/joyeuse/modem/`, never in git.
+
+## Dual boot iOS / Android 17: plan (2026-10-20)
+
+User decision: half of `userdata` for iOS, half for Android, no MIUI, an
+Android 17 ROM, and an on-screen menu.
+- LUN0 GPT (same as the MIUI ROM's `gpt_main0.bin`): `userdata` starts at
+  block 0x28ca28 and grows to the end, 53620 MiB on this phone. The iOS HFS
+  volume uses its first 16 GiB. Split: entry 17 keeps its start, shrinks to
+  ~26.8 GiB and is renamed `iosroot` (kernel boot-arg `ufsroot=iosroot`;
+  the console log ring follows the partition's new end); a new entry 18
+  `userdata` (same type GUID, new unique GUID) takes the rest for Android.
+  This must happen **before** any Android recovery runs "Format Data",
+  which formats whatever is named `userdata`. Backups first: the GPT
+  blocks and the HFS volume.
+- ROM: RisingOS 9 "elefthería" (Android 17), official for miatoll
+  (RisingOS-Revived/official_devices, OTA/device/{VANILLA,GAPPS}/miatoll.json;
+  2026-10-11 VANILLA 2.39 GB, sha256 3c5df2c1…a92a), recovery OrangeFox.
+  The phone has the MIUI 14 (V14.0.3) firmware these ROMs expect.
+- Partitions: `boot` = the shim with the menu and the XNU payload;
+  `recovery` = OrangeFox; `recoverybak` (128 MiB, unused by ABL) = the
+  ROM's kernel, ramdisk and cmdline repacked uncompressed for the shim.
+  ROM updates rewrite `boot`: repack and reflash the shim afterwards.
+- Shim menu: draw iOS / Android on the ABL framebuffer, read the keys over
+  SPMI as bsd/dev/sweet_keys.c does (PON real-time status 0x810 on PM6150
+  SID 0; vol+ is PM6150L SID 4 GPIO2 at 0xc110), default iOS after a
+  timeout. Android: copy the Image to a 2 MiB-aligned base + text_offset
+  in the upper bank, the ramdisk after it, rewrite /chosen bootargs and
+  linux,initrd-start/end in a copy of ABL's FDT (ABL already merged the
+  ROM's dtbo; the shim boot.img carries the ROM's dtb), MMU and caches
+  off, x0 = FDT.

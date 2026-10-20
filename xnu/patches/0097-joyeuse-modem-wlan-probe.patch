@@ -251,7 +251,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan.c
-@@ -0,0 +1,835 @@
+@@ -0,0 +1,843 @@
 +/*
 + * JOYEUSE: Wi-Fi bring-up, staged like the GPU (bsd/dev/sweet_gpu.c).
 + *
@@ -468,6 +468,14 @@
 +		uint32_t hosts = sm32(e + 12);
 +		unsigned h0 = hosts & 0xffffu, h1 = hosts >> 16;
 +		if (!off || !size || off >= SMEM_SIZE || size > SMEM_SIZE - off) {
++			continue;
++		}
++		/* Partitions of other host pairs are XPU-protected from apps (a read
++		 * stalls); like qcom_smem.c, touch only apps' and the global one. */
++		bool ours = h0 == SMEM_HOST_APPS || h1 == SMEM_HOST_APPS ||
++		    (h0 == SMEM_GLOBAL_HOST && h1 == SMEM_GLOBAL_HOST);
++		if (!ours) {
++			wl_log("smem: partition %u hosts %u/%u at 0x%x size 0x%x (not apps')", i, h0, h1, off, size);
 +			continue;
 +		}
 +		char pm[5] = { 0 };
