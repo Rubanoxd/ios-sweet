@@ -325,10 +325,35 @@ long-descriptor FORMAT field). iOS keeps running.
    0xfd000000 with the `--highmem` ADT), mapped write-combined everywhere.
    Open: `CP_ALWAYS_ON_COUNTER` does not count (GetTimestamp is constant).
 
-Next steps: build Turnip with UniXNU's
-`turnip-darwin-kmd.patch` for iOS (needs an iOS SDK, which this Mac lacks)
-and run it with `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`; a running
-GPU timestamp (GMU always-on counter); hwcg and CP
+## Turnip (Vulkan) on the Adreno
+
+**Vulkan runs on the GPU under iOS** (2026-10-20): Mesa's Turnip with
+UniXNU's darwin kernel backend, built for iOS 16, finds
+`NativeAdrenoGpuPublished`, reports `Turnip Adreno (TM) 618, Vulkan
+1.3.354` (vendor 0x5143, device 0x6010800, one 2022 MiB heap), creates a
+device, and a `vkCmdFillBuffer` of 1 MiB executed by the GPU reads back
+right (`tools/sweet-vkinfo`).
+
+Build (outside git, next to this checkout):
+- `../sdk/theos-sdks/iPhoneOS16.5.sdk`: sparse clone of github.com/theos/sdks
+  (commit 0222fd5) - there is no Xcode on this Mac.
+- `../mesa/src`: Mesa at 85fda3b3 (tree b72ff1eb, UniXNU's pin) plus
+  UniXNU's five `patches/mesa` patches (UniXNU dec4c7b) plus
+  `tools/mesa-patches/0001-tu-has-host-import.patch` (their backend uses a
+  `tu_physical_device` field their patch does not declare).
+- `../mesa/venv`: meson, mako, pyyaml, packaging; Homebrew bison 3.8,
+  glslang, ninja.
+- `tools/build-turnip-ios.sh` configures (cross file for arm64-apple-ios16.0
+  with the Theos SDK, UniXNU's option set, `-Dtu-darwin-abi-dir` = the
+  kernel's `NativeAdrenoABI.h`) and builds
+  `../mesa/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib` (17 MB).
+- On the phone: `/var/jb/usr/lib/libvulkan_freedreno.dylib` (ad-hoc signed)
+  and `/var/jb/usr/bin/sweet-vkinfo`, which loads it as an ICD without a
+  loader (`vk_icdGetInstanceProcAddr`) and sets
+  `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`.
+
+Next steps: real rendering tests (a compute shader, a render pass); a
+running GPU timestamp (GMU always-on counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
 
 ## Internet over USB

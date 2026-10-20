@@ -1,0 +1,13 @@
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index d32a7d8..618f316 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -136,6 +136,8 @@ struct tu_physical_device
+    uint64_t va_size;
+ 
+    bool has_cached_coherent_memory;
++   /* darwin backend: the kernel can wire caller memory as a BO (EXT_external_memory_host) */
++   bool has_host_import;
+    bool has_cached_non_coherent_memory;
+    /* Index for device local, host-coherent, host-cached memory.
+     * Only set to positive index when overwriting device-local, uncached memory
