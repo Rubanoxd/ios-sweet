@@ -21,7 +21,7 @@ current-version: 1319
 exports:
   - targets:         [ arm64-ios ]
     symbols:         [ _dlopen, _dlsym, _dlerror, _dprintf, _atoi, _memset, _memcpy,
-                       _mach_absolute_time ]
+                       _mach_absolute_time, _usleep ]
 ...
 EOF
 clang -target arm64-apple-ios16.0 -Os -Wall -Wno-incompatible-sysroot -ffreestanding \

@@ -33,14 +33,15 @@
  	core_wr(0x0038, 0);                       /* RBBM_INT_0_MASK: polled */
  
  	core_wr64(0x0830, GFX_IOVA + GFX_SQE_OFF);   /* CP_SQE_INSTR_BASE */
-@@ -1406,10 +1416,22 @@
+@@ -1405,11 +1415,23 @@
+ #define CP_EVENT_WRITE    0x46u
  #define CACHE_FLUSH_TS    4u
  #define RBBM_INT_MASK     ((1u << 1) | (1u << 9) | (1u << 20) | (1u << 23) | (1u << 24) | (1u << 25))
- 
++
 +extern void sweet_irq_enable(uint32_t intid, bool enable);
 +
 +#define GPU_FAULT_BITS    ((1u << 1) | (1u << 9) | (1u << 23) | (1u << 24) | (1u << 25))
-+
+ 
  static struct {
  	volatile uint64_t count;
  	volatile uint32_t status;
@@ -116,7 +117,7 @@
  	volatile uint32_t *fence = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF + 0x40);
  	*fence = 0;
  	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
-@@ -1458,8 +1520,381 @@
+@@ -1458,8 +1520,396 @@
  	    gpu_irq.count - before, gpu_irq.status, *fence, core_rd(0x0806), rb_wptr);
  	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
  	return gpu_irq.count > before && *fence == 0x618;
@@ -157,7 +158,8 @@
 +
 +static bool gpu_ready;
 +static int sweet_gpu_watch_chan;
-+static int gpu_trace = 64;              /* kernel log lines left for maps and submits */
++static int gpu_trace = 64;
++static int gpu_debug;                   /* sweetgpudebug=1: slow step trace */              /* kernel log lines left for maps and submits */
 +static vm_offset_t gfx_smmu;
 +static lck_grp_t *gpu_lck_grp;
 +static lck_mtx_t *gpu_mtx;
@@ -187,8 +189,8 @@
 +	*va = gfx_pool + 0x1000 * gfx_pool_left;
 +	*pa = gfx_pool_pa + 0x1000 * gfx_pool_left;
 +	return true;
- }
- 
++}
++
 +static void
 +gfx_tlb_flush(void)
 +{
@@ -290,6 +292,11 @@
 +		printf("SWEET GPU: map 0x%llx -> pa 0x%llx +0x%llx %s\n", iova, pa, bytes, writable ? "rw" : "ro");
 +	}
 +	lck_mtx_lock(gpu_mtx);
++	if (gpu_debug) {
++		printf("SWEET GPU: vm_map 0x%llx: locked, l1[%u] 0x%llx\n", iova, (unsigned)(iova >> 30) & 3,
++		    ((uint64_t *)gfx_mem)[(iova >> 30) & 3]);
++		delay(300000);
++	}
 +	for (uint64_t off = 0; off < bytes && !err; off += 0x1000) {
 +		uint64_t pte_pa;
 +		uint64_t *pte = gfx_pte(iova + off, true, &pte_pa);
@@ -303,14 +310,22 @@
 +			flush_dcache64((addr64_t)pte_pa, 8, TRUE);
 +		}
 +	}
++	if (gpu_debug) {
++		printf("SWEET GPU: vm_map 0x%llx: ptes written (err %d), TLB flush\n", iova, err);
++		delay(300000);
++	}
 +	gfx_tlb_flush();
++	if (gpu_debug) {
++		printf("SWEET GPU: vm_map 0x%llx: TLB flushed\n", iova);
++		delay(300000);
++	}
 +	lck_mtx_unlock(gpu_mtx);
 +	if (err) {
 +		(void)sweet_gpu_vm_unmap(iova, bytes);
 +	}
 +	return err;
-+}
-+
+ }
+ 
 +int
 +sweet_gpu_vm_unmap(uint64_t iova, uint64_t bytes)
 +{
@@ -472,6 +487,7 @@
 +gpu_runtime_start(vm_offset_t smmu)
 +{
 +	gfx_smmu = smmu;
++	PE_parse_boot_argn("sweetgpudebug", &gpu_debug, sizeof(gpu_debug));
 +	gpu_lck_grp = lck_grp_alloc_init("sweet_gpu", LCK_GRP_ATTR_NULL);
 +	gpu_mtx = lck_mtx_alloc_init(gpu_lck_grp, LCK_ATTR_NULL);
 +	/* The tables stage 6 built: L2 for [0, 1 GiB) and the L3 of GFX_IOVA. */
@@ -498,7 +514,7 @@
  static int sweet_gpu_sleep_chan;
  
  static void
-@@ -1491,7 +1926,9 @@
+@@ -1491,7 +1941,9 @@
  		if (smmu != 0) {
  			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
  			    sg.stage >= 6 && gpu_stage_cp(smmu) && sg.stage >= 7) {
@@ -730,7 +746,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,686 @@
 +/*
 + * JOYEUSE: the Adreno 618 as an IOKit service for userspace.
 + *
@@ -769,9 +785,12 @@
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <libkern/c++/OSString.h>
 +#include <sys/errno.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
 +#include "NativeAdrenoABI.h"
 +
 +extern "C" {
++int vsnprintf(char *, size_t, const char *, va_list);
 +struct sweet_gpu_info {
 +	uint32_t chip_id, gmem_bytes;
 +	uint64_t gmem_base, uche_trap_base, va_start, va_size;
@@ -787,6 +806,33 @@
 +uint64_t sweet_gpu_timestamp(void);
 +uint64_t sweet_gpu_faults(void);
 +void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
++
++/* sweetgpudebug=1: every step goes to the console (and so to the USB live
++ * log) followed by a 300 ms pause, so the last line before a hard hang of
++ * the phone still gets out. */
++static int sAdrenoDebug = -1;
++
++static void
++adrenoStep(const char *fmt, ...) __printflike(1, 2);
++
++static void
++adrenoStep(const char *fmt, ...)
++{
++	if (sAdrenoDebug < 0) {
++		sAdrenoDebug = 0;
++		PE_parse_boot_argn("sweetgpudebug", &sAdrenoDebug, sizeof(sAdrenoDebug));
++	}
++	if (!sAdrenoDebug) {
++		return;
++	}
++	char line[160];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("SWEET ADRENO: %s\n", line);
++	IOSleep(300);
 +}
 +
 +class NativeAdrenoGpuPublished : public IOService {
@@ -928,6 +974,7 @@
 +	for (uint64_t off = 0; off < e->bytes;) {
 +		IOByteCount len = 0;
 +		addr64_t pa = e->md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		adrenoStep("mapSegments: off 0x%llx pa 0x%llx len 0x%llx", off, (uint64_t)pa, (uint64_t)len);
 +		if (pa == 0 || len == 0) {
 +			(void)sweet_gpu_vm_unmap(iova, off);
 +			return kIOReturnVMError;
@@ -970,7 +1017,7 @@
 +SweetAdrenoUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 +    IOMemoryDescriptor **memory)
 +{
-+	IOLog("SWEET ADRENO: clientMemoryForType %u\n", (unsigned)type);
++	adrenoStep("clientMemoryForType %u", (unsigned)type);
 +	IOLockLock(fLock);
 +	Entry *e = lookup(type);
 +	if (e == NULL || e->token != type || e->imported) {
@@ -1006,12 +1053,13 @@
 +	bool trace = sAdrenoTrace > 0;
 +	if (trace) {
 +		sAdrenoTrace--;
-+		IOLog("SWEET ADRENO: method %u in %u out %u\n", selector, args->structureInputSize,
++		printf("SWEET ADRENO: method %u in %u out %u\n", selector, args->structureInputSize,
 +		    args->structureOutputSize);
++		adrenoStep("method %u start", selector);
 +	}
 +	IOReturn r = dispatchMethod(selector, args, dispatch, target, reference);
 +	if (trace) {
-+		IOLog("SWEET ADRENO: method %u -> 0x%x\n", selector, r);
++		printf("SWEET ADRENO: method %u -> 0x%x\n", selector, r);
 +	}
 +	return r;
 +}
@@ -1122,13 +1170,16 @@
 +		}
 +		/* Below 2^36 (SMMU output), aligned as asked (at least a page). */
 +		mach_vm_address_t mask = 0xfffffffffull & ~((1ull << (a.align_log2 > 14 ? a.align_log2 : 14)) - 1);
++		adrenoStep("BoAlloc: inTaskWithPhysicalMask 0x%llx bytes", a.bytes);
 +		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 +		    kIODirectionInOut | (a.contiguous ? kIOMemoryPhysicallyContiguous : 0), a.bytes, mask);
 +		if (md == NULL) {
 +			ret = kIOReturnNoMemory;
 +			break;
 +		}
++		adrenoStep("BoAlloc: md %p, bzero", md);
 +		bzero(md->getBytesNoCopy(), (size_t)a.bytes);
++		adrenoStep("BoAlloc: clean caches");
 +		for (uint64_t off = 0; off < a.bytes;) {
 +			IOByteCount len = 0;
 +			addr64_t pa = md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
@@ -1197,7 +1248,9 @@
 +			ret = kIOReturnBadArgument;
 +			break;
 +		}
++		adrenoStep("BoMap: handle %llu at 0x%llx", m.handle, m.iova);
 +		ret = mapSegments(e, m.iova, (m.permissions & 2) != 0);
++		adrenoStep("BoMap: 0x%x", ret);
 +		if (ret == kIOReturnSuccess) {
 +			e->iova = m.iova;
 +			NativeAdrenoAbiBoMapReply r = { m.iova };

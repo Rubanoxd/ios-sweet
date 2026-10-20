@@ -6,7 +6,8 @@
  * CP_MEM_WRITE, submit, wait for the fence, check the value; then a burst of
  * submissions to time the fences. Run as root on the phone.
  *
- *   sweet-gputest [JOBS]        default 200 jobs in the burst
+ *   sweet-gputest [JOBS [notime] [slow]]   default 200 jobs in the burst;
+ *       notime skips GetTimestamp, slow announces every call and pauses 1 s
  *
  * Built without an iOS SDK (tools/sweet-gputest/build.sh): IOKit is reached
  * through dlopen/dlsym; the ABI header is the kernel's
@@ -67,11 +68,23 @@ static kern_return_t (*IOConnectMapMemory64)(mach_port_t, uint32_t, mach_port_t,
 static mach_port_t *task_self;
 static mach_port_t conn;
 
+extern int usleep(unsigned us);
+static int slow;                /* "slow": announce every call, pause 1 s after it */
+
 static kern_return_t
 call(uint32_t method, const void *in, size_t in_size, void *out, size_t out_size)
 {
 	size_t got = out_size;
-	return IOConnectCallStructMethod(conn, method, in, in_size, out_size ? out : 0, out_size ? &got : 0);
+	if (slow) {
+		printf("> method %u\n", method);
+	}
+	kern_return_t kr = IOConnectCallStructMethod(conn, method, in, in_size, out_size ? out : 0,
+	    out_size ? &got : 0);
+	if (slow) {
+		printf("< method %u: 0x%x\n", method, kr);
+		usleep(1000000);
+	}
+	return kr;
 }
 
 static uint32_t
@@ -116,8 +129,15 @@ bo_new(struct bo *b, uint64_t bytes, uint64_t iova)
 	mach_vm_address_t addr = 0;
 	mach_vm_size_t len = 0;
 	if (!kr) {
+		if (slow) {
+			printf("> IOConnectMapMemory64 token %u\n", cr.token);
+		}
 		kr = IOConnectMapMemory64(conn, cr.token, *task_self, &addr, &len,
 		    kIOMapAnywhere | kIOMapWriteCombineCache);
+		if (slow) {
+			printf("< IOConnectMapMemory64: 0x%x at 0x%llx\n", kr, addr);
+			usleep(1000000);
+		}
 	}
 	if (kr || len < bytes) {
 		printf("BoCpuMap: 0x%x (len 0x%llx)\n", kr, len);
@@ -135,6 +155,14 @@ int
 main(int argc, const char **argv)
 {
 	unsigned jobs = argc > 1 ? (unsigned)atoi(argv[1]) : 200;
+	int timestamps = 1;
+	for (int i = 2; i < argc; ++i) {
+		if (argv[i][0] == 'n') {
+			timestamps = 0;          /* notime */
+		} else if (argv[i][0] == 's') {
+			slow = 1;                /* slow */
+		}
+	}
 	void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
 	void *sys = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);
 	if (!iokit || !sys) {
@@ -178,8 +206,10 @@ main(int argc, const char **argv)
 	    p.input_bits, p.output_bits, p.max_bo_bytes, p.flags);
 	printf("chip 0x%08x gmem %u KiB at 0x%llx, va 0x%llx+0x%llx, hbb %u swizzle 0x%x\n", d.chip_id,
 	    d.gmem_bytes / 1024, d.gmem_base, d.va_start, d.va_size, d.highest_bank_bit, d.ubwc_swizzle);
-	NativeAdrenoAbiTimestamp t0, t1;
-	call(NativeAdrenoMethodGetTimestamp, 0, 0, &t0, sizeof(t0));
+	NativeAdrenoAbiTimestamp t0 = { 0 }, t1 = { 0 };
+	if (timestamps) {
+		call(NativeAdrenoMethodGetTimestamp, 0, 0, &t0, sizeof(t0));
+	}
 
 	struct bo ib, data;
 	if (bo_new(&ib, 0x4000, d.va_start) || bo_new(&data, 0x4000, d.va_start + 0x100000)) {
@@ -236,7 +266,9 @@ main(int argc, const char **argv)
 	w.fence = last;
 	kr = call(NativeAdrenoMethodWaitFence, &w, sizeof(w), 0, 0);
 	uint64_t ticks = mach_absolute_time() - start;
-	call(NativeAdrenoMethodGetTimestamp, 0, 0, &t1, sizeof(t1));
+	if (timestamps) {
+		call(NativeAdrenoMethodGetTimestamp, 0, 0, &t1, sizeof(t1));
+	}
 	NativeAdrenoAbiStatus st = { 0, 0 };
 	call(NativeAdrenoMethodGetStatus, 0, 0, &st, sizeof(st));
 	printf("burst: %u jobs, wait 0x%x, last value %u, %u busy retries, %llu us; gpu clock +%llu, faults %llu\n",
