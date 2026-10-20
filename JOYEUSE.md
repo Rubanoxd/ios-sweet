@@ -289,9 +289,20 @@ long-descriptor FORMAT field). iOS keeps running.
    `CP_MEM_WRITE` drains and the CPU reads `0xcafe0618` back from memory
    written by the GPU through SMMU bank 0; no SMMU fault, no CP fault.
 
-Next steps: interrupts (RBBM, GMU) instead of polling, hwcg, CP protect
-and UBWC from hw_init, then a kernel GPU service with a KGSL-like user
-client (buffers, submit, fences) for Turnip.
+7. `sweetgpu=7` (xnu 0089, shim `shim-boot-joyeuse-gpu7.img`): peripheral
+   interrupts. `bsd/dev/sweet_irq.c` programs SPIs in the GIC distributor
+   (Group 1 NS, priority 0xa0, level/edge, routed to the boot CPU) and
+   `sleh_irq` hands INTIDs >= 32 to its handler table (until now no
+   peripheral interrupt reached any driver). With two security states
+   `GICD_IGROUPR` is RAZ/WI for non-secure accesses, so it reads 0 and must
+   not be checked. Hardware result (2026-10-20): `INTID 332 (level) -> CPU
+   0x0, 960 lines`, then `irq: RECEIVED after 1 interrupt(s), status
+   0x00100000` (CP_CACHE_FLUSH_TS) with the fence (1560) in memory.
+
+Next steps: a kernel GPU service with UniXNU's NativeAdreno ABI v1 (an
+IOKit user client `NativeAdrenoGpuPublished`: buffers, CPU maps, submit,
+fences), so their Turnip `tu_knl_darwin.cc` backend runs unchanged; hwcg,
+CP protect and UBWC from hw_init; the GMU interrupts.
 
 ## Internet over USB
 
