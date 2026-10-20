@@ -377,13 +377,21 @@ not 0x80 * apid like the observer. (3) With the right channel every write
 went through (PON = APID 154: `0x88f 0x00 -> 0x02`, `0x85a 0x07 -> 0x01`,
 enable bit back on) and the phone rebooted into **MIUI Recovery**: the
 reason is read, but 1 is recovery; pm6150.dtsi has mode-bootloader 2,
-mode-recovery 1. (4) Writes 2 << 1 now; not yet tested.
+mode-recovery 1. (4) **Works** (2026-10-20): `0x88f 0x00 -> 0x04`, and the
+phone is in Fastboot a few seconds later; test kernels are now booted
+without touching the phone.
 Per-connection GPU address windows (xnu 0093): one 512 MiB window per
 user-client connection (six), so two Vulkan processes do not collide.
-GPU frequency scaling (xnu 0094): the A618 of sc7180/atoll has no hardware
-clock gating in Linux, so the GPU sat at the 800 MHz boot vote; submissions
-now raise the level and the watchdog drops it to 180 MHz after 1 s idle
-(legacy DCVS OOB). Shim `shim-boot-joyeuse-gpu10.img` has 0091-0094, untested.
+GPU frequency scaling (xnu 0094, opt-in `sweetgpudcvs=1`): the A618 of
+sc7180/atoll has no hardware clock gating in Linux, so the GPU sits at the
+800 MHz boot vote. The legacy DCVS OOB is acked, but on hardware the first
+change leaves the core without its state (CP_RB_BASE 0, rptr 0) and the
+CP does not restart, even with GPU_SET and BOOT_SLUMBER cleared first as
+Linux does; so it is off by default. Every core access now checks
+CP_RB_BASE and restarts a core that lost its state.
+Shim `shim-boot-joyeuse-gpu10.img` (0091-0094, default options), verified
+2026-10-20: sweet-gputest passes twice in a row (each connection gets its
+own 512 MiB window) and the reboot into Fastboot works.
 
 Next steps: Turnip's own GPU timestamps (CP counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
