@@ -13,7 +13,9 @@ renderer. Stage 3 (first part, commit below): `MTLCreateSystemDefaultDevice` in 
 real device on Turnip ("Turnip Adreno (TM) 618 (SweetMetal)"): buffers, queues, command buffers and blit
 fill/copy verified on the phone as root and as mobile. Shaders: Metal kernels from a metallib run on the GPU
 (AIR -> SPIR-V by Darling's Iridium on LLVM 14 for iOS, then Turnip): add_arrays/square_add over 1M elements,
-0 wrong. Next: render pipelines (Iridium vertex/fragment), textures, then drawables toward compositing.
+0 wrong. Rendering works too: textures, render pipelines (blending), render passes and draws; a triangle with a
+blended half-transparent veil renders correctly on the phone. Next: texture/sampler arguments, IOSurface textures
+and drawables, then backboardd compositing (GPU blur/transparency, fluidity).
 
 ### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<
 

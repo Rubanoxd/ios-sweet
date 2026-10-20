@@ -16,3 +16,25 @@ kernel void square_add(device const uint *in [[buffer(0)]], device uint *out [[b
 {
     out[id] = in[id] * in[id] + k;
 }
+
+// A colored triangle (render test): vertices pulled from a buffer by
+// vertex_id, color interpolated to the fragment stage.
+struct Vertex {
+    float2 position;
+    float4 color;
+};
+struct VOut {
+    float4 position [[position]];
+    float4 color;
+};
+vertex VOut tri_vertex(uint vid [[vertex_id]], constant Vertex *v [[buffer(0)]])
+{
+    VOut o;
+    o.position = float4(v[vid].position, 0.0, 1.0);
+    o.color = v[vid].color;
+    return o;
+}
+fragment float4 tri_fragment(VOut in [[stage_in]])
+{
+    return in.color;
+}

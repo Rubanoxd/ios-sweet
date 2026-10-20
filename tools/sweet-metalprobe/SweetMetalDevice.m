@@ -12,9 +12,13 @@
  * completed handlers, status, error, waitUntilCompleted), blit fillBuffer
  * and copyFromBuffer, libraries from metallibs (AIR translated to SPIR-V by
  * Darling's Iridium, sweet-iridium.h), kernel functions, compute pipelines
- * and compute encoders (buffers, setBytes, uniform dispatches). Not yet:
- * newLibraryWithSource (needs the on-device MSL compiler), textures,
- * samplers, render encoders, events, heaps, drawables. Those return nil, fail the
+ * and compute encoders (buffers, setBytes, uniform dispatches), 2D
+ * textures (getBytes/replaceRegion), render pipelines (vertex + fragment of
+ * one library, blending) and render encoders (color attachments with
+ * load/store/clear, buffers and bytes per stage, viewport, cull, winding,
+ * drawPrimitives). Not yet: newLibraryWithSource (needs the on-device MSL
+ * compiler), texture/sampler arguments, vertex descriptors, depth/stencil,
+ * events, heaps, drawables. Those return nil, fail the
  * command buffer or, for selectors not implemented at all, are logged
  * through doesNotRecognizeSelector: before the usual exception.
  */
@@ -23,6 +27,8 @@
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
+#define VK_NO_PROTOTYPES 1
+#include <vulkan/vulkan.h>
 #include "SweetMetalDevice.h"
 #include "sweet-mtl-vk.h"
 #include "sweet-iridium.h"
@@ -278,7 +284,7 @@ newLibrary(NSData *data, NSError **error)
 @property (atomic, copy) NSString *encodeFailure;
 @property (atomic) BOOL committed;
 - (smv_cmd *)cmd;
-- (void)use:(SMBuffer *)buffer;
+- (void)use:(id)resource;
 - (void)refuse:(NSString *)what;
 @end
 
@@ -336,6 +342,202 @@ newLibrary(NSData *data, NSError **error)
 	_commandBuffer = nil;
 }
 @end
+
+/* ---- textures ---- */
+struct pixel_format {
+	MTLPixelFormat metal;
+	VkFormat vk;
+	uint32_t bytes;
+};
+static const struct pixel_format kFormats[] = {
+	{ MTLPixelFormatR8Unorm, VK_FORMAT_R8_UNORM, 1 },
+	{ MTLPixelFormatRG8Unorm, VK_FORMAT_R8G8_UNORM, 2 },
+	{ MTLPixelFormatR16Float, VK_FORMAT_R16_SFLOAT, 2 },
+	{ MTLPixelFormatRGBA8Unorm, VK_FORMAT_R8G8B8A8_UNORM, 4 },
+	{ MTLPixelFormatRGBA8Unorm_sRGB, VK_FORMAT_R8G8B8A8_SRGB, 4 },
+	{ MTLPixelFormatBGRA8Unorm, VK_FORMAT_B8G8R8A8_UNORM, 4 },
+	{ MTLPixelFormatBGRA8Unorm_sRGB, VK_FORMAT_B8G8R8A8_SRGB, 4 },
+	{ MTLPixelFormatRGB10A2Unorm, VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4 },
+	{ MTLPixelFormatBGR10A2Unorm, VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4 },
+	{ MTLPixelFormatR32Float, VK_FORMAT_R32_SFLOAT, 4 },
+	{ MTLPixelFormatRGBA16Float, VK_FORMAT_R16G16B16A16_SFLOAT, 8 },
+	{ MTLPixelFormatRGBA32Float, VK_FORMAT_R32G32B32A32_SFLOAT, 16 },
+};
+static const struct pixel_format *
+pixelFormat(MTLPixelFormat f)
+{
+	for (size_t i = 0; i < sizeof(kFormats) / sizeof(kFormats[0]); ++i) {
+		if (kFormats[i].metal == f) {
+			return &kFormats[i];
+		}
+	}
+	return NULL;
+}
+
+@interface SMTexture : SMObject
+@property (nonatomic) smv_texture *handle;
+@property (nonatomic) MTLPixelFormat pixelFormat;
+@property (nonatomic) NSUInteger width, height;
+@property (nonatomic) MTLTextureUsage usage;
+@property (nonatomic) MTLResourceOptions options;
+@end
+@implementation SMTexture
+- (void)dealloc
+{
+	smv_texture_free(_handle);
+}
+- (MTLTextureType)textureType
+{
+	return MTLTextureType2D;
+}
+- (NSUInteger)depth
+{
+	return 1;
+}
+- (NSUInteger)mipmapLevelCount
+{
+	return 1;
+}
+- (NSUInteger)arrayLength
+{
+	return 1;
+}
+- (NSUInteger)sampleCount
+{
+	return 1;
+}
+- (BOOL)isFramebufferOnly
+{
+	return NO;
+}
+- (BOOL)allowGPUOptimizedContents
+{
+	return YES;
+}
+- (MTLResourceOptions)resourceOptions
+{
+	return _options;
+}
+- (MTLStorageMode)storageMode
+{
+	return (MTLStorageMode)((_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift);
+}
+- (MTLCPUCacheMode)cpuCacheMode
+{
+	return MTLCPUCacheModeDefaultCache;
+}
+- (MTLHazardTrackingMode)hazardTrackingMode
+{
+	return MTLHazardTrackingModeTracked;
+}
+- (IOSurfaceRef)iosurface
+{
+	return NULL;
+}
+- (NSUInteger)iosurfacePlane
+{
+	return 0;
+}
+- (id<MTLBuffer>)buffer
+{
+	return nil;
+}
+- (id<MTLTexture>)parentTexture
+{
+	return nil;
+}
+- (MTLTextureSwizzleChannels)swizzle
+{
+	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
+	    MTLTextureSwizzleAlpha);
+}
+- (BOOL)access:(MTLRegion)region level:(NSUInteger)level bytes:(void *)bytes row:(NSUInteger)row write:(int)write
+{
+	if (level != 0 || region.size.depth != 1 || region.origin.z != 0) {
+		sweet_metal_log("texture access: only level 0 of 2D textures");
+		return NO;
+	}
+	const uint32_t r[4] = { (uint32_t)region.origin.x, (uint32_t)region.origin.y, (uint32_t)region.size.width,
+		(uint32_t)region.size.height };
+	if (!smv_texture_access(_handle, r, bytes, (uint32_t)row, write)) {
+		sweet_metal_log("texture access: %s", smv_error());
+		return NO;
+	}
+	return YES;
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level
+{
+	[self access:region level:level bytes:bytes row:row write:0];
+}
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes
+    bytesPerRow:(NSUInteger)row
+{
+	[self access:region level:level bytes:(void *)bytes row:row write:1];
+}
+@end
+
+/* ---- render pipelines ---- */
+static VkBlendFactor
+blendFactor(MTLBlendFactor f)
+{
+	static const VkBlendFactor map[] = { VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_SRC_COLOR,
+		VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+		VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_DST_ALPHA,
+		VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA_SATURATE, VK_BLEND_FACTOR_CONSTANT_COLOR,
+		VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR, VK_BLEND_FACTOR_CONSTANT_ALPHA,
+		VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA, VK_BLEND_FACTOR_SRC1_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR,
+		VK_BLEND_FACTOR_SRC1_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA };
+	return (NSUInteger)f < sizeof(map) / sizeof(map[0]) ? map[f] : VK_BLEND_FACTOR_ONE;
+}
+static uint32_t
+writeMask(MTLColorWriteMask m)
+{
+	return ((m & MTLColorWriteMaskRed) ? VK_COLOR_COMPONENT_R_BIT : 0) |
+	    ((m & MTLColorWriteMaskGreen) ? VK_COLOR_COMPONENT_G_BIT : 0) |
+	    ((m & MTLColorWriteMaskBlue) ? VK_COLOR_COMPONENT_B_BIT : 0) |
+	    ((m & MTLColorWriteMaskAlpha) ? VK_COLOR_COMPONENT_A_BIT : 0);
+}
+
+@interface SMRenderPipeline : SMObject
+@property (nonatomic) smv_render_pipeline *handle;
+@property (nonatomic, strong) SMFunction *vertex, *fragment;
+@end
+@implementation SMRenderPipeline
+- (void)dealloc
+{
+	smv_render_pipeline_free(_handle);
+}
+- (BOOL)supportIndirectCommandBuffers
+{
+	return NO;
+}
+- (NSUInteger)maxTotalThreadsPerThreadgroup
+{
+	return 0;
+}
+- (BOOL)threadgroupSizeMatchesTileSize
+{
+	return NO;
+}
+- (NSUInteger)imageblockSampleLength
+{
+	return 0;
+}
+@end
+
+/* The argument table of one stage: the GPU addresses of its buffer
+ * bindings, in Iridium's order. NO if the stage takes something else. */
+static BOOL
+stageAddresses(const struct sweet_air_function *f, const uint64_t *bound, uint64_t *out)
+{
+	for (unsigned i = 0; f && i < f->bindings; ++i) {
+		if (f->binding[i].type != SWEET_AIR_BUFFER || f->binding[i].index >= SWEET_AIR_MAX_BINDINGS) {
+			return NO;
+		}
+		out[i] = bound[f->binding[i].index];
+	}
+	return YES;
+}
 
 @interface SMComputeEncoder : SMObject
 @property (nonatomic, strong) SMCommandBuffer *commandBuffer;
@@ -466,6 +668,172 @@ newLibrary(NSData *data, NSError **error)
 }
 @end
 
+@interface SMRenderEncoder : SMObject
+@property (nonatomic, strong) SMCommandBuffer *commandBuffer;
+@end
+@implementation SMRenderEncoder {
+	SMRenderPipeline *_pipeline;
+	MTLCullMode _cull;
+	MTLWinding _winding;
+	uint64_t _vertex[SWEET_AIR_MAX_BINDINGS], _fragment[SWEET_AIR_MAX_BINDINGS];
+}
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state
+{
+	if (![(id)state isKindOfClass:[SMRenderPipeline class]]) {
+		[_commandBuffer refuse:@"render: foreign pipeline state"];
+		return;
+	}
+	_pipeline = (SMRenderPipeline *)state;
+}
+- (void)bind:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index into:(uint64_t *)table
+{
+	if (index >= SWEET_AIR_MAX_BINDINGS) {
+		[_commandBuffer refuse:@"render: buffer index out of range"];
+		return;
+	}
+	if (!buffer) {
+		table[index] = 0;
+		return;
+	}
+	if (![(id)buffer isKindOfClass:[SMBuffer class]]) {
+		[_commandBuffer refuse:@"render: foreign buffer"];
+		return;
+	}
+	[_commandBuffer use:buffer];
+	table[index] = smv_buffer_address(((SMBuffer *)buffer).handle) + offset;
+}
+- (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index into:(uint64_t *)table
+{
+	smv_buffer *h = smv_buffer_new(length ? length : 4, bytes);
+	if (!h) {
+		[_commandBuffer refuse:[NSString stringWithFormat:@"set*Bytes: %s", smv_error()]];
+		return;
+	}
+	SMBuffer *b = [SMBuffer new];
+	b.handle = h;
+	[self bind:(id<MTLBuffer>)b offset:0 index:index into:table];
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	[self bind:buffer offset:offset index:index into:_vertex];
+}
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+	[self bind:buffer offset:offset index:index into:_fragment];
+}
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	[self bytes:bytes length:length index:index into:_vertex];
+}
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+	[self bytes:bytes length:length index:index into:_fragment];
+}
+- (void)setViewport:(MTLViewport)v
+{
+	smv_cmd *c = [_commandBuffer cmd];
+	if (c) {
+		smv_cmd_viewport(c, v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
+	}
+}
+- (void)setCullMode:(MTLCullMode)mode
+{
+	_cull = mode;
+	[self raster];
+}
+- (void)setFrontFacingWinding:(MTLWinding)winding
+{
+	_winding = winding;
+	[self raster];
+}
+- (void)raster
+{
+	smv_cmd *c = [_commandBuffer cmd];
+	if (c) {
+		smv_cmd_raster(c, (uint32_t)_cull,
+		    _winding == MTLWindingClockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+	}
+}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)mode
+{
+	if (mode != MTLTriangleFillModeFill) {
+		[_commandBuffer refuse:@"render: only filled triangles are implemented yet"];
+	}
+}
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)state
+{
+	if (state) {
+		[_commandBuffer refuse:@"render: depth/stencil is not implemented yet"];
+	}
+}
+- (void)setScissorRect:(MTLScissorRect)rect
+{
+	(void)rect;
+	sweet_metal_log("setScissorRect ignored (not implemented yet)");
+}
+- (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha
+{
+	(void)red;
+	(void)green;
+	(void)blue;
+	(void)alpha;
+	sweet_metal_log("setBlendColor ignored (not implemented yet)");
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
+    instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base
+{
+	if (!_pipeline) {
+		[_commandBuffer refuse:@"draw without a pipeline state"];
+		return;
+	}
+	uint64_t va[SWEET_AIR_MAX_BINDINGS], fa[SWEET_AIR_MAX_BINDINGS];
+	const struct sweet_air_function *vf = _pipeline.vertex.info, *ff = _pipeline.fragment.info;
+	if (!stageAddresses(vf, _vertex, va) || !stageAddresses(ff, _fragment, fa)) {
+		[_commandBuffer refuse:@"render: only buffer arguments are implemented yet"];
+		return;
+	}
+	smv_cmd *c = [_commandBuffer cmd];
+	if (c && !smv_cmd_draw(c, _pipeline.handle, (uint32_t)type, va, vf->bindings, fa, ff ? ff->bindings : 0,
+	    (uint32_t)start, (uint32_t)count, (uint32_t)instances, (uint32_t)base)) {
+		[_commandBuffer refuse:[NSString stringWithFormat:@"draw: %s", smv_error()]];
+	}
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
+    instanceCount:(NSUInteger)instances
+{
+	[self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:instances baseInstance:0];
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
+{
+	[self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:1 baseInstance:0];
+}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
+{
+	(void)usage;
+	[_commandBuffer use:resource];
+}
+- (void)pushDebugGroup:(NSString *)string
+{
+	(void)string;
+}
+- (void)popDebugGroup
+{
+}
+- (void)insertDebugSignpost:(NSString *)string
+{
+	(void)string;
+}
+- (void)endEncoding
+{
+	smv_cmd *c = [_commandBuffer cmd];
+	if (c) {
+		smv_cmd_end_render(c);
+	}
+	_commandBuffer = nil;
+	_pipeline = nil;
+}
+@end
+
 @implementation SMCommandBuffer {
 	smv_cmd *_list;
 	NSMutableSet *_resources;
@@ -497,10 +865,10 @@ newLibrary(NSData *data, NSError **error)
 	}
 	return _list;
 }
-- (void)use:(SMBuffer *)buffer
+- (void)use:(id)resource
 {
 	@synchronized (_resources) {
-		[_resources addObject:buffer];
+		[_resources addObject:resource];
 	}
 }
 - (void)refuse:(NSString *)what
@@ -555,11 +923,51 @@ newLibrary(NSData *data, NSError **error)
 	(void)type;
 	return [self computeCommandEncoder];
 }
-- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
-	(void)descriptor;
-	[self refuse:@"render encoders are not implemented yet"];
-	return nil;
+	if (d.depthAttachment.texture || d.stencilAttachment.texture) {
+		[self refuse:@"render: depth/stencil attachments are not implemented yet"];
+		return nil;
+	}
+	struct smv_attachment a[SMV_MAX_TARGETS];
+	unsigned n = 0;
+	NSUInteger w = d.renderTargetWidth, h = d.renderTargetHeight;
+	for (unsigned i = 0; i < SMV_MAX_TARGETS; ++i) {
+		MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
+		if (!c.texture) {
+			continue;
+		}
+		if (![(id)c.texture isKindOfClass:[SMTexture class]] || c.level || c.slice || i != n) {
+			[self refuse:@"render: color attachments must be this device's textures, level 0, in order"];
+			return nil;
+		}
+		SMTexture *t = (SMTexture *)c.texture;
+		[self use:t];
+		static const uint32_t load[] = { VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_LOAD_OP_LOAD,
+			VK_ATTACHMENT_LOAD_OP_CLEAR };
+		a[n] = (struct smv_attachment){ .texture = t.handle,
+			.load = c.loadAction <= MTLLoadActionClear ? load[c.loadAction] : VK_ATTACHMENT_LOAD_OP_LOAD,
+			.store = c.storeAction == MTLStoreActionDontCare ? VK_ATTACHMENT_STORE_OP_DONT_CARE :
+			    VK_ATTACHMENT_STORE_OP_STORE,
+			.clear = { (float)c.clearColor.red, (float)c.clearColor.green, (float)c.clearColor.blue,
+			    (float)c.clearColor.alpha } };
+		if (!w || !h) {
+			w = t.width;
+			h = t.height;
+		}
+		n++;
+	}
+	smv_cmd *c = [self cmd];
+	if (!c) {
+		return nil;
+	}
+	if (!smv_cmd_begin_render(c, a, n, (uint32_t)w, (uint32_t)h)) {
+		[self refuse:[NSString stringWithFormat:@"render pass: %s", smv_error()]];
+		return nil;
+	}
+	SMRenderEncoder *e = [SMRenderEncoder new];
+	e.commandBuffer = self;
+	return (id<MTLRenderCommandEncoder>)e;
 }
 - (void)presentDrawable:(id<MTLDrawable>)drawable
 {
@@ -706,6 +1114,11 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		{ [SMFunction class], "MTLFunction" }, { [SMFunction class], "MTLFunctionSPI" },
 		{ [SMComputePipeline class], "MTLComputePipelineState" },
 		{ [SMComputePipeline class], "MTLComputePipelineStateSPI" },
+		{ [SMTexture class], "MTLTexture" }, { [SMTexture class], "MTLTextureSPI" },
+		{ [SMRenderPipeline class], "MTLRenderPipelineState" },
+		{ [SMRenderPipeline class], "MTLRenderPipelineStateSPI" },
+		{ [SMRenderEncoder class], "MTLRenderCommandEncoder" },
+		{ [SMRenderEncoder class], "MTLRenderCommandEncoderSPI" },
 	};
 	for (size_t i = 0; i < sizeof(conform) / sizeof(conform[0]); ++i) {
 		Protocol *p = objc_getProtocol(conform[i].protocol);
@@ -923,10 +1336,106 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	id<MTLComputePipelineState> p = [self newComputePipelineStateWithFunction:function error:&error];
 	handler(p, error);
 }
-- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d
 {
-	(void)descriptor;
-	sweet_metal_log("textures are not implemented yet");
-	return nil;
+	const struct pixel_format *f = pixelFormat(d.pixelFormat);
+	if (d.textureType != MTLTextureType2D || d.mipmapLevelCount != 1 || d.sampleCount != 1 ||
+	    d.arrayLength != 1 || !f) {
+		sweet_metal_log("texture refused: type %lu format %lu mips %lu samples %lu (2D, 1 level, 1 sample only)",
+		    (unsigned long)d.textureType, (unsigned long)d.pixelFormat, (unsigned long)d.mipmapLevelCount,
+		    (unsigned long)d.sampleCount);
+		return nil;
+	}
+	smv_texture *h = smv_texture_new((uint32_t)d.width, (uint32_t)d.height, f->vk, f->bytes);
+	if (!h) {
+		sweet_metal_log("texture refused: %s", smv_error());
+		return nil;
+	}
+	SMTexture *t = [SMTexture new];
+	t.handle = h;
+	t.pixelFormat = d.pixelFormat;
+	t.width = d.width;
+	t.height = d.height;
+	t.usage = d.usage;
+	t.options = d.resourceOptions;
+	return (id<MTLTexture>)t;
+}
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+    error:(NSError **)error
+{
+	NSString *why = nil;
+	SMFunction *vf = [(id)d.vertexFunction isKindOfClass:[SMFunction class]] ? (SMFunction *)d.vertexFunction : nil;
+	SMFunction *ff = [(id)d.fragmentFunction isKindOfClass:[SMFunction class]] ?
+	    (SMFunction *)d.fragmentFunction : nil;
+	if (!vf || vf.functionType != MTLFunctionTypeVertex || !ff || ff.functionType != MTLFunctionTypeFragment) {
+		why = @"a vertex and a fragment function of this device are required";
+	} else if (vf.library != ff.library) {
+		why = @"vertex and fragment functions from different libraries are not implemented yet";
+	} else if (d.vertexDescriptor.attributes[0].format != MTLVertexFormatInvalid) {
+		why = @"vertex descriptors (stage_in attributes) are not implemented yet";
+	} else if (d.depthAttachmentPixelFormat != MTLPixelFormatInvalid ||
+	    d.stencilAttachmentPixelFormat != MTLPixelFormatInvalid) {
+		why = @"depth/stencil is not implemented yet";
+	}
+	struct smv_color_target targets[SMV_MAX_TARGETS];
+	unsigned n = 0;
+	for (unsigned i = 0; !why && i < SMV_MAX_TARGETS; ++i) {
+		MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+		if (c.pixelFormat == MTLPixelFormatInvalid) {
+			continue;
+		}
+		const struct pixel_format *f = pixelFormat(c.pixelFormat);
+		if (!f || i != n) {
+			why = [NSString stringWithFormat:@"color attachment %u: format %lu, or not in order", i,
+			    (unsigned long)c.pixelFormat];
+			break;
+		}
+		targets[n++] = (struct smv_color_target){ .format = f->vk, .blend = c.blendingEnabled,
+			.src_rgb = blendFactor(c.sourceRGBBlendFactor), .dst_rgb = blendFactor(c.destinationRGBBlendFactor),
+			.op_rgb = (uint32_t)c.rgbBlendOperation, .src_alpha = blendFactor(c.sourceAlphaBlendFactor),
+			.dst_alpha = blendFactor(c.destinationAlphaBlendFactor), .op_alpha = (uint32_t)c.alphaBlendOperation,
+			.write_mask = writeMask(c.writeMask) };
+	}
+	smv_render_pipeline *h = NULL;
+	if (!why) {
+		h = smv_render_pipeline_new(vf.library.spirv.bytes, vf.library.spirv.length, vf.name.UTF8String,
+		    ff.name.UTF8String, targets, n);
+		if (!h) {
+			why = [NSString stringWithUTF8String:smv_error()];
+		}
+	}
+	if (why) {
+		sweet_metal_log("render pipeline refused: %s", why.UTF8String);
+		if (error) {
+			*error = smError(why);
+		}
+		return nil;
+	}
+	SMRenderPipeline *p = [SMRenderPipeline new];
+	p.handle = h;
+	p.vertex = vf;
+	p.fragment = ff;
+	p.label = d.label;
+	if (error) {
+		*error = nil;
+	}
+	return (id<MTLRenderPipelineState>)p;
+}
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+    options:(MTLPipelineOption)options reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
+    error:(NSError **)error
+{
+	(void)options;
+	if (reflection) {
+		*reflection = nil;
+	}
+	return [self newRenderPipelineStateWithDescriptor:d error:error];
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d
+    completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
+{
+	NSError *error = nil;
+	id<MTLRenderPipelineState> p = [self newRenderPipelineStateWithDescriptor:d error:&error];
+	handler(p, error);
 }
 @end

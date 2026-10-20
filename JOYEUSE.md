@@ -534,6 +534,26 @@ Shaders, compute (2026-10-20): Metal kernels run on the Adreno 618.
   and `square_add` (integers + setBytes) over 1M elements: 0 wrong, both
   dispatches 2.6-3.3 ms, as root and as mobile. `sweet-air2spv` runs
   Iridium alone on the phone.
-Not yet: `newLibraryWithSource` (MSL front end on the phone), textures,
-samplers, render pipelines and encoders (Iridium has vertex/fragment
-support: next for graphics), events, drawables, partial threadgroups.
+
+Rendering (2026-10-20): Metal draws on the Adreno 618.
+- Runtime: 2D textures (optimal tiling, kept in `VK_IMAGE_LAYOUT_GENERAL`,
+  CPU access through a staging buffer), dynamic rendering (Vulkan 1.3),
+  graphics pipelines from the library's one SPIR-V module (vertex +
+  fragment entry points), three per pipeline for the point/line/triangle
+  topology classes; viewport, scissor, topology, cull mode and front face
+  are dynamic. Iridium's argument tables: set 0 vertex, set 1 fragment.
+  Metal's clip-space y points up: negative-height viewport (as Indium).
+  Full memory barriers around every pass and copy (correct, not fast).
+- Metal: `newTextureWithDescriptor:` (2D, 1 level, common color formats),
+  `getBytes`/`replaceRegion`, `newRenderPipelineStateWithDescriptor:`
+  (color formats, blending, write masks), `renderCommandEncoderWithDescriptor:`
+  (color attachments, load/store/clear), `set{Vertex,Fragment}{Buffer,Bytes}`,
+  `setViewport`, `setCullMode`, `setFrontFacingWinding`, `drawPrimitives`.
+- `sweet-mtltest`: a 256x256 BGRA8 render: cleared gray, an RGB triangle and
+  a half-transparent white triangle blended over the corner; pass 0.38 ms;
+  pixels checked (orientation, colors, blending) as root and as mobile;
+  image in `/var/tmp/sweet-mtltest.ppm`.
+Not yet: `newLibraryWithSource`, texture/sampler shader arguments, vertex
+descriptors (stage_in attributes), depth/stencil, scissor, blend color,
+indexed draws, events, IOSurface textures and drawables (what backboardd
+needs to composite on the GPU), partial threadgroups.

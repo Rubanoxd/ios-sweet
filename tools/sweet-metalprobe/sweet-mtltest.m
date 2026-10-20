@@ -6,7 +6,10 @@
  * the same queue that must run after the first, completed handlers and
  * status; then two kernels from a metallib (Iridium translates the AIR):
  * add_arrays (float) and square_add (integers and a setBytes constant)
- * over 1M elements. Every result is checked on the CPU.
+ * over 1M elements; a render pass into a 256x256 BGRA texture: a colored
+ * triangle on a cleared background, then a half-transparent white triangle
+ * blended over the top-left corner (written to /var/tmp/sweet-mtltest.ppm).
+ * Every result is checked on the CPU.
  *   sweet-mtltest [LIB.metallib]   (default /var/jb/usr/share/sweet-mtltest.metallib)
  */
 #import <Foundation/Foundation.h>
@@ -32,6 +35,8 @@ kernel(id<MTLDevice> device, id<MTLLibrary> lib, NSString *name)
 	    p ? "" : error.localizedDescription.UTF8String ?: "");
 	return p;
 }
+
+static void render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib);
 
 static void
 kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
@@ -94,6 +99,94 @@ kernels(id<MTLDevice> device, id<MTLCommandQueue> queue, const char *path)
 	    (unsigned long)n, r[7], out[7]);
 	check(cb.status == MTLCommandBufferStatusCompleted && bad_f == 0, "add_arrays (float) on the GPU");
 	check(cb.status == MTLCommandBufferStatusCompleted && bad_u == 0, "square_add (integers, setBytes) on the GPU");
+	render(device, queue, lib);
+}
+
+struct vtx {
+	float position[2], pad[2], color[4];   /* Metal's float2 + float4 layout */
+};
+
+static void
+render(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib)
+{
+	const NSUInteger W = 256, H = 256;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	    width:W height:H mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	id<MTLTexture> tex = [device newTextureWithDescriptor:td];
+	check(tex != nil, "256x256 BGRA8 texture");
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"tri_fragment"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	NSError *error = nil;
+	id<MTLRenderPipelineState> plain = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	pd.colorAttachments[0].blendingEnabled = YES;
+	pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+	pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	id<MTLRenderPipelineState> blended = [device newRenderPipelineStateWithDescriptor:pd error:&error];
+	printf("render pipelines: %s\n", plain && blended ? "OK" : error.localizedDescription.UTF8String);
+	check(plain && blended, "render pipelines (plain and blended)");
+	if (!tex || !plain || !blended) {
+		return;
+	}
+	const struct vtx tri[3] = {
+		{ { -0.8f, -0.8f }, { 0, 0 }, { 1, 0, 0, 1 } },     /* bottom left: red */
+		{ { 0.8f, -0.8f }, { 0, 0 }, { 0, 1, 0, 1 } },      /* bottom right: green */
+		{ { 0.0f, 0.8f }, { 0, 0 }, { 0, 0, 1, 1 } },       /* top: blue */
+	};
+	const struct vtx veil[3] = {
+		{ { -1, 1 }, { 0, 0 }, { 1, 1, 1, 0.5f } },
+		{ { 0, 1 }, { 0, 0 }, { 1, 1, 1, 0.5f } },
+		{ { -1, 0 }, { 0, 0 }, { 1, 1, 1, 0.5f } },
+	};
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = tex;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e setRenderPipelineState:plain];
+	[e setVertexBytes:tri length:sizeof(tri) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e setRenderPipelineState:blended];
+	[e setVertexBytes:veil length:sizeof(veil) atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e endEncoding];
+	CFTimeInterval t0 = CACurrentMediaTime();
+	[cb commit];
+	[cb waitUntilCompleted];
+	printf("render: status %lu, error %s, %.2f ms\n", (unsigned long)cb.status,
+	    cb.error.localizedDescription.UTF8String ?: "none", (CACurrentMediaTime() - t0) * 1e3);
+	static uint8_t px[256 * 256 * 4];
+	[tex getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+	FILE *f = fopen("/var/tmp/sweet-mtltest.ppm", "wb");
+	if (f) {
+		fprintf(f, "P6 %lu %lu 255\n", (unsigned long)W, (unsigned long)H);
+		for (NSUInteger i = 0; i < W * H; ++i) {
+			fputc(px[i * 4 + 2], f);
+			fputc(px[i * 4 + 1], f);
+			fputc(px[i * 4 + 0], f);
+		}
+		fclose(f);
+	}
+	/* BGRA bytes at (x, y), y from the top */
+#define AT(x, y) (&px[((y) * W + (x)) * 4])
+	const uint8_t *bg = AT(250, 250), *top = AT(128, 40), *left = AT(40, 225), *right = AT(215, 225),
+	    *veiled = AT(5, 5);
+	printf("pixels BGRA: background %u,%u,%u  top %u,%u,%u  bottom-left %u,%u,%u  bottom-right %u,%u,%u  "
+	    "veiled corner %u,%u,%u\n", bg[0], bg[1], bg[2], top[0], top[1], top[2], left[0], left[1], left[2],
+	    right[0], right[1], right[2], veiled[0], veiled[1], veiled[2]);
+	check(cb.status == MTLCommandBufferStatusCompleted && bg[2] > 20 && bg[2] < 32 && bg[0] == bg[2],
+	    "clear color");
+	check(top[0] > 150 && top[2] < 80, "top of the triangle is blue (y axis not flipped)");
+	check(left[2] > 150 && left[0] < 80, "bottom left is red");
+	check(right[1] > 150 && right[2] < 80, "bottom right is green");
+	check(veiled[0] > 130 && veiled[0] < 150 && veiled[2] > 130 && veiled[2] < 150,
+	    "half-transparent white blended over the corner");
 }
 
 int
@@ -168,7 +261,7 @@ main(int argc, char **argv)
 		check(bad_a == 0, "second command buffer ran after the first");
 
 		kernels(device, queue, argc > 1 ? argv[1] : "/var/jb/usr/share/sweet-mtltest.metallib");
-		printf("%s\n", fails ? "SOME CHECKS FAILED" : "ALL OK: METAL KERNELS ON TURNIP");
+		printf("%s\n", fails ? "SOME CHECKS FAILED" : "ALL OK: METAL KERNELS AND RENDERING ON TURNIP");
 		return fails != 0;
 	}
 }
