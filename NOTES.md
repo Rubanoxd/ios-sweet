@@ -2,6 +2,24 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> 2026-10-20: joyeuse GPU - Vulkan (Turnip) renders on the Adreno 618 under iOS <<<
+
+See `JOYEUSE.md` "GPU" and "Turnip". Observed on the phone (fork Rubanoxd/ios-sweet, branch joyeuse):
+- xnu 0084-0089: staged bring-up in `bsd/dev/sweet_gpu.c` (`sweetgpu=7`): CX power, GMU firmware
+  (0xbabeface), GX + HFI v1, SMMU bank 0, hw_init, SQE + ring, zap via SCM PAS, CP_MEM_WRITE, and
+  peripheral IRQs through `bsd/dev/sweet_irq.c` + a sleh_irq hook (GPU INTID 332).
+- xnu 0090 (CI 39368681708): `iokit/Kernel/arm/SweetAdreno.cpp`, service `NativeAdrenoGpuPublished`
+  with UniXNU's NativeAdreno ABI v1; buffers from unmanaged DDR 0xb0000000-0xfd000000 (mapping kernel
+  RAM write-combined into a process froze the phone). Shim `shim/out/shim-boot-joyeuse-gpu8.img`
+  (`-gpu8d` adds `sweetgpudebug=1`).
+- Turnip (Mesa 85fda3b3 + UniXNU patches + `tools/mesa-patches/0001`) built by
+  `tools/build-turnip-ios.sh` with the Theos iPhoneOS16.5 SDK; on the phone
+  `/var/jb/usr/lib/libvulkan_freedreno.dylib`. `sweet-vkinfo`: Turnip Adreno (TM) 618, Vulkan 1.3.354,
+  1 MiB fill OK. `sweet-vktest`: 1M-invocation compute shader correct (62.8 ms), triangle render pass
+  correct (2.9 ms, image `logs/sweet-vktest-triangle.png`, not in git).
+Open: CP_ALWAYS_ON_COUNTER constant; no per-process GPU address spaces; GPU not yet used by iOS itself
+(no Metal). Internet over USB: `JOYEUSE.md` "Internet over USB".
+
 ### >>> 2026-10-19 evening: joyeuse (Redmi Note 9 Pro) boots iOS to the home screen with touch <<<
 
 See `JOYEUSE.md` "Verified on the phone". Kernel 5e42f18 (fork Rubanoxd/ios-sweet CI 39290730255); fixes found on hardware: mkadt CPU nodes must stay `qcom,kryo470` (e2f8993), HW-gated QUP1 s_ahb clock (14267ac), FT8756 idle frames (fd5b643, 5e42f18). Next: Tianma/NT36675 untested, first-boot lsd wait, LCD backlight on display off.

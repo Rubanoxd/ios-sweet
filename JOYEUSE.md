@@ -352,8 +352,14 @@ Build (outside git, next to this checkout):
   loader (`vk_icdGetInstanceProcAddr`) and sets
   `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`.
 
-Next steps: real rendering tests (a compute shader, a render pass); a
-running GPU timestamp (GMU always-on counter); hwcg and CP
+`tools/sweet-vktest` (2026-10-20, on the phone): a 64-wide compute
+shader over 1M uints (`out[i] = i*i + 7`) is right in every word (62.8 ms,
+ir3 compiles the pipeline in 18 ms on the phone), and a render pass draws a
+red/green/blue triangle on a gray clear into a 256x256 RGBA8 image in
+2.9 ms; the pixels at the clear corner and near each vertex check out and
+the PPM it writes shows the interpolated triangle.
+
+Next steps: a running GPU timestamp (GMU always-on counter); hwcg and CP
 protect from hw_init; the GMU interrupts; per-process address spaces.
 
 ## Internet over USB
