@@ -20,7 +20,7 @@ install-name:    '/usr/lib/libSystem.B.dylib'
 current-version: 1319
 exports:
   - targets:         [ arm64-ios ]
-    symbols:         [ _dlopen, _dlsym, _dlerror, _printf, _atoi, _memset, _memcpy,
+    symbols:         [ _dlopen, _dlsym, _dlerror, _dprintf, _atoi, _memset, _memcpy,
                        _mach_absolute_time ]
 ...
 EOF

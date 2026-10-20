@@ -33,25 +33,88 @@
  	core_wr(0x0038, 0);                       /* RBBM_INT_0_MASK: polled */
  
  	core_wr64(0x0830, GFX_IOVA + GFX_SQE_OFF);   /* CP_SQE_INSTR_BASE */
-@@ -1410,6 +1420,7 @@
+@@ -1406,10 +1416,22 @@
+ #define CACHE_FLUSH_TS    4u
+ #define RBBM_INT_MASK     ((1u << 1) | (1u << 9) | (1u << 20) | (1u << 23) | (1u << 24) | (1u << 25))
+ 
++extern void sweet_irq_enable(uint32_t intid, bool enable);
++
++#define GPU_FAULT_BITS    ((1u << 1) | (1u << 9) | (1u << 23) | (1u << 24) | (1u << 25))
++
+ static struct {
  	volatile uint64_t count;
  	volatile uint32_t status;
- } gpu_irq;
+-} gpu_irq;
++	/* first error seen, for gpu_report_errors(); each error source is
++	 * masked once it fired so a stuck one cannot storm */
++	volatile uint32_t err_status, cp_int, cp_hw_fault, sqe_stat;
++	volatile bool err_new, storm;
++	uint32_t mask;
++	uint64_t window;
++	uint32_t window_count;
++} gpu_irq = { .mask = RBBM_INT_MASK };
 +static volatile uint64_t gpu_fault_count;
  static int gpu_irq_chan;
  
  /* Primary interrupt context: ack the RBBM sources, then wake the waiter. */
-@@ -1420,6 +1431,9 @@
+@@ -1420,9 +1442,47 @@
  	core_wr(0x0037, status);                      /* RBBM_INT_CLEAR_CMD */
  	gpu_irq.status |= status;
  	gpu_irq.count++;
-+	if (status & ((1u << 1) | (1u << 9) | (1u << 23) | (1u << 24))) {
-+		gpu_fault_count++;                        /* AHB/CP HW error, hang, UCHE OOB */
++	if (status & GPU_FAULT_BITS) {
++		gpu_fault_count++;                        /* AHB/CP HW error, hang, UCHE OOB/trap */
++		if (!gpu_irq.err_status) {
++			gpu_irq.err_status = status & GPU_FAULT_BITS;
++			gpu_irq.cp_int = core_rd(0x0823);         /* CP_INTERRUPT_STATUS */
++			gpu_irq.cp_hw_fault = core_rd(0x0821);    /* CP_HW_FAULT */
++			core_wr(0x0908, 1);                       /* CP_SQE_STAT_ADDR */
++			gpu_irq.sqe_stat = core_rd(0x0909);       /* possible bad opcode */
++			gpu_irq.err_new = true;
++		}
++		gpu_irq.mask &= ~(status & GPU_FAULT_BITS);
++		core_wr(0x0038, gpu_irq.mask);            /* RBBM_INT_0_MASK */
++	}
++	/* More than 20000 interrupts in a second: stop taking them at all. */
++	uint64_t now = mach_absolute_time();
++	if (now - gpu_irq.window > 19200000ull) {
++		gpu_irq.window = now;
++		gpu_irq.window_count = 0;
++	}
++	if (++gpu_irq.window_count > 20000) {
++		sweet_irq_enable(GPU_INTID, false);
++		gpu_irq.storm = true;
 +	}
  	thread_wakeup(&gpu_irq_chan);
  }
  
-@@ -1458,8 +1472,301 @@
++static void
++gpu_report_errors(const char *where)
++{
++	if (gpu_irq.storm) {
++		gpu_log("%s: interrupt storm, GPU interrupt disabled (status 0x%08x)", where, gpu_irq.status);
++		gpu_irq.storm = false;
++	}
++	if (gpu_irq.err_new) {
++		gpu_irq.err_new = false;
++		gpu_log("%s: GPU error irq 0x%08x cp_int 0x%08x cp_hw_fault 0x%08x sqe_stat 0x%08x "
++		    "rbbm_status 0x%08x rptr %u", where, gpu_irq.err_status, gpu_irq.cp_int,
++		    gpu_irq.cp_hw_fault, gpu_irq.sqe_stat, core_rd(0x0210), core_rd(0x0806));
++	}
++}
++
+ static bool
+ gpu_stage_irq(vm_offset_t smmu)
+ {
+@@ -1432,7 +1492,7 @@
+ 		return false;
+ 	}
+ 	core_wr(0x0037, 0xffffffffu);                 /* clear anything stale */
+-	core_wr(0x0038, RBBM_INT_MASK);               /* RBBM_INT_0_MASK */
++	core_wr(0x0038, gpu_irq.mask);                /* RBBM_INT_0_MASK */
+ 	volatile uint32_t *fence = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF + 0x40);
+ 	*fence = 0;
+ 	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
+@@ -1458,8 +1518,318 @@
  	    gpu_irq.count - before, gpu_irq.status, *fence, core_rd(0x0806), rb_wptr);
  	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
  	return gpu_irq.count > before && *fence == 0x618;
@@ -91,6 +154,7 @@
 +uint64_t sweet_gpu_faults(void);
 +
 +static bool gpu_ready;
++static int gpu_trace = 64;              /* kernel log lines left for maps and submits */
 +static vm_offset_t gfx_smmu;
 +static lck_grp_t *gpu_lck_grp;
 +static lck_mtx_t *gpu_mtx;
@@ -120,8 +184,8 @@
 +	*va = gfx_pool + 0x1000 * gfx_pool_left;
 +	*pa = gfx_pool_pa + 0x1000 * gfx_pool_left;
 +	return true;
- }
- 
++}
++
 +static void
 +gfx_tlb_flush(void)
 +{
@@ -181,8 +245,8 @@
 +	info->ubwc_swizzle = 0x6;
 +	info->macrotile_mode = 0;
 +	info->ubwc_version = 2;
-+}
-+
+ }
+ 
 +int
 +sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable)
 +{
@@ -191,6 +255,10 @@
 +		return EINVAL;
 +	}
 +	int err = 0;
++	if (gpu_trace > 0) {
++		gpu_trace--;
++		printf("SWEET GPU: map 0x%llx -> pa 0x%llx +0x%llx %s\n", iova, pa, bytes, writable ? "rw" : "ro");
++	}
 +	lck_mtx_lock(gpu_mtx);
 +	for (uint64_t off = 0; off < bytes && !err; off += 0x1000) {
 +		uint64_t pte_pa;
@@ -272,6 +340,11 @@
 +	core_wr(0x0807, rb_wptr);                     /* CP_RB_WPTR */
 +	lck_mtx_unlock(gpu_mtx);
 +	*fence = seq;
++	if (gpu_trace > 0) {
++		gpu_trace--;
++		printf("SWEET GPU: submit %u: %u buffer(s), first 0x%llx +%u dwords\n", seq, count,
++		    iova[0], dwords[0]);
++	}
 +	return 0;
 +}
 +
@@ -294,6 +367,13 @@
 +			return 0;
 +		}
 +		if (!timeout_ns || mach_absolute_time() >= deadline) {
++			gpu_report_errors("wait");
++			if (timeout_ns >= 100000000ull) {
++				gpu_log("wait: fence %u not reached in %llu ms (retired %u, rptr %u wptr %u, "
++				    "rbbm_status 0x%08x)", fence, timeout_ns / 1000000, sweet_gpu_retired(),
++				    core_rd(0x0806), rb_wptr, core_rd(0x0210));
++				gpu_smmu_faults(gfx_smmu, SMMU_GFX_IDX);
++			}
 +			return ETIMEDOUT;
 +		}
 +		assert_wait_deadline(&gpu_irq_chan, THREAD_ABORTSAFE, deadline);
@@ -353,7 +433,7 @@
  static int sweet_gpu_sleep_chan;
  
  static void
-@@ -1491,7 +1798,9 @@
+@@ -1491,7 +1861,9 @@
  		if (smmu != 0) {
  			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
  			    sg.stage >= 6 && gpu_stage_cp(smmu) && sg.stage >= 7) {
@@ -585,7 +665,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,649 @@
 +/*
 + * JOYEUSE: the Adreno 618 as an IOKit service for userspace.
 + *
@@ -699,6 +779,8 @@
 +	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
 +	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 +	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference);
 +};
 +
 +OSDefineMetaClassAndStructors(SweetAdrenoUserClient, IOUserClient);
@@ -823,6 +905,7 @@
 +SweetAdrenoUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 +    IOMemoryDescriptor **memory)
 +{
++	IOLog("SWEET ADRENO: clientMemoryForType %u\n", (unsigned)type);
 +	IOLockLock(fLock);
 +	Entry *e = lookup(type);
 +	if (e == NULL || e->token != type || e->imported) {
@@ -848,8 +931,28 @@
 +	return true;
 +}
 +
++/* The first calls of every boot go to the kernel log (bring-up aid). */
++static int sAdrenoTrace = 96;
++
 +IOReturn
 +SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	bool trace = sAdrenoTrace > 0;
++	if (trace) {
++		sAdrenoTrace--;
++		IOLog("SWEET ADRENO: method %u in %u out %u\n", selector, args->structureInputSize,
++		    args->structureOutputSize);
++	}
++	IOReturn r = dispatchMethod(selector, args, dispatch, target, reference);
++	if (trace) {
++		IOLog("SWEET ADRENO: method %u -> 0x%x\n", selector, r);
++	}
++	return r;
++}
++
++IOReturn
++SweetAdrenoUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments *args,
 +    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
 +    __unused void *reference)
 +{

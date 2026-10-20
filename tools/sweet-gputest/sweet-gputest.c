@@ -45,7 +45,9 @@ typedef uint64_t mach_vm_size_t;
 extern void *dlopen(const char *path, int mode);
 extern void *dlsym(void *handle, const char *symbol);
 extern char *dlerror(void);
-extern int printf(const char *fmt, ...);
+extern int dprintf(int fd, const char *fmt, ...);
+/* unbuffered: the output must survive a hang of the phone */
+#define printf(...) dprintf(1, __VA_ARGS__)
 extern int atoi(const char *s);
 extern void *memset(void *p, int c, size_t n);
 extern void *memcpy(void *d, const void *s, size_t n);
