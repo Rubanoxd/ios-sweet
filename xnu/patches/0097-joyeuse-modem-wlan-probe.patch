@@ -251,7 +251,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan.c
-@@ -0,0 +1,869 @@
+@@ -0,0 +1,871 @@
 +/*
 + * JOYEUSE: Wi-Fi bring-up, staged like the GPU (bsd/dev/sweet_gpu.c).
 + *
@@ -306,6 +306,7 @@
 +#include <stdarg.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
 +extern void ml_io_unmap(vm_offset_t, vm_size_t);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern int sweet_rpmh_cmd_db(const char *res, unsigned *slave, uint32_t *addr, uint16_t *aux,
@@ -849,7 +850,8 @@
 +{
 +	uint64_t base = trunc_page_64(pa);
 +	vm_size_t len = round_page_64(pa + n) - base;
-+	vm_offset_t va = ml_io_map((vm_offset_t)base, len);
++	/* ml_io_map entries are permanent; only this kind may be unmapped. */
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)base, len, VM_WIMG_IO);
 +	if (!va) {
 +		return false;
 +	}
