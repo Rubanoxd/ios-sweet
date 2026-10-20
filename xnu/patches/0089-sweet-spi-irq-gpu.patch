@@ -1,0 +1,273 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_touch_spi.c		standard
+ bsd/dev/sweet_dpu.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_irq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_irq.c
+@@ -0,0 +1,144 @@
++/*
++ * SWEET: peripheral interrupts (GIC SPIs) for the built-in drivers.
++ *
++ * XNU here has no IOKit interrupt controller for the GIC: the timer and the
++ * IPIs are handled in sleh_irq directly (osfmk/arm64/sleh.c), and every other
++ * INTID went to cpu_data's interrupt_handler, which nothing registers. A
++ * driver now calls sweet_irq_register(), which programs the SPI in the
++ * distributor (Group 1 non-secure, priority 0xa0 like the timer, level or
++ * edge, routed to the boot CPU) and enables it; sleh_irq hands every
++ * INTID >= 32 to sweet_spi_dispatch() before the old path and sends the EOI
++ * afterwards. Handlers run in primary interrupt context with interrupts
++ * masked: they must clear the device's interrupt source and may only do
++ * what is safe there (register access, thread_wakeup).
++ *
++ * GICD at 0x17a00000 on both SM7150 (sweet) and SM7125 (joyeuse).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <kern/locks.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++typedef void (*sweet_irq_handler_t)(void *ctx, uint32_t intid);
++int sweet_irq_register(uint32_t intid, bool edge, sweet_irq_handler_t handler, void *ctx);
++void sweet_irq_enable(uint32_t intid, bool enable);
++bool sweet_spi_dispatch(uint32_t intid);
++
++#define GICD_PA           0x17a00000u
++#define GICD_SIZE         0x10000u
++#define GICD_TYPER        0x0004u
++#define GICD_IGROUPR      0x0080u
++#define GICD_ISENABLER    0x0100u
++#define GICD_ICENABLER    0x0180u
++#define GICD_ICPENDR      0x0280u
++#define GICD_IPRIORITYR   0x0400u
++#define GICD_ICFGR        0x0c00u
++#define GICD_IGRPMODR     0x0d00u
++#define GICD_IROUTER      0x6000u
++#define SWEET_IRQ_SLOTS   16
++
++static struct {
++	uint32_t intid;
++	sweet_irq_handler_t handler;
++	void *ctx;
++	uint64_t count;
++} sweet_irq_slots[SWEET_IRQ_SLOTS];
++static vm_offset_t sweet_gicd;
++static uint32_t sweet_gic_lines;
++
++static uint32_t
++gicd_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(sweet_gicd + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gicd_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sweet_gicd + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++void
++sweet_irq_enable(uint32_t intid, bool enable)
++{
++	if (sweet_gicd && intid >= 32 && intid < sweet_gic_lines) {
++		gicd_wr((enable ? GICD_ISENABLER : GICD_ICENABLER) + 4 * (intid / 32), 1u << (intid % 32));
++	}
++}
++
++int
++sweet_irq_register(uint32_t intid, bool edge, sweet_irq_handler_t handler, void *ctx)
++{
++	if (!sweet_gicd) {
++		sweet_gicd = ml_io_map(GICD_PA, GICD_SIZE);
++		if (!sweet_gicd) {
++			return ENOMEM;
++		}
++		sweet_gic_lines = 32 * ((gicd_rd(GICD_TYPER) & 0x1f) + 1);
++	}
++	if (intid < 32 || intid >= sweet_gic_lines || intid > 1019 || !handler) {
++		return EINVAL;
++	}
++	unsigned free_slot = SWEET_IRQ_SLOTS;
++	for (unsigned i = 0; i < SWEET_IRQ_SLOTS; ++i) {
++		if (sweet_irq_slots[i].handler && sweet_irq_slots[i].intid == intid) {
++			return EBUSY;
++		}
++		if (!sweet_irq_slots[i].handler && free_slot == SWEET_IRQ_SLOTS) {
++			free_slot = i;
++		}
++	}
++	if (free_slot == SWEET_IRQ_SLOTS) {
++		return ENOSPC;
++	}
++	uint32_t bit = 1u << (intid % 32);
++	sweet_irq_enable(intid, false);
++	/* Group 1 non-secure (a secure SPI reads back 0 and stays TZ's). */
++	gicd_wr(GICD_IGROUPR + 4 * (intid / 32), gicd_rd(GICD_IGROUPR + 4 * (intid / 32)) | bit);
++	if (!(gicd_rd(GICD_IGROUPR + 4 * (intid / 32)) & bit)) {
++		printf("SWEET IRQ: INTID %u is not a non-secure interrupt\n", intid);
++		return EPERM;
++	}
++	uint32_t prio = gicd_rd(GICD_IPRIORITYR + (intid & ~3u));
++	prio = (prio & ~(0xffu << (8 * (intid % 4)))) | (0xa0u << (8 * (intid % 4)));
++	gicd_wr(GICD_IPRIORITYR + (intid & ~3u), prio);
++	uint32_t cfg = gicd_rd(GICD_ICFGR + 4 * (intid / 16));
++	uint32_t edge_bit = 2u << (2 * (intid % 16));
++	gicd_wr(GICD_ICFGR + 4 * (intid / 16), edge ? (cfg | edge_bit) : (cfg & ~edge_bit));
++	/* Route to the boot CPU (affinity of logical CPU 0). */
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	uint64_t aff = topo->cpus[0].phys_id & 0xff00ffffffull;
++	*(volatile uint64_t *)(sweet_gicd + GICD_IROUTER + 8 * intid) = aff;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	gicd_wr(GICD_ICPENDR + 4 * (intid / 32), bit);
++	sweet_irq_slots[free_slot].ctx = ctx;
++	sweet_irq_slots[free_slot].intid = intid;
++	sweet_irq_slots[free_slot].count = 0;
++	__atomic_store_n(&sweet_irq_slots[free_slot].handler, handler, __ATOMIC_RELEASE);
++	sweet_irq_enable(intid, true);
++	printf("SWEET IRQ: INTID %u (%s) -> CPU 0x%llx, %u lines\n", intid, edge ? "edge" : "level",
++	    aff, sweet_gic_lines);
++	return 0;
++}
++
++bool
++sweet_spi_dispatch(uint32_t intid)
++{
++	for (unsigned i = 0; i < SWEET_IRQ_SLOTS; ++i) {
++		sweet_irq_handler_t h = __atomic_load_n(&sweet_irq_slots[i].handler, __ATOMIC_ACQUIRE);
++		if (h && sweet_irq_slots[i].intid == intid) {
++			sweet_irq_slots[i].count++;
++			h(sweet_irq_slots[i].ctx, intid);
++			return true;
++		}
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -26,6 +26,9 @@
+  *      and CP_ME_INIT; the a615_zap shader through the SCM PAS calls (pas
+  *      id 13 into pil_gpu_mem 0x93b15000) and CP_SET_SECURE_MODE 0; then a
+  *      CP_MEM_WRITE that must land in memory
++ *   7  the GPU interrupt (SPI 300, INTID 332) through bsd/dev/sweet_irq.c:
++ *      RBBM_INT_0_MASK, then a CACHE_FLUSH_TS event with its IRQ bit that
++ *      must write the fence and interrupt
+  * 0 skips everything. A block is read only after the status bits of the
+  * clocks and power domain in front of it say it is reachable (an access to
+  * a gated block hangs the bus); the first failure stops the sequence.
+@@ -1392,6 +1395,69 @@
+ 	    v == 0xcafe0618u ? "THE GPU EXECUTES COMMANDS" : "no");
+ 	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
+ 	return idle && v == 0xcafe0618u;
++}
++
++/* Stage 7: the GPU's interrupt (kgsl-3d0: GIC SPI 300, level, INTID 332). */
++typedef void (*sweet_irq_handler_t)(void *ctx, uint32_t intid);
++extern int sweet_irq_register(uint32_t intid, bool edge, sweet_irq_handler_t handler, void *ctx);
++
++#define GPU_INTID         332u
++#define CP_EVENT_WRITE    0x46u
++#define CACHE_FLUSH_TS    4u
++#define RBBM_INT_MASK     ((1u << 1) | (1u << 9) | (1u << 20) | (1u << 23) | (1u << 24) | (1u << 25))
++
++static struct {
++	volatile uint64_t count;
++	volatile uint32_t status;
++} gpu_irq;
++static int gpu_irq_chan;
++
++/* Primary interrupt context: ack the RBBM sources, then wake the waiter. */
++static void
++gpu_irq_handler(__unused void *ctx, __unused uint32_t intid)
++{
++	uint32_t status = core_rd(0x0201);            /* RBBM_INT_0_STATUS */
++	core_wr(0x0037, status);                      /* RBBM_INT_CLEAR_CMD */
++	gpu_irq.status |= status;
++	gpu_irq.count++;
++	thread_wakeup(&gpu_irq_chan);
++}
++
++static bool
++gpu_stage_irq(vm_offset_t smmu)
++{
++	int err = sweet_irq_register(GPU_INTID, false, gpu_irq_handler, NULL);
++	if (err) {
++		gpu_log("irq: register INTID %u failed: %d", GPU_INTID, err);
++		return false;
++	}
++	core_wr(0x0037, 0xffffffffu);                 /* clear anything stale */
++	core_wr(0x0038, RBBM_INT_MASK);               /* RBBM_INT_0_MASK */
++	volatile uint32_t *fence = (volatile uint32_t *)(gfx_mem + GMU_TABLES + GFX_SCRATCH_OFF + 0x40);
++	*fence = 0;
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++
++	/* a6xx_submit's fence: CACHE_FLUSH_TS with the IRQ bit writes the
++	 * seqno to memory and raises CP_CACHE_FLUSH_TS. */
++	uint64_t before = gpu_irq.count;
++	uint64_t deadline;
++	clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline(&gpu_irq_chan, THREAD_UNINT, deadline);
++	rb_pkt7(CP_EVENT_WRITE, 4);
++	rb_out(CACHE_FLUSH_TS | (1u << 31));
++	rb_out(GFX_IOVA + GFX_SCRATCH_OFF + 0x40);
++	rb_out(0);
++	rb_out(0x618);
++	gfx_sync(GFX_RB_OFF, 0x8000);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	core_wr(0x0807, rb_wptr);                     /* CP_RB_WPTR */
++	wait_result_t wr = thread_block(THREAD_CONTINUE_NULL);
++	gfx_sync(GFX_SCRATCH_OFF, 0x1000);
++	gpu_log("irq: %s after %llu interrupt(s), status 0x%08x, fence %u (want 1560), rptr %u wptr %u",
++	    gpu_irq.count > before ? "RECEIVED" : (wr == THREAD_TIMED_OUT ? "timed out" : "woken, none"),
++	    gpu_irq.count - before, gpu_irq.status, *fence, core_rd(0x0806), rb_wptr);
++	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
++	return gpu_irq.count > before && *fence == 0x618;
+ }
+ 
+ static int sweet_gpu_sleep_chan;
+@@ -1424,8 +1490,8 @@
+ 		vm_offset_t smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
+ 		if (smmu != 0) {
+ 			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
+-			    sg.stage >= 6) {
+-				(void)gpu_stage_cp(smmu);
++			    sg.stage >= 6 && gpu_stage_cp(smmu) && sg.stage >= 7) {
++				(void)gpu_stage_irq(smmu);
+ 			}
+ 		}
+ 	}
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1846,6 +1846,10 @@
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
+ }
++
++#if defined(SWEET)
++extern bool sweet_spi_dispatch(uint32_t intid);
++#endif
+ 
+ void
+ sleh_irq(arm_saved_state_t *state)
+@@ -1882,7 +1886,8 @@
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		/* SPIs of the built-in drivers (bsd/dev/sweet_irq.c) */
++		if (!(intid >= 32 && sweet_spi_dispatch(intid)) && cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
