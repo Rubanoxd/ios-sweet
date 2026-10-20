@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_reboot.c
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,192 @@
 +/*
 + * SWEET: reboot straight into the bootloader's Fastboot mode, so a new test
 + * kernel can be booted without anyone holding Power + Volume down:
@@ -28,8 +28,9 @@
 + *     PMIC keeps the reason
 + *  3. IMEM restart_reason@65c = 0x77665500
 + *  4. PS_HOLD low (0x0c264000); PSCI SYSTEM_RESET if that does nothing.
-+ * PMIC access: the SPMI arbiter v5 (spmi@c440000: core, chnls 0xc600000,
-+ * obsrvr 0xe600000, cnfg 0xc40a000, EE 0), pm6150 SID 0, PON peripheral only.
++ * PMIC access: the SPMI arbiter v5 (spmi@c440000: core, chnls 0xc600000 +
++ * 0x10000 per APID, obsrvr 0xe600000 + 0x80 per APID, cnfg 0xc40a000, EE 0),
++ * pm6150 SID 0, PON peripheral only, and only if EE 0 owns it.
 + * The caller syncs the filesystems first: nothing is flushed here.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -79,10 +80,9 @@
 +rb_spmi_init(void)
 +{
 +	rb_core = ml_io_map(SPMI_CORE, 0x2000);
-+	rb_chnls = ml_io_map(SPMI_CHNLS, 0x10000);
 +	rb_obs = ml_io_map(SPMI_OBS, 0x10000);
 +	rb_cnfg = ml_io_map(SPMI_CNFG, 0x1000);
-+	if (!rb_core || !rb_chnls || !rb_obs || !rb_cnfg) {
++	if (!rb_core || !rb_obs || !rb_cnfg) {
 +		return false;
 +	}
 +	unsigned count = rb_rd(rb_core, 4) & 0x7ffu;
@@ -90,7 +90,13 @@
 +		uint32_t map = rb_rd(rb_core, 0x900u + 4u * i);
 +		if (map && ((map >> 8) & 0xfffu) == PON_PPID && (rb_rd(rb_cnfg, 0x700u + 4u * i) & 7u) == 0) {
 +			rb_apid = i;
-+			return true;
++			/* Linux pmic_arb_offset_v5: the read/write channel of an APID
++			 * is 0x10000 * apid into chnls (the observer's is 0x80 * apid);
++			 * 0x80 * apid there hung the bus on the first try. */
++			rb_chnls = ml_io_map(SPMI_CHNLS + 0x10000u * i, 0x1000);
++			printf("SWEET: PON on SPMI APID %u, channel %s\n", i, rb_chnls ? "mapped" : "not mapped");
++			delay(100000);
++			return rb_chnls != 0;
 +		}
 +	}
 +	return false;
@@ -124,7 +130,7 @@
 +static bool
 +rb_spmi_write(unsigned addr, uint8_t v)
 +{
-+	vm_offset_t ch = rb_chnls + 0x80u * rb_apid;                 /* EE 0 */
++	vm_offset_t ch = rb_chnls;                                   /* this APID's channel */
 +	rb_wr(ch, 0x10, v);                                         /* WDATA0 */
 +	rb_wr(ch, 0x00, (0u << 27) | ((addr & 0xffu) << 4));         /* EXT_WRITEL, 1 byte */
 +	return rb_spmi_wait(ch);
@@ -141,6 +147,7 @@
 +	uint8_t now = 0;
 +	(void)rb_spmi_read(addr, &now);
 +	printf("SWEET: PMIC 0x%03x 0x%02x -> 0x%02x (%s)\n", addr, old, now, ok ? "ok" : "write failed");
++	delay(100000);
 +	return ok;
 +}
 +
@@ -150,6 +157,7 @@
 +	vm_offset_t imem = ml_io_map(IMEM_PAGE, 0x1000);
 +	vm_offset_t pshold = ml_io_map(PSHOLD, 0x1000);
 +	printf("SWEET: rebooting into Fastboot\n");
++	delay(200000);                          /* each step's line must reach the USB log */
 +	if (rb_spmi_init()) {
 +		(void)rb_spmi_rmw(PON_SOFT_RB_SPARE, 0xfe, 1u << 1);    /* BOOTLOADER */
 +		(void)rb_spmi_rmw(PON_PS_HOLD_RST_CTL2, 0x80, 0x00);
