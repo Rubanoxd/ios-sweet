@@ -102,6 +102,8 @@ main(int argc, char **argv)
 		}
 		renderer.layer = root;
 		renderer.bounds = CGRectMake(0, 0, W, H);
+		/* no run loop here: commit the implicit transaction, or the renderer sees an empty tree */
+		[CATransaction flush];
 		CFTimeInterval t0 = CACurrentMediaTime();
 		for (int frame = 0; frame < 2; ++frame) {
 			[renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];

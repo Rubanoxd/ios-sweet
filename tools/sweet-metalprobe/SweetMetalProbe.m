@@ -38,11 +38,23 @@
 
 extern const char *getprogname(void);
 
+/* Tracing (every Metal call worth knowing, up to 4000 lines): on when
+ * /var/tmp/sweetmetal.trace exists when the process starts. */
+int
+sweet_metal_tracing(void)
+{
+	static int state = -1;
+	if (state < 0) {
+		state = access("/var/tmp/sweetmetal.trace", F_OK) == 0;
+	}
+	return state;
+}
+
 void
 sweet_metal_log(const char *fmt, ...)
 {
 	static int lines;
-	if (__sync_fetch_and_add(&lines, 1) >= 64) {
+	if (__sync_fetch_and_add(&lines, 1) >= (sweet_metal_tracing() ? 4000 : 64)) {
 		return;
 	}
 	char what[320], line[384];

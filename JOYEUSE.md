@@ -591,6 +591,30 @@ IOSurface textures and drawables (2026-10-20):
   with this device: QuartzCore makes the drawable's IOSurface texture
   through it; a GPU clear of it is presented and reads back right.
 
+QuartzCore's compositor on the device (`tools/sweet-metalprobe/sweet-carender`,
+CARenderer rendererWithMTLTexture:, 2026-10-20), what it needed so far:
+- `newPipelineLibraryWithFilePath:error:` answered with nil (the base
+  _MTLDevice loader crashed on default.pipelinelib, AGX binaries); CA then
+  builds its pipelines from default.metallib functions.
+- `supportsFamily:` Apple1-4 / Common1-2 and `supportsFeatureSet:` iOS
+  GPU families 1-4 (the A11's): with no family, CA asks for shader
+  variants iOS does not ship (fixed_frag_lpf_cpf); now it asks for the
+  half-precision ones (fixed_frag_lph_cpf).
+- `newFunctionWithDescriptor:error:`, depth/stencil state objects,
+  command-queue/command-buffer SPI properties; unimplemented protocol
+  selectors now answer nil/0 and are logged ("stubbed") instead of
+  throwing; `touch /var/tmp/sweetmetal.trace` traces every Metal call.
+- A CLI must `[CATransaction flush]` before rendering (no run loop).
+- Where it stops now: CA's uber-shader `fixed_frag_lph_cpf` (13k lines,
+  306 branches, 357 phis, 36 switches) is not translated. It is specialized
+  by ~40 function constants (`air.function_constants`: externally
+  initialized globals in section air.fc_initializer, e.g. fc_generic id 0,
+  fc_vertex_layout id 3; arguments that exist only under a constant). Next:
+  apply MTLFunctionConstantValues to those globals and run LLVM's
+  sroa/mem2reg/instcombine/sccp/simplifycfg/adce/lowerswitch before
+  Iridium (allocas and switches go away; branches remain), then structured
+  control flow in Iridium for what is left.
+
 QuartzCore (what backboardd would need), from the iOS 16.7 images:
 - `QuartzCore.framework/default.metallib` (1 MB) is AIR: 141 functions
   (39 vertex, 95 fragment, 7 kernels: blurs, downsampling, shading, paths,

@@ -318,6 +318,7 @@ embeddedSamplerDesc(const struct sweet_air_sampler *e)
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name
 {
 	NSNumber *at = name ? _functions[name] : nil;
+	sweet_metal_trace("newFunctionWithName %s: %s", name.UTF8String, at ? "found" : "not in the library");
 	if (!at) {
 		return nil;
 	}
@@ -330,6 +331,20 @@ embeddedSamplerDesc(const struct sweet_air_sampler *e)
 		return nil;
 	}
 	return (id<MTLFunction>)f;
+}
+/* Function constants are not applied yet (Iridium has no specialization
+ * constants for them): the function is returned as compiled, logged once. */
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error
+{
+	static int logged;
+	if (descriptor.constantValues && logged++ < 8) {
+		sweet_metal_log("newFunctionWithDescriptor %s: function constants ignored", descriptor.name.UTF8String);
+	}
+	id<MTLFunction> f = [self newFunctionWithName:descriptor.name];
+	if (!f && error) {
+		*error = smError([NSString stringWithFormat:@"no function %@", descriptor.name]);
+	}
+	return f;
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values
     error:(NSError **)error
@@ -427,6 +442,7 @@ newLibrary(NSData *data, NSError **error)
 @property (atomic) CFTimeInterval GPUStartTime, GPUEndTime;
 @property (atomic, copy) NSString *encodeFailure;
 @property (atomic) BOOL committed;
+@property (atomic) uint64_t protectionOptions;      /* SPI, kept */
 - (smv_cmd *)cmd;
 - (void)use:(id)resource;
 - (void)refuse:(NSString *)what;
@@ -528,6 +544,7 @@ pixelFormat(MTLPixelFormat f)
 @property (nonatomic) IOSurfaceRef surface;      /* retained; NULL for ordinary textures */
 @property (nonatomic) void *hostBase;
 @property (nonatomic) size_t hostBytes;
+@property (atomic) uint64_t protectionOptions;      /* SPI, kept */
 - (void)flushHost;
 @end
 @implementation SMTexture
@@ -1129,6 +1146,9 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
     instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base
 {
+	sweet_metal_trace("draw type %lu start %lu count %lu instances %lu with %s/%s", (unsigned long)type,
+	    (unsigned long)start, (unsigned long)count, (unsigned long)instances,
+	    _pipeline ? _pipeline.vertex.name.UTF8String : "(no pipeline)", _pipeline ? _pipeline.fragment.name.UTF8String : "");
 	if (!_pipeline) {
 		[_commandBuffer refuse:@"draw without a pipeline state"];
 		return;
@@ -1277,6 +1297,11 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
+	sweet_metal_trace("render pass: color0 %s %lux%lu load %lu store %lu, depth %s, stencil %s",
+	    d.colorAttachments[0].texture ? class_getName(object_getClass(d.colorAttachments[0].texture)) : "none",
+	    (unsigned long)d.colorAttachments[0].texture.width, (unsigned long)d.colorAttachments[0].texture.height,
+	    (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction,
+	    d.depthAttachment.texture ? "yes" : "no", d.stencilAttachment.texture ? "yes" : "no");
 	if (d.depthAttachment.texture || d.stencilAttachment.texture) {
 		[self refuse:@"render: depth/stencil attachments are not implemented yet"];
 		return nil;
@@ -1384,6 +1409,7 @@ stageArgs(SMFunction *fn, const struct stage_state *st, uint64_t *addresses, str
 }
 - (void)commit
 {
+	sweet_metal_trace("commit %p (%s)", (__bridge void *)self, self.encodeFailure ? self.encodeFailure.UTF8String : "ok");
 	if (self.committed) {
 		sweet_metal_log("commit twice");
 		return;
@@ -1595,15 +1621,23 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 }
 /* No GPU family or feature set is claimed: the base class answers from
  * Apple tables, and nothing beyond buffers and blits works yet. */
+/* The families of the A11 this device stands in for (featureProfile 5):
+ * QuartzCore picks its shader variants (half precision "lph" ones) from
+ * these; with none it asks for variants iOS does not ship. Logged, so the
+ * features a client then relies on show up. */
 - (BOOL)supportsFamily:(MTLGPUFamily)family
 {
-	(void)family;
-	return NO;
+	BOOL yes = (family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple4) ||
+	    family == MTLGPUFamilyCommon1 || family == MTLGPUFamilyCommon2;
+	sweet_metal_trace("supportsFamily %ld: %s", (long)family, yes ? "yes" : "no");
+	return yes;
 }
 - (BOOL)supportsFeatureSet:(NSUInteger)set
 {
-	(void)set;
-	return NO;
+	/* MTLFeatureSet_iOS_GPUFamily1_v1 (0) .. GPUFamily4_v2 (14) */
+	BOOL yes = set <= 14;
+	sweet_metal_trace("supportsFeatureSet %lu: %s", (unsigned long)set, yes ? "yes" : "no");
+	return yes;
 }
 - (BOOL)supportsTextureSampleCount:(NSUInteger)count
 {
@@ -1809,6 +1843,24 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 	t.options = d.resourceOptions;
 	return (id<MTLTexture>)t;
 }
+/* Precompiled pipelines are GPU binaries for Apple GPUs: none here, so the
+ * client builds its pipelines from its functions instead. */
+- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error
+{
+	sweet_metal_log("pipeline library %s: not available on this device", path.lastPathComponent.UTF8String);
+	if (error) {
+		*error = smError(@"pipeline libraries are not available on this device");
+	}
+	return nil;
+}
+- (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error
+{
+	(void)descriptor;
+	if (error) {
+		*error = smError(@"binary archives are not available on this device");
+	}
+	return nil;
+}
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d
 {
 	SMDepthStencil *st = [SMDepthStencil new];
@@ -1900,6 +1952,7 @@ sweet_metal_open(unsigned port, char *err, size_t len)
 		}
 		return nil;
 	}
+	sweet_metal_trace("render pipeline %s + %s: OK", vf.name.UTF8String, ff.name.UTF8String);
 	SMRenderPipeline *p = [SMRenderPipeline new];
 	p.handle = h;
 	p.vertex = vf;
