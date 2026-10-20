@@ -1,0 +1,1214 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -28,7 +28,8 @@
+  *      CP_MEM_WRITE that must land in memory
+  *   7  the GPU interrupt (SPI 300, INTID 332) through bsd/dev/sweet_irq.c:
+  *      RBBM_INT_0_MASK, then a CACHE_FLUSH_TS event with its IRQ bit that
+- *      must write the fence and interrupt
++ *      must write the fence and interrupt; then the runtime the user
++ *      client uses (iokit/Kernel/arm/SweetAdreno.cpp) is ready
+  * 0 skips everything. A block is read only after the status bits of the
+  * clocks and power domain in front of it say it is reachable (an access to
+  * a gated block hangs the bus); the first failure stops the sequence.
+@@ -43,6 +44,8 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+@@ -1342,6 +1345,13 @@
+ 	core_wr(0x0500, 0x1);                     /* RBBM_PERFCTR_CNTL */
+ 	core_wr(0x001f, (1u << 30) | 0x1fffff);   /* RBBM_INTERFACE_HANG_INT_CNTL */
+ 	core_wr(0x0e19, (1u << 7) | 0x1);         /* UCHE_CLIENT_PF */
++	/* a6xx_set_ubwc_config for a618: highest bank bit 14 (hbb_lo 1),
++	 * swizzle 0x6, 4-channel macrotile. */
++	core_wr(0x8e08, 1u << 1);                 /* RB_NC_MODE_CNTL */
++	core_wr(0xb604, 1u << 1);                 /* TPL1_NC_MODE_CNTL */
++	core_wr(0xae02, 1u << 1);                 /* SP_NC_MODE_CNTL */
++	core_wr(0x0e01, 1u << 21);                /* UCHE_MODE_CNTL */
++	core_wr(0x0534, 0);                       /* RBBM_NC_MODE_CNTL */
+ 	core_wr(0x0038, 0);                       /* RBBM_INT_0_MASK: polled */
+ 
+ 	core_wr64(0x0830, GFX_IOVA + GFX_SQE_OFF);   /* CP_SQE_INSTR_BASE */
+@@ -1410,6 +1420,7 @@
+ 	volatile uint64_t count;
+ 	volatile uint32_t status;
+ } gpu_irq;
++static volatile uint64_t gpu_fault_count;
+ static int gpu_irq_chan;
+ 
+ /* Primary interrupt context: ack the RBBM sources, then wake the waiter. */
+@@ -1420,6 +1431,9 @@
+ 	core_wr(0x0037, status);                      /* RBBM_INT_CLEAR_CMD */
+ 	gpu_irq.status |= status;
+ 	gpu_irq.count++;
++	if (status & ((1u << 1) | (1u << 9) | (1u << 23) | (1u << 24))) {
++		gpu_fault_count++;                        /* AHB/CP HW error, hang, UCHE OOB */
++	}
+ 	thread_wakeup(&gpu_irq_chan);
+ }
+ 
+@@ -1458,8 +1472,301 @@
+ 	    gpu_irq.count - before, gpu_irq.status, *fence, core_rd(0x0806), rb_wptr);
+ 	gpu_smmu_faults(smmu, SMMU_GFX_IDX);
+ 	return gpu_irq.count > before && *fence == 0x618;
++}
++
++/*
++ * Runtime for the user client (iokit/Kernel/arm/SweetAdreno.cpp, UniXNU's
++ * NativeAdreno ABI v1): after stage 7 the GPU stays up (GPU_SET held) and
++ * this exports its address space, ring and fences.
++ *
++ * Address space: SMMU bank 0, 32-bit input. The kernel's ring, microcode and
++ * scratch stay at GFX_IOVA; clients place buffers in [GPU_CLIENT_VA_START,
++ * GPU_CLIENT_VA_END). L2/L3 tables come from 16 KiB kernel pages cut in four.
++ * Submissions: one CP_INDIRECT_BUFFER per client buffer, then a
++ * CACHE_FLUSH_TS event with its IRQ bit that writes the sequence number to
++ * the fence word; at most GPU_MAX_INFLIGHT jobs are outstanding.
++ */
++#define GPU_CLIENT_VA_START 0x40000000ull
++#define GPU_CLIENT_VA_END   0x100000000ull
++#define GPU_MAX_INFLIGHT    8u
++#define GPU_FENCE_OFF       (GFX_SCRATCH_OFF + 0x40)
++#define CP_INDIRECT_BUFFER  0x3fu
++
++struct sweet_gpu_info {
++	uint32_t chip_id, gmem_bytes;
++	uint64_t gmem_base, uche_trap_base, va_start, va_size;
++	uint32_t highest_bank_bit, ubwc_swizzle, macrotile_mode, ubwc_version;
++};
++int sweet_gpu_ready(void);
++void sweet_gpu_get_info(struct sweet_gpu_info *info);
++int sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable);
++int sweet_gpu_vm_unmap(uint64_t iova, uint64_t bytes);
++int sweet_gpu_submit(const uint64_t *iova, const uint32_t *dwords, unsigned count, uint32_t *fence);
++int sweet_gpu_wait_fence(uint32_t fence, uint64_t timeout_ns);
++uint32_t sweet_gpu_retired(void);
++uint64_t sweet_gpu_timestamp(void);
++uint64_t sweet_gpu_faults(void);
++
++static bool gpu_ready;
++static vm_offset_t gfx_smmu;
++static lck_grp_t *gpu_lck_grp;
++static lck_mtx_t *gpu_mtx;
++static uint32_t gpu_seqno;
++static vm_offset_t gfx_l2_va[4];
++static uint64_t gfx_l2_pa[4];
++static vm_offset_t *gfx_l3_va[4];          /* [512] each, allocated with the L2 */
++static uint64_t *gfx_l3_pa[4];
++static vm_offset_t gfx_pool;
++static uint64_t gfx_pool_pa;
++static unsigned gfx_pool_left;
++
++/* One zeroed 4 KiB table: a quarter of a contiguous 16 KiB kernel page. */
++static bool
++gfx_table_alloc(vm_offset_t *va, uint64_t *pa)
++{
++	if (!gfx_pool_left) {
++		if (kmem_alloc_contig(kernel_map, &gfx_pool, 0x4000, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return false;
++		}
++		gfx_pool_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)gfx_pool));
++		flush_dcache64((addr64_t)gfx_pool_pa, 0x4000, TRUE);
++		gfx_pool_left = 4;
++	}
++	gfx_pool_left--;
++	*va = gfx_pool + 0x1000 * gfx_pool_left;
++	*pa = gfx_pool_pa + 0x1000 * gfx_pool_left;
++	return true;
+ }
+ 
++static void
++gfx_tlb_flush(void)
++{
++	uint32_t cb = 0x8000 + 0x1000 * SMMU_GFX_IDX;    /* 8 global pages of 4 KiB */
++	gpu_wr(gfx_smmu, cb + 0x618, 0);                /* TLBIALL */
++	gpu_wr(gfx_smmu, cb + 0x7f0, 0);                /* TLBSYNC */
++	(void)gpu_wait(gfx_smmu, cb + 0x7f4, 1u, 0, 1000);
++}
++
++/* Level-3 entry pointer for iova, creating the L2/L3 tables on demand. */
++static uint64_t *
++gfx_pte(uint64_t iova, bool create, uint64_t *pte_pa)
++{
++	unsigned i1 = (unsigned)(iova >> 30) & 3, i2 = (unsigned)(iova >> 21) & 0x1ff;
++	unsigned i3 = (unsigned)(iova >> 12) & 0x1ff;
++	if (!gfx_l2_va[i1]) {
++		if (!create) {
++			return NULL;
++		}
++		vm_offset_t *l3v = kalloc_data(512 * sizeof(vm_offset_t), Z_WAITOK | Z_ZERO);
++		uint64_t *l3p = kalloc_data(512 * sizeof(uint64_t), Z_WAITOK | Z_ZERO);
++		if (!l3v || !l3p || !gfx_table_alloc(&gfx_l2_va[i1], &gfx_l2_pa[i1])) {
++			return NULL;
++		}
++		gfx_l3_va[i1] = l3v;
++		gfx_l3_pa[i1] = l3p;
++		((uint64_t *)gfx_mem)[i1] = gfx_l2_pa[i1] | 0x3;
++		flush_dcache64((addr64_t)(gfx_mem_pa + 8 * i1), 8, TRUE);
++	}
++	if (!gfx_l3_va[i1][i2]) {
++		if (!create || !gfx_table_alloc(&gfx_l3_va[i1][i2], &gfx_l3_pa[i1][i2])) {
++			return NULL;
++		}
++		((uint64_t *)gfx_l2_va[i1])[i2] = gfx_l3_pa[i1][i2] | 0x3;
++		flush_dcache64((addr64_t)(gfx_l2_pa[i1] + 8 * i2), 8, TRUE);
++	}
++	*pte_pa = gfx_l3_pa[i1][i2] + 8 * i3;
++	return (uint64_t *)gfx_l3_va[i1][i2] + i3;
++}
++
++int
++sweet_gpu_ready(void)
++{
++	return gpu_ready;
++}
++
++void
++sweet_gpu_get_info(struct sweet_gpu_info *info)
++{
++	info->chip_id = 0x06010800;            /* KGSL-style: decodes to 618 */
++	info->gmem_bytes = 0x80000;
++	info->gmem_base = 0x100000;            /* UCHE_GMEM_RANGE_MIN */
++	info->uche_trap_base = 0x0001fffffffff000ull;
++	info->va_start = GPU_CLIENT_VA_START;
++	info->va_size = GPU_CLIENT_VA_END - GPU_CLIENT_VA_START;
++	info->highest_bank_bit = 14;           /* a6xx_calc_ubwc_config, a618 */
++	info->ubwc_swizzle = 0x6;
++	info->macrotile_mode = 0;
++	info->ubwc_version = 2;
++}
++
++int
++sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable)
++{
++	if (!gpu_ready || (iova | pa | bytes) & 0xfff || !bytes || iova < GPU_CLIENT_VA_START ||
++	    iova + bytes > GPU_CLIENT_VA_END || iova + bytes < iova || (pa + bytes) >> 36) {
++		return EINVAL;
++	}
++	int err = 0;
++	lck_mtx_lock(gpu_mtx);
++	for (uint64_t off = 0; off < bytes && !err; off += 0x1000) {
++		uint64_t pte_pa;
++		uint64_t *pte = gfx_pte(iova + off, true, &pte_pa);
++		if (!pte) {
++			err = ENOMEM;
++		} else if (*pte & 1) {
++			err = EEXIST;
++		} else {
++			*pte = (pa + off) | 0x3 | (1ull << 6) | (writable ? 0 : (1ull << 7)) | (2ull << 8) |
++			    (1ull << 10) | (1ull << 11);
++			flush_dcache64((addr64_t)pte_pa, 8, TRUE);
++		}
++	}
++	gfx_tlb_flush();
++	lck_mtx_unlock(gpu_mtx);
++	if (err) {
++		(void)sweet_gpu_vm_unmap(iova, bytes);
++	}
++	return err;
++}
++
++int
++sweet_gpu_vm_unmap(uint64_t iova, uint64_t bytes)
++{
++	if (!gpu_ready || (iova | bytes) & 0xfff || iova < GPU_CLIENT_VA_START ||
++	    iova + bytes > GPU_CLIENT_VA_END || iova + bytes < iova) {
++		return EINVAL;
++	}
++	lck_mtx_lock(gpu_mtx);
++	for (uint64_t off = 0; off < bytes; off += 0x1000) {
++		uint64_t pte_pa;
++		uint64_t *pte = gfx_pte(iova + off, false, &pte_pa);
++		if (pte && *pte) {
++			*pte = 0;
++			flush_dcache64((addr64_t)pte_pa, 8, TRUE);
++		}
++	}
++	gfx_tlb_flush();
++	lck_mtx_unlock(gpu_mtx);
++	return 0;
++}
++
++uint32_t
++sweet_gpu_retired(void)
++{
++	addr64_t pa = gfx_mem_pa + GMU_TABLES + GPU_FENCE_OFF;
++	flush_dcache64(pa, 64, TRUE);
++	return *(volatile uint32_t *)(gfx_mem + GMU_TABLES + GPU_FENCE_OFF);
++}
++
++int
++sweet_gpu_submit(const uint64_t *iova, const uint32_t *dwords, unsigned count, uint32_t *fence)
++{
++	if (!gpu_ready || !count || count > 16) {
++		return EINVAL;
++	}
++	lck_mtx_lock(gpu_mtx);
++	uint32_t need = 4 * count + 5 + 8;
++	uint32_t room = (core_rd(0x0806) - rb_wptr - 1) & (GFX_RB_DWORDS - 1);   /* CP_RB_RPTR */
++	if (gpu_seqno - sweet_gpu_retired() >= GPU_MAX_INFLIGHT || room < need) {
++		lck_mtx_unlock(gpu_mtx);
++		return EBUSY;
++	}
++	for (unsigned i = 0; i < count; ++i) {
++		rb_pkt7(CP_INDIRECT_BUFFER, 3);
++		rb_out((uint32_t)iova[i]);
++		rb_out((uint32_t)(iova[i] >> 32));
++		rb_out(dwords[i]);
++	}
++	uint32_t seq = ++gpu_seqno;
++	rb_pkt7(CP_EVENT_WRITE, 4);
++	rb_out(CACHE_FLUSH_TS | (1u << 31));
++	rb_out(GFX_IOVA + GPU_FENCE_OFF);
++	rb_out(0);
++	rb_out(seq);
++	gfx_sync(GFX_RB_OFF, 0x8000);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	core_wr(0x0807, rb_wptr);                     /* CP_RB_WPTR */
++	lck_mtx_unlock(gpu_mtx);
++	*fence = seq;
++	return 0;
++}
++
++int
++sweet_gpu_wait_fence(uint32_t fence, uint64_t timeout_ns)
++{
++	if (!gpu_ready) {
++		return ENXIO;
++	}
++	if ((int32_t)(fence - gpu_seqno) > 0) {
++		return EINVAL;                            /* never submitted */
++	}
++	uint64_t deadline = 0;
++	if (timeout_ns) {
++		nanoseconds_to_absolutetime(timeout_ns, &deadline);
++		deadline += mach_absolute_time();
++	}
++	for (;;) {
++		if ((int32_t)(sweet_gpu_retired() - fence) >= 0) {
++			return 0;
++		}
++		if (!timeout_ns || mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++		assert_wait_deadline(&gpu_irq_chan, THREAD_ABORTSAFE, deadline);
++		if ((int32_t)(sweet_gpu_retired() - fence) >= 0) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			return 0;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
++			return EINTR;
++		}
++	}
++}
++
++uint64_t
++sweet_gpu_timestamp(void)
++{
++	if (!gpu_ready) {
++		return 0;
++	}
++	uint32_t hi, lo;
++	do {
++		hi = core_rd(0x0981);
++		lo = core_rd(0x0980);                     /* CP_ALWAYS_ON_COUNTER */
++	} while (hi != core_rd(0x0981));
++	return ((uint64_t)hi << 32) | lo;
++}
++
++uint64_t
++sweet_gpu_faults(void)
++{
++	return gpu_fault_count;
++}
++
++static void
++gpu_runtime_start(vm_offset_t smmu)
++{
++	gfx_smmu = smmu;
++	gpu_lck_grp = lck_grp_alloc_init("sweet_gpu", LCK_GRP_ATTR_NULL);
++	gpu_mtx = lck_mtx_alloc_init(gpu_lck_grp, LCK_ATTR_NULL);
++	/* The tables stage 6 built: L2 for [0, 1 GiB) and the L3 of GFX_IOVA. */
++	gfx_l3_va[0] = kalloc_data(512 * sizeof(vm_offset_t), Z_WAITOK | Z_ZERO);
++	gfx_l3_pa[0] = kalloc_data(512 * sizeof(uint64_t), Z_WAITOK | Z_ZERO);
++	if (!gpu_mtx || !gfx_l3_va[0] || !gfx_l3_pa[0]) {
++		gpu_log("runtime: no memory");
++		return;
++	}
++	gfx_l2_va[0] = gfx_mem + 0x1000;
++	gfx_l2_pa[0] = gfx_mem_pa + 0x1000;
++	gfx_l3_va[0][(GFX_IOVA >> 21) & 0x1ff] = gfx_mem + 0x2000;
++	gfx_l3_pa[0][(GFX_IOVA >> 21) & 0x1ff] = gfx_mem_pa + 0x2000;
++	gpu_seqno = sweet_gpu_retired();
++	gpu_ready = true;
++	gpu_log("runtime ready: client va 0x%llx-0x%llx, fence %u", GPU_CLIENT_VA_START,
++	    GPU_CLIENT_VA_END, gpu_seqno);
++}
++
+ static int sweet_gpu_sleep_chan;
+ 
+ static void
+@@ -1491,7 +1798,9 @@
+ 		if (smmu != 0) {
+ 			if (gpu_stage_gmu_boot(smmu) && sg.stage >= 5 && gpu_stage_gx_hfi() &&
+ 			    sg.stage >= 6 && gpu_stage_cp(smmu) && sg.stage >= 7) {
+-				(void)gpu_stage_irq(smmu);
++				if (gpu_stage_irq(smmu)) {
++					gpu_runtime_start(smmu);
++				}
+ 			}
+ 		}
+ 	}
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = NativeAdrenoGpuPublished;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = NativeAdrenoGpuPublished;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/NativeAdrenoABI.h
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: MIT
++ * From UniXNU (https://github.com/UniXNU/UniXNU) drivers/NativeAdreno/NativeAdrenoABI.h
++ * at dec4c7b5b64f35c8a95a828fb0f8375d91eae6a5, unchanged below this comment, so their Turnip darwin backend
++ * (patches/mesa/turnip-darwin-kmd.patch) can drive this kernel.
++ * Copyright (c) 2026 NativeAdreno contributors. MIT License:
++ * MIT License
++ *
++ * Copyright (c) 2026 NativeAdreno contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_ABI_H
++#define NATIVE_ADRENO_ABI_H
++#include <stdint.h>
++
++/* Versioned kernel/user-client wire ABI for the native Adreno driver. This is
++ * NOT the Metal, IOKit or Turnip ABI and it does not describe an ioctl. The
++ * IOKit service will copy exactly these fixed-size records across its external
++ * methods. All fields are little endian; both participants are ARM64. Every
++ * array is inside one fixed record so a caller cannot pass a length that
++ * disagrees with the storage. Unknown versions, methods and flags are refused
++ * rather than ignored. */
++enum {
++    NativeAdrenoAbiVersion = 1,
++    NativeAdrenoAbiMaxBuffers = 16,
++    NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
++    NativeAdrenoMethodQuery = 1,
++    NativeAdrenoMethodBoAlloc = 2,
++    NativeAdrenoMethodBoMap = 3,
++    NativeAdrenoMethodBoFree = 4,
++    NativeAdrenoMethodSubmit = 5,
++    NativeAdrenoMethodWaitFence = 6,
++    NativeAdrenoMethodGetTimestamp = 7,
++    NativeAdrenoMethodGetStatus = 8,
++    NativeAdrenoMethodSetMetadata = 9,
++    NativeAdrenoMethodGetMetadata = 10,
++    NativeAdrenoMethodCreateQueue = 11,
++    NativeAdrenoMethodCloseQueue = 12,
++    NativeAdrenoMethodBoCpuMap = 13,
++    NativeAdrenoMethodBoCpuUnmap = 14,
++    NativeAdrenoMethodGetDeviceInfo = 15,
++    NativeAdrenoMethodBoImport = 16,
++    NativeAdrenoAbiMetadataBytes = 64,
++    NativeAdrenoAbiMaxQueues = 8
++};
++struct NativeAdrenoAbiParams {
++    uint32_t abi_version;
++    uint32_t input_bits;          /* GPU VA bits below 2^input_bits */
++    uint32_t output_bits;         /* physical address bits */
++    uint32_t flags;               /* NativeAdrenoParamsHostImport or zero */
++    uint64_t max_bo_bytes;
++};
++enum {
++    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
++};
++struct NativeAdrenoAbiBoAlloc {
++    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++    uint32_t align_log2;          /* 12..24 */
++    uint32_t contiguous;          /* 1 requires one raw physical span */
++};
++struct NativeAdrenoAbiBoAllocReply {
++    uint64_t handle;              /* opaque to userspace, nonzero */
++};
++/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
++ * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
++ * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
++struct NativeAdrenoAbiBoImport {
++    uint64_t address;             /* 4KiB aligned */
++    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++};
++struct NativeAdrenoAbiBoMap {
++    uint64_t handle;
++    uint64_t iova;                /* 4KiB aligned, inside the mounted aperture */
++    uint32_t permissions;         /* bit0 read, bit1 write; read required */
++    uint32_t writeback;           /* 0 normal non-coherent, 1 WB/WA */
++    uint32_t shareability;        /* 2 outer, 3 inner */
++    uint32_t reserved;            /* zero */
++};
++struct NativeAdrenoAbiBoMapReply {
++    uint64_t iova;
++};
++struct NativeAdrenoAbiBoFree {
++    uint64_t handle;
++};
++struct NativeAdrenoAbiSubmitBuffer {
++    uint64_t handle;
++    uint64_t iova;
++    uint64_t bytes;               /* 4-byte multiple, dword count = bytes/4 */
++};
++struct NativeAdrenoAbiSubmit {
++    uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
++    uint32_t reserved;            /* zero */
++    uint64_t queue;               /* open queue; 0 is created by open() */
++    uint64_t wait_fence;          /* zero or an earlier fence of this client */
++    uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
++    NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
++};
++struct NativeAdrenoAbiMetadata {
++    uint64_t handle;              /* object identity */
++    uint32_t bytes;               /* set: length; get: requested capacity */
++    uint32_t reserved;            /* zero */
++    char text[NativeAdrenoAbiMetadataBytes]; /* raw bytes, not NUL terminated */
++};
++struct NativeAdrenoAbiSubmitReply {
++    uint64_t fence;               /* nonzero CP timestamp value */
++};
++struct NativeAdrenoAbiWaitFence {
++    uint64_t fence;
++    uint64_t timeout_ns;          /* 0 polls once */
++};
++struct NativeAdrenoAbiTimestamp {
++    uint64_t ticks;               /* GPU always-on counter value */
++};
++struct NativeAdrenoAbiBoCpuMap {
++    uint64_t handle;
++};
++struct NativeAdrenoAbiBoCpuMapReply {
++    uint32_t token;               /* clientMemoryForType selector */
++    uint32_t reserved;            /* zero */
++    uint64_t bytes;               /* bytes the mapping covers */
++};
++struct NativeAdrenoAbiBoCpuUnmap {
++    uint64_t handle;
++    uint32_t token;               /* exactly the token returned by map */
++    uint32_t reserved;            /* zero */
++};
++struct NativeAdrenoAbiQueue {
++    uint64_t queue;               /* zero for create, an open id for close */
++};
++struct NativeAdrenoAbiQueueReply {
++    uint64_t queue;               /* nonzero id of the created queue */
++};
++struct NativeAdrenoAbiStatus {
++    uint64_t faults;              /* monotonic; change means context lost */
++    uint64_t suspends;            /* monotonic suspend/reset count */
++};
++/* Fixed facts of the mounted GPU that the Vulkan driver needs and cannot derive: all come from the board code, which takes
++ * them from the pinned sources (a6xx catalog, UBWC config, the programmed UCHE ranges), never from a guess. */
++enum {
++    NativeAdrenoDeviceClientIova = 1,     /* flags: the client chooses BO addresses (BoMap iova) */
++    NativeAdrenoDeviceCachedCoherent = 2  /* flags: unused until IO-coherent BO memory exists */
++};
++struct NativeAdrenoAbiDeviceInfo {
++    uint32_t chip_id;             /* ADRENO_CHIPID, e.g. 0x43050a01 */
++    uint32_t gmem_bytes;
++    uint64_t gmem_base;           /* UCHE GMEM window start (GPU address) */
++    uint64_t uche_trap_base;
++    uint64_t va_start;            /* first GPU address the client may map */
++    uint64_t va_size;
++    uint32_t highest_bank_bit;
++    uint32_t ubwc_swizzle;        /* bit0 level 1, bit1 level 2, bit2 level 3 */
++    uint32_t macrotile_mode;      /* 0 four channel, 1 eight channel */
++    uint32_t ubwc_version;        /* encoder version, 4 for UBWC 4.0 */
++    uint32_t flags;
++    uint32_t reserved;            /* zero */
++};
++#if defined(__cplusplus)
++static_assert(sizeof(NativeAdrenoAbiDeviceInfo) == 64, "ABI device info layout");
++static_assert(sizeof(NativeAdrenoAbiParams) == 24, "ABI params layout");
++static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
++static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
++static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
++static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
++static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");
++static_assert(sizeof(NativeAdrenoAbiQueue) == 8, "ABI queue layout");
++static_assert(sizeof(NativeAdrenoAbiQueueReply) == 8, "ABI queue reply layout");
++static_assert(sizeof(NativeAdrenoAbiMetadata) == 80, "ABI metadata layout");
++static_assert(sizeof(NativeAdrenoAbiWaitFence) == 16, "ABI wait layout");
++static_assert(sizeof(NativeAdrenoAbiTimestamp) == 8, "ABI timestamp layout");
++static_assert(sizeof(NativeAdrenoAbiStatus) == 16, "ABI status layout");
++#endif
++#endif
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -0,0 +1,626 @@
++/*
++ * JOYEUSE: the Adreno 618 as an IOKit service for userspace.
++ *
++ * NativeAdrenoGpuPublished speaks UniXNU's NativeAdreno ABI v1
++ * (NativeAdrenoABI.h, MIT) in its direct form: IOServiceOpen type 0, then
++ * IOConnectCallStructMethod with the ABI method number as the selector and
++ * the fixed-size records as structure input/output. That is what their
++ * Turnip backend (tu_knl_darwin.cc, TU_DARWIN_SERVICE=NativeAdrenoGpuPublished)
++ * calls, so it can run on this kernel unchanged.
++ *
++ * The GPU itself is brought up by bsd/dev/sweet_gpu.c (sweetgpu=7); this
++ * file only keeps per-client buffer objects and calls its runtime:
++ *  - BoAlloc: IOBufferMemoryDescriptor below 2^36 (the SMMU's output size),
++ *    zeroed and cleaned to the point of coherency (the GPU maps it
++ *    non-cacheable). Handles are small integers: Turnip indexes a sparse
++ *    array with them.
++ *  - BoMap: the client picks the GPU address inside [va_start, va_start +
++ *    va_size); each physical segment goes into the SMMU bank 0 tables.
++ *  - BoCpuMap: the token is a clientMemoryForType type; the user maps it
++ *    write-combined (kIOMapWriteCombineCache in IOConnectMapMemory64).
++ *  - Submit: up to 16 indirect buffers, one CACHE_FLUSH_TS fence per job,
++ *    at most 8 jobs in flight (kIOReturnBusy), fences are 32 bits.
++ *  - BoImport: wires the caller's own pages (an IOSurface) as a buffer.
++ * One address space is shared by every client: there is no per-process
++ * isolation yet.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSString.h>
++#include <sys/errno.h>
++#include "NativeAdrenoABI.h"
++
++extern "C" {
++struct sweet_gpu_info {
++	uint32_t chip_id, gmem_bytes;
++	uint64_t gmem_base, uche_trap_base, va_start, va_size;
++	uint32_t highest_bank_bit, ubwc_swizzle, macrotile_mode, ubwc_version;
++};
++int sweet_gpu_ready(void);
++void sweet_gpu_get_info(struct sweet_gpu_info *info);
++int sweet_gpu_vm_map(uint64_t iova, uint64_t pa, uint64_t bytes, bool writable);
++int sweet_gpu_vm_unmap(uint64_t iova, uint64_t bytes);
++int sweet_gpu_submit(const uint64_t *iova, const uint32_t *dwords, unsigned count, uint32_t *fence);
++int sweet_gpu_wait_fence(uint32_t fence, uint64_t timeout_ns);
++uint32_t sweet_gpu_retired(void);
++uint64_t sweet_gpu_timestamp(void);
++uint64_t sweet_gpu_faults(void);
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
++}
++
++class NativeAdrenoGpuPublished : public IOService {
++	OSDeclareDefaultStructors(NativeAdrenoGpuPublished);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(NativeAdrenoGpuPublished, IOService);
++
++bool
++NativeAdrenoGpuPublished::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
++	setProperty("NativeAdrenoAbiVersion", (unsigned long long)NativeAdrenoAbiVersion, 32);
++	registerService();
++	return true;
++}
++
++enum { kSweetAdrenoMaxObjects = 1024 };
++
++class SweetAdrenoUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetAdrenoUserClient);
++
++	struct Entry {
++		IOMemoryDescriptor *md;      /* IOBufferMemoryDescriptor, or the wired import */
++		uint64_t bytes;
++		uint64_t iova;               /* 0 while unmapped */
++		uint32_t last_fence;
++		uint32_t token;              /* CPU-map lease, 0 if none */
++		uint32_t metadata_bytes;
++		bool imported;
++		bool busy_known;             /* last_fence is valid */
++		char metadata[NativeAdrenoAbiMetadataBytes];
++	};
++	task_t fTask;
++	IOLock *fLock;
++	Entry *fEntries;
++	bool fQueues[NativeAdrenoAbiMaxQueues];
++
++	Entry *lookup(uint64_t handle);
++	IOReturn mapSegments(Entry *e, uint64_t iova, bool writable);
++	IOReturn freeEntry(Entry *e, bool wait);
++	static IOReturn fromErrno(int err);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAdrenoUserClient, IOUserClient);
++
++bool
++SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (type != 0 || !IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fLock = IOLockAlloc();
++	fEntries = IONewZero(Entry, kSweetAdrenoMaxObjects);
++	return fLock != NULL && fEntries != NULL;
++}
++
++bool
++SweetAdrenoUserClient::start(IOService *provider)
++{
++	if (!OSDynamicCast(NativeAdrenoGpuPublished, provider) || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fQueues[0] = true;          /* queue 0 exists from open() */
++	return true;
++}
++
++void
++SweetAdrenoUserClient::free(void)
++{
++	if (fEntries != NULL) {
++		for (unsigned i = 0; i < kSweetAdrenoMaxObjects; ++i) {
++			if (fEntries[i].md != NULL) {
++				(void)freeEntry(&fEntries[i], true);
++			}
++		}
++		IODelete(fEntries, Entry, kSweetAdrenoMaxObjects);
++		fEntries = NULL;
++	}
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++SweetAdrenoUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::fromErrno(int err)
++{
++	switch (err) {
++	case 0: return kIOReturnSuccess;
++	case EBUSY: return kIOReturnBusy;
++	case ETIMEDOUT: return kIOReturnTimeout;
++	case ENOMEM: return kIOReturnNoMemory;
++	case ENXIO: return kIOReturnNotReady;
++	case EEXIST: return kIOReturnExclusiveAccess;
++	case EINTR: return kIOReturnAborted;
++	default: return kIOReturnBadArgument;
++	}
++}
++
++SweetAdrenoUserClient::Entry *
++SweetAdrenoUserClient::lookup(uint64_t handle)
++{
++	if (handle == 0 || handle > kSweetAdrenoMaxObjects || fEntries[handle - 1].md == NULL) {
++		return NULL;
++	}
++	return &fEntries[handle - 1];
++}
++
++IOReturn
++SweetAdrenoUserClient::mapSegments(Entry *e, uint64_t iova, bool writable)
++{
++	for (uint64_t off = 0; off < e->bytes;) {
++		IOByteCount len = 0;
++		addr64_t pa = e->md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		if (pa == 0 || len == 0) {
++			(void)sweet_gpu_vm_unmap(iova, off);
++			return kIOReturnVMError;
++		}
++		if (len > e->bytes - off) {
++			len = (IOByteCount)(e->bytes - off);
++		}
++		int err = sweet_gpu_vm_map(iova + off, pa, len, writable);
++		if (err) {
++			if (off) {
++				(void)sweet_gpu_vm_unmap(iova, off);
++			}
++			return fromErrno(err);
++		}
++		off += len;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::freeEntry(Entry *e, bool wait)
++{
++	if (e->busy_known && (int32_t)(sweet_gpu_retired() - e->last_fence) < 0) {
++		if (!wait || sweet_gpu_wait_fence(e->last_fence, 5000000000ull) != 0) {
++			return kIOReturnBusy;
++		}
++	}
++	if (e->iova) {
++		(void)sweet_gpu_vm_unmap(e->iova, e->bytes);
++	}
++	if (e->imported) {
++		e->md->complete();
++	}
++	e->md->release();
++	bzero(e, sizeof(*e));
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetAdrenoUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	IOLockLock(fLock);
++	Entry *e = lookup(type);
++	if (e == NULL || e->token != type || e->imported) {
++		IOLockUnlock(fLock);
++		return kIOReturnBadArgument;
++	}
++	e->md->retain();
++	*memory = e->md;
++	*options = 0;               /* the cache mode is the caller's (write combine) */
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
++/* Exact sizes in and out, as the ABI requires; nothing is padded or guessed. */
++static bool
++sizesOk(IOExternalMethodArguments *args, uint32_t in, uint32_t out)
++{
++	if (args->structureInputDescriptor || args->structureOutputDescriptor ||
++	    args->structureInputSize != in || args->structureOutputSize < out) {
++		return false;
++	}
++	args->structureOutputSize = out;
++	return true;
++}
++
++IOReturn
++SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	const void *in = args->structureInput;
++	void *out = args->structureOutput;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (!sweet_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	switch (selector) {
++	case NativeAdrenoMethodQuery: {
++		if (!sizesOk(args, 0, sizeof(NativeAdrenoAbiParams))) {
++			return kIOReturnBadArgument;
++		}
++		NativeAdrenoAbiParams p = {};
++		p.abi_version = NativeAdrenoAbiVersion;
++		p.input_bits = 32;
++		p.output_bits = 36;
++		p.flags = NativeAdrenoParamsHostImport;
++		p.max_bo_bytes = 1ull << NativeAdrenoAbiMaxBoBytesShift;
++		memcpy(out, &p, sizeof(p));
++		return kIOReturnSuccess;
++	}
++	case NativeAdrenoMethodGetDeviceInfo: {
++		if (!sizesOk(args, 0, sizeof(NativeAdrenoAbiDeviceInfo))) {
++			return kIOReturnBadArgument;
++		}
++		struct sweet_gpu_info gi;
++		sweet_gpu_get_info(&gi);
++		NativeAdrenoAbiDeviceInfo d = {};
++		d.chip_id = gi.chip_id;
++		d.gmem_bytes = gi.gmem_bytes;
++		d.gmem_base = gi.gmem_base;
++		d.uche_trap_base = gi.uche_trap_base;
++		d.va_start = gi.va_start;
++		d.va_size = gi.va_size;
++		d.highest_bank_bit = gi.highest_bank_bit;
++		d.ubwc_swizzle = gi.ubwc_swizzle;
++		d.macrotile_mode = gi.macrotile_mode;
++		d.ubwc_version = gi.ubwc_version;
++		d.flags = NativeAdrenoDeviceClientIova;
++		memcpy(out, &d, sizeof(d));
++		return kIOReturnSuccess;
++	}
++	case NativeAdrenoMethodGetTimestamp: {
++		if (!sizesOk(args, 0, sizeof(NativeAdrenoAbiTimestamp))) {
++			return kIOReturnBadArgument;
++		}
++		NativeAdrenoAbiTimestamp t = { sweet_gpu_timestamp() };
++		memcpy(out, &t, sizeof(t));
++		return kIOReturnSuccess;
++	}
++	case NativeAdrenoMethodGetStatus: {
++		if (!sizesOk(args, 0, sizeof(NativeAdrenoAbiStatus))) {
++			return kIOReturnBadArgument;
++		}
++		NativeAdrenoAbiStatus st = { sweet_gpu_faults(), 0 };
++		memcpy(out, &st, sizeof(st));
++		return kIOReturnSuccess;
++	}
++	case NativeAdrenoMethodWaitFence: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiWaitFence), 0)) {
++			return kIOReturnBadArgument;
++		}
++		NativeAdrenoAbiWaitFence w;
++		memcpy(&w, in, sizeof(w));
++		if (w.fence == 0 || w.fence > UINT32_MAX) {
++			return kIOReturnBadArgument;
++		}
++		return fromErrno(sweet_gpu_wait_fence((uint32_t)w.fence, w.timeout_ns));
++	}
++	default:
++		break;
++	}
++
++	IOLockLock(fLock);
++	switch (selector) {
++	case NativeAdrenoMethodBoAlloc: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoAlloc), sizeof(NativeAdrenoAbiBoAllocReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoAlloc a;
++		memcpy(&a, in, sizeof(a));
++		if (a.bytes == 0 || (a.bytes & 0xfff) || a.bytes > (1ull << NativeAdrenoAbiMaxBoBytesShift) ||
++		    a.align_log2 < 12 || a.align_log2 > 24 || a.contiguous > 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		Entry *e = NULL;
++		uint64_t handle = 0;
++		for (unsigned i = 0; i < kSweetAdrenoMaxObjects && !e; ++i) {
++			if (fEntries[i].md == NULL) {
++				e = &fEntries[i];
++				handle = i + 1;
++			}
++		}
++		if (e == NULL) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		/* Below 2^36 (SMMU output), aligned as asked (at least a page). */
++		mach_vm_address_t mask = 0xfffffffffull & ~((1ull << (a.align_log2 > 14 ? a.align_log2 : 14)) - 1);
++		IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | (a.contiguous ? kIOMemoryPhysicallyContiguous : 0), a.bytes, mask);
++		if (md == NULL) {
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		bzero(md->getBytesNoCopy(), (size_t)a.bytes);
++		for (uint64_t off = 0; off < a.bytes;) {
++			IOByteCount len = 0;
++			addr64_t pa = md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++			if (!pa || !len) {
++				break;
++			}
++			flush_dcache64(pa, (unsigned)len, TRUE);
++			off += len;
++		}
++		e->md = md;
++		e->bytes = a.bytes;
++		NativeAdrenoAbiBoAllocReply r = { handle };
++		memcpy(out, &r, sizeof(r));
++		break;
++	}
++	case NativeAdrenoMethodBoImport: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoImport), sizeof(NativeAdrenoAbiBoAllocReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoImport im;
++		memcpy(&im, in, sizeof(im));
++		if (im.bytes == 0 || ((im.address | im.bytes) & 0xfff) ||
++		    im.bytes > (1ull << NativeAdrenoAbiMaxBoBytesShift)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		Entry *e = NULL;
++		uint64_t handle = 0;
++		for (unsigned i = 0; i < kSweetAdrenoMaxObjects && !e; ++i) {
++			if (fEntries[i].md == NULL) {
++				e = &fEntries[i];
++				handle = i + 1;
++			}
++		}
++		if (e == NULL) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(im.address, im.bytes,
++		    kIODirectionInOut, fTask);
++		if (md == NULL || md->prepare() != kIOReturnSuccess) {
++			if (md) {
++				md->release();
++			}
++			ret = kIOReturnVMError;
++			break;
++		}
++		e->md = md;
++		e->bytes = im.bytes;
++		e->imported = true;
++		NativeAdrenoAbiBoAllocReply r = { handle };
++		memcpy(out, &r, sizeof(r));
++		break;
++	}
++	case NativeAdrenoMethodBoMap: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoMap), sizeof(NativeAdrenoAbiBoMapReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoMap m;
++		memcpy(&m, in, sizeof(m));
++		Entry *e = lookup(m.handle);
++		if (e == NULL || e->iova || !(m.permissions & 1) || (m.permissions & ~3u) ||
++		    m.writeback > 1 || (m.shareability != 2 && m.shareability != 3) || m.reserved) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		ret = mapSegments(e, m.iova, (m.permissions & 2) != 0);
++		if (ret == kIOReturnSuccess) {
++			e->iova = m.iova;
++			NativeAdrenoAbiBoMapReply r = { m.iova };
++			memcpy(out, &r, sizeof(r));
++		}
++		break;
++	}
++	case NativeAdrenoMethodBoFree: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoFree), 0)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoFree f;
++		memcpy(&f, in, sizeof(f));
++		Entry *e = lookup(f.handle);
++		ret = e ? freeEntry(e, false) : kIOReturnBadArgument;
++		break;
++	}
++	case NativeAdrenoMethodBoCpuMap: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoCpuMap), sizeof(NativeAdrenoAbiBoCpuMapReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoCpuMap c;
++		memcpy(&c, in, sizeof(c));
++		Entry *e = lookup(c.handle);
++		if (e == NULL || e->imported) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		e->token = (uint32_t)c.handle;      /* clientMemoryForType type */
++		NativeAdrenoAbiBoCpuMapReply r = {};
++		r.token = e->token;
++		r.bytes = e->bytes;
++		memcpy(out, &r, sizeof(r));
++		break;
++	}
++	case NativeAdrenoMethodBoCpuUnmap: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiBoCpuUnmap), 0)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiBoCpuUnmap c;
++		memcpy(&c, in, sizeof(c));
++		Entry *e = lookup(c.handle);
++		if (e == NULL || e->token == 0 || e->token != c.token || c.reserved) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		e->token = 0;
++		break;
++	}
++	case NativeAdrenoMethodSubmit: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiSubmit), sizeof(NativeAdrenoAbiSubmitReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiSubmit *s = IONew(NativeAdrenoAbiSubmit, 1);
++		if (s == NULL) {
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		memcpy(s, in, sizeof(*s));
++		uint64_t iova[NativeAdrenoAbiMaxBuffers];
++		uint32_t dwords[NativeAdrenoAbiMaxBuffers];
++		Entry *used[NativeAdrenoAbiMaxBuffers];
++		if (s->buffer_count == 0 || s->buffer_count > NativeAdrenoAbiMaxBuffers || s->reserved ||
++		    s->queue >= NativeAdrenoAbiMaxQueues || !fQueues[s->queue]) {
++			ret = kIOReturnBadArgument;
++		}
++		for (uint32_t i = 0; ret == kIOReturnSuccess && i < s->buffer_count; ++i) {
++			const NativeAdrenoAbiSubmitBuffer *b = &s->buffers[i];
++			Entry *e = lookup(b->handle);
++			if (e == NULL || !e->iova || b->bytes == 0 || (b->bytes & 3) || (b->iova & 3) ||
++			    b->iova < e->iova || b->iova + b->bytes > e->iova + e->bytes ||
++			    b->bytes / 4 > 0xfffff) {
++				ret = kIOReturnBadArgument;
++				break;
++			}
++			iova[i] = b->iova;
++			dwords[i] = (uint32_t)(b->bytes / 4);
++			used[i] = e;
++		}
++		if (ret == kIOReturnSuccess && s->wait_fence) {
++			IOLockUnlock(fLock);
++			ret = fromErrno(sweet_gpu_wait_fence((uint32_t)s->wait_fence, s->wait_timeout_ns));
++			IOLockLock(fLock);
++		}
++		uint32_t fence = 0;
++		if (ret == kIOReturnSuccess) {
++			ret = fromErrno(sweet_gpu_submit(iova, dwords, s->buffer_count, &fence));
++		}
++		if (ret == kIOReturnSuccess) {
++			for (uint32_t i = 0; i < s->buffer_count; ++i) {
++				if (lookup(s->buffers[i].handle) == used[i]) {
++					used[i]->last_fence = fence;
++					used[i]->busy_known = true;
++				}
++			}
++			NativeAdrenoAbiSubmitReply r = { fence };
++			memcpy(out, &r, sizeof(r));
++		}
++		IODelete(s, NativeAdrenoAbiSubmit, 1);
++		break;
++	}
++	case NativeAdrenoMethodSetMetadata: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiMetadata), 0)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiMetadata md;
++		memcpy(&md, in, sizeof(md));
++		Entry *e = lookup(md.handle);
++		if (e == NULL || md.bytes > NativeAdrenoAbiMetadataBytes || md.reserved) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(e->metadata, md.text, md.bytes);
++		e->metadata_bytes = md.bytes;
++		break;
++	}
++	case NativeAdrenoMethodGetMetadata: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiMetadata), sizeof(NativeAdrenoAbiMetadata))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiMetadata md;
++		memcpy(&md, in, sizeof(md));
++		Entry *e = lookup(md.handle);
++		if (e == NULL || md.reserved) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiMetadata r = {};
++		r.handle = md.handle;
++		r.bytes = e->metadata_bytes < md.bytes ? e->metadata_bytes : md.bytes;
++		memcpy(r.text, e->metadata, r.bytes);
++		memcpy(out, &r, sizeof(r));
++		break;
++	}
++	case NativeAdrenoMethodCreateQueue: {
++		if (!sizesOk(args, 0, sizeof(NativeAdrenoAbiQueueReply))) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		uint64_t id = 0;
++		for (unsigned i = 1; i < NativeAdrenoAbiMaxQueues && !id; ++i) {
++			if (!fQueues[i]) {
++				fQueues[i] = true;
++				id = i;
++			}
++		}
++		if (!id) {
++			ret = kIOReturnNoResources;
++			break;
++		}
++		NativeAdrenoAbiQueueReply r = { id };
++		memcpy(out, &r, sizeof(r));
++		break;
++	}
++	case NativeAdrenoMethodCloseQueue: {
++		if (!sizesOk(args, sizeof(NativeAdrenoAbiQueue), 0)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		NativeAdrenoAbiQueue q;
++		memcpy(&q, in, sizeof(q));
++		if (q.queue == 0 || q.queue >= NativeAdrenoAbiMaxQueues || !fQueues[q.queue]) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		fQueues[q.queue] = false;
++		break;
++	}
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++#endif /* SWEET */
