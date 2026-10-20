@@ -299,10 +299,23 @@ long-descriptor FORMAT field). iOS keeps running.
    0x0, 960 lines`, then `irq: RECEIVED after 1 interrupt(s), status
    0x00100000` (CP_CACHE_FLUSH_TS) with the fence (1560) in memory.
 
-Next steps: a kernel GPU service with UniXNU's NativeAdreno ABI v1 (an
-IOKit user client `NativeAdrenoGpuPublished`: buffers, CPU maps, submit,
-fences), so their Turnip `tu_knl_darwin.cc` backend runs unchanged; hwcg,
-CP protect and UBWC from hw_init; the GMU interrupts.
+8. User client (xnu 0090, shim `shim-boot-joyeuse-gpu8.img`, still
+   `sweetgpu=7`): after stage 7 the GPU stays up and
+   `iokit/Kernel/arm/SweetAdreno.cpp` publishes `NativeAdrenoGpuPublished`,
+   which speaks UniXNU's NativeAdreno ABI v1 (`NativeAdrenoABI.h`, MIT,
+   unchanged) in its direct form: `IOServiceOpen` type 0, selector = ABI
+   method. Buffers are IOBufferMemoryDescriptors below 2^36 mapped at the
+   client's chosen GPU address (0x40000000-0x100000000 in SMMU bank 0),
+   CPU maps are write-combined, submissions are indirect buffers with a
+   CACHE_FLUSH_TS IRQ fence (8 in flight), the a618 UBWC registers are
+   programmed. `tools/sweet-gputest` (built without an iOS SDK, installed
+   as `/var/jb/usr/bin/sweet-gputest`) checks the whole path from a user
+   process: one CP_MEM_WRITE through an IB, then a burst of jobs.
+
+Next steps: run sweet-gputest on gpu8; build Turnip with UniXNU's
+`turnip-darwin-kmd.patch` for iOS (needs an iOS SDK, which this Mac lacks)
+and run it with `TU_DARWIN_SERVICE=NativeAdrenoGpuPublished`; hwcg and CP
+protect from hw_init; the GMU interrupts; per-process address spaces.
 
 ## Internet over USB
 
