@@ -423,7 +423,7 @@ a reboot).
 
 ## Metal: what iOS needs (notes, 2026-10-20)
 
-Nothing here runs yet; this is the plan for making iOS itself use the GPU.
+Plan and state of making iOS itself use the GPU.
 - Discovery: Metal.framework looks up the IOKit service `IOAcceleratorES`,
   reads its `MetalPluginName` property, loads that bundle and calls its
   principal class' `initWithAcceleratorPort:`. backboardd already asks for
@@ -444,3 +444,26 @@ Nothing here runs yet; this is the plan for making iOS itself use the GPU.
   pointing at a test bundle that logs and returns nil, to see who loads it
   and under which sandbox; (2) Turnip from inside SpringBoard; (3) only then
   a real MTLDevice.
+
+Stage 1 works (xnu 0096, `sweetmetal=1`, 2026-10-20). The kernel publishes
+a built-in `IOAcceleratorES` (no closed IOGPUFamily here, so the class name
+is free) with `MetalPluginName` = `MetalPluginClassName` = `SweetMetalProbe`
+(`sweetmetalplugin=<name>` to change it); it prints `SWEET MTL:` lines for
+property reads and opens of user processes and refuses `IOServiceOpen`.
+`tools/sweet-metalprobe` builds the bundle (a `_MTLDevice` subclass whose
+`initWithAcceleratorPort:` appends to `/var/tmp/sweetmetal.log` and returns
+nil) and `sweet-mtlquery` (prints what `MTLCreateSystemDefaultDevice`
+returns). Installed as `/System/Library/Extensions/SweetMetalProbe.bundle`
+(ad-hoc signed), shim `shim-boot-joyeuse-metal1.img` (= gpu11 + 0096 +
+`sweetmetal=1`):
+- backboardd[58] and SpringBoard[26], both uid 501, load the bundle and call
+  `initWithAcceleratorPort:` (a real port) on their own; the library
+  validation of this port accepts our ad-hoc bundle in those processes.
+- A root process (`sweet-mtlquery`) goes the same way: `reads
+  MetalPluginName`, `reads MetalPluginClassName`, load, init, nil.
+- With nil, both keep the CPU renderer: same PIDs after 80 s, no crash loop.
+- None of them called `IOServiceOpen` on the accelerator before the plugin:
+  the open is the plugin's job (`_MTLDevice`'s IOGPU path does it in the
+  original plugins).
+Next: stage 2, the plugin opens our GPU user client and runs a Turnip
+compute job from inside SpringBoard, still returning nil.
