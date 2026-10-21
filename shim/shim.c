@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "ufs.h"
 #include "menu.h"
+#include "android.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -375,9 +376,16 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
-	/* The boot menu first; Android is offered once it is installed. */
+	/* The boot menu first; iOS after 5 s without a key. */
 	stage = "menu";
-	(void)menu_choose(0, 5);
+	if (menu_choose(5) == 1) {
+		stage = "android";
+		con_clear(BLUE);
+		con_str("SHIM", "Android");
+		con_str("ANDROID", android_boot(dtb));
+		con_str("SHIM", "falling back to iOS in 10 s");
+		delay_ms(10000);
+	}
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

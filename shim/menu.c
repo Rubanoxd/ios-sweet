@@ -8,6 +8,7 @@
 #include "console.h"
 #include "keys.h"
 #include "menu.h"
+#include "android.h"
 
 #define BG		0xff101018U
 #define BOX		0xff2a2a36U
@@ -50,10 +51,10 @@ static void draw_box(int y, const char *name, const char *note, int selected, in
 	con_text(BOX_X + 64, y + 170, note, 3, selected ? WHITE : GREY, bg);
 }
 
-static void draw_options(int sel, int android_ok)
+static void draw_options(int sel)
 {
 	draw_box(BOX_Y0, "iOS 16.7", "XNU sobre Snapdragon 720G", sel == 0, 1);
-	draw_box(BOX_Y1, "Android 17", android_ok ? "RisingOS" : "No instalado todavia", sel == 1, android_ok);
+	draw_box(BOX_Y1, "Android 17", "RisingOS", sel == 1, 1);
 }
 
 static void draw_status(const char *s)
@@ -71,14 +72,14 @@ static void draw_countdown(int left)
 		center(1700, line, 3, GREY, BG);
 }
 
-int menu_choose(int android_ok, unsigned timeout_s)
+int menu_choose(unsigned timeout_s)
 {
 	con_clear(BG);
 	center(300, "ios-sweet", 6, WHITE, BG);
 	center(450, "Redmi Note 9 Pro", 3, GREY, BG);
 	center(640, "Elige el sistema", 3, WHITE, BG);
 	int sel = 0;
-	draw_options(sel, android_ok);
+	draw_options(sel);
 	int have_keys = keys_init();
 	if (!have_keys) {
 		draw_status("Sin teclas: arranca iOS");
@@ -124,12 +125,13 @@ int menu_choose(int android_ok, unsigned timeout_s)
 			next = keys_have_volup() ? 1 : !sel;
 		if (next != sel) {
 			sel = next;
-			draw_options(sel, android_ok);
+			draw_options(sel);
 			draw_status("");
 		}
 		if (pressed & KEY_POWER) {
-			if (sel == 1 && !android_ok) {
-				draw_status("Android no esta instalado");
+			/* Android is looked for only when chosen: the iOS path never touches UFS. */
+			if (sel == 1 && !android_probe()) {
+				draw_status("No hay Android en recoverybak");
 				continue;
 			}
 			draw_status(sel ? "Arrancando Android..." : "Arrancando iOS...");

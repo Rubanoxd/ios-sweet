@@ -9,11 +9,12 @@ static uint32_t host_fb[FB_H * FB_STRIDE / 4];
 int keys_init(void) { return 1; }
 unsigned keys_read(void) { return 0; }
 int keys_have_volup(void) { return 1; }
+int android_probe(void) { return 0; }
 
 int main(void)
 {
 	con_fb = host_fb;
-	menu_choose(0, 5);
+	menu_choose(5);
 	FILE *f = fopen("out/menu.ppm", "wb");
 	fprintf(f, "P6 %d %d 255\n", FB_W, FB_H);
 	for (int i = 0; i < FB_W * FB_H; i++) {

@@ -264,3 +264,82 @@ void test_ufs(void)
 		return;
 	list_partitions(elba, nent);
 }
+
+/*
+ * Partition reads for the Android boot path (android.c), read-only like the
+ * probe above. One READ(10) moves at most 256 KiB (a single PRDT entry); data
+ * lands in a low bounce buffer and is copied to its destination, which may be
+ * above 4 GiB.
+ */
+#define CHUNK_BLOCKS	64u
+static uint8_t bounce[CHUNK_BLOCKS * BLOCK] __attribute__((aligned(4096)));
+static int ufs_taken;
+
+int ufs_open(void)
+{
+	if (ufs_taken)
+		return 0;
+	uint32_t hcs = ufs_rd(REG_HCS);
+	if (!(ufs_rd(REG_HCE) & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR))
+		return -1;
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1))
+		return -2;
+	static const uint8_t tur[6] = { 0x00 };
+	uint32_t ocs, st;
+	for (int i = 0; i < 3; i++)
+		if (!scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st))
+			break;
+	ufs_taken = 1;
+	return 0;
+}
+
+int ufs_find(const char *want, uint64_t *first, uint64_t *blocks)
+{
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	if (read_blocks(1, 1, data))
+		return -1;
+	const uint8_t *gpt = data;
+	if (gpt[0] != 'E' || gpt[1] != 'F' || gpt[2] != 'I' || gpt[3] != ' ')
+		return -2;
+	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
+	uint32_t elba = gpt[72] | gpt[73] << 8;
+	if (esz != 128 || nent > 128 || read_blocks(elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+		return -3;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		int c = 0;
+		for (; c < 36 && want[c]; c++)
+			if (e[56 + 2 * c] != (uint8_t)want[c] || e[57 + 2 * c])
+				break;
+		if (want[c] || c >= 36 || e[56 + 2 * c] || e[57 + 2 * c])
+			continue;
+		*first = le64(e + 32);
+		*blocks = le64(e + 40) - *first + 1;
+		return 0;
+	}
+	return -4;
+}
+
+int ufs_read(uint64_t lba, uint64_t bytes, uintptr_t dst)
+{
+	while (bytes) {
+		uint32_t n = bytes > CHUNK_BLOCKS * BLOCK ? CHUNK_BLOCKS : (uint32_t)((bytes + BLOCK - 1) / BLOCK);
+		if (read_blocks((uint32_t)lba, n, bounce))
+			return -1;
+		uint64_t take = bytes < (uint64_t)n * BLOCK ? bytes : (uint64_t)n * BLOCK;
+		volatile uint64_t *d = (volatile uint64_t *)dst;
+		const volatile uint64_t *s = (const volatile uint64_t *)bounce;
+		for (uint64_t i = 0; i < (take + 7) / 8; i++)
+			d[i] = s[i];
+		lba += n;
+		dst += take;
+		bytes -= take;
+	}
+	return 0;
+}
