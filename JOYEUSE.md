@@ -823,3 +823,29 @@ Android 17 ROM, and an on-screen menu.
   linux,initrd-start/end in a copy of ABL's FDT (ABL already merged the
   ROM's dtbo; the shim boot.img carries the ROM's dtb), MMU and caches
   off, x0 = FDT.
+
+### Dual boot: GPT done (2026-10-21)
+
+The phone's real LUN0 GPT is not the MIUI ROM's: the UFS is 128 GB (30119936
+blocks of 4 KiB, 64-entry table) and an earlier Windows-on-ARM install left
+two more partitions, 19 `esp` (337 MiB, EF00) and 20 `win` (52 GiB, NTFS).
+With the user's decision, Android takes Windows' place and iOS keeps all of
+its partition; only names and one type changed, no sizes or data:
+- 18 `userdata` -> **`iosroot`** (2673192..16400127, 52.4 GiB, same type
+  and unique GUID). iOS boots with `ufsroot=iosroot`: verified, root mounts
+  as before (`shim-boot-joyeuse-iosroot.img`, kernel 0097). **Every shim from
+  now on needs `ufsroot=iosroot`**: without it the kernel looks for
+  `userdata`, which is now Android's.
+- 20 `win` -> **`userdata`** (16486400..30119930, 52.0 GiB, type Android
+  user data). Still holds the old NTFS until Android formats it.
+- 19 `esp` untouched.
+Done from OrangeFox R12.0_2 FBEv2 (now flashed in `recovery`; the MIUI
+recovery.img is in the ROM) with its `sgdisk --change-name/--typecode`;
+both GPT copies checked. Backups in `IA/ios-joyeuse/backups/` (not in git):
+the GPT (sgdisk backup + raw primary and backup blocks) and the first
+16 GiB of the iOS partition (the whole HFSX volume), sha256 `9c24e274…4659`
+equal on the phone and the Mac. Lesson: never `dd` the raw root device from
+the running iOS (it hung the phone); copy from a recovery.
+Next: install RisingOS 9 by hand (super, dtbo, vbmeta, vbmeta_system; its
+boot.img into `recoverybak` for the shim), format the new `userdata`, then
+the shim with the menu in `boot` (`shim-boot-joyeuse-dual.img`, ROM dtb).
