@@ -1,0 +1,42 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -63,6 +63,7 @@
+  * log) followed by a 300 ms pause, so the last line before a hard hang of
+  * the phone still gets out. */
+ static int sAdrenoDebug = -1;
++static int sZeroOff;           /* sweetgpunozero=1: BoAlloc leaves memory as it was (xnu 0101) */
+ 
+ static void
+ adrenoStep(const char *fmt, ...) __printflike(1, 2);
+@@ -218,6 +219,7 @@
+ 	if (sPoolLock == NULL) {
+ 		return false;
+ 	}
++	PE_parse_boot_argn("sweetgpunozero", &sZeroOff, sizeof(sZeroOff));
+ 	setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
+ 	setProperty("NativeAdrenoAbiVersion", (unsigned long long)NativeAdrenoAbiVersion, 32);
+ 	registerService();
+@@ -575,8 +577,22 @@
+ 			ret = kIOReturnNoMemory;
+ 			break;
+ 		}
+-		bzero((void *)zmap->getVirtualAddress(), (size_t)size);
++		adrenoStep("BoAlloc: mapped at 0x%llx", (uint64_t)zmap->getVirtualAddress());
++		/*
++		 * xnu 0101: plain 64-bit stores, not bzero. bzero's DC ZVA on this
++		 * write-combined (Normal non-cacheable) pool memory left CPU0 stuck with
++		 * interrupts masked inside BoAlloc (backboardd's Metal compositor and a
++		 * pure allocation loop both hung there). sweetgpunozero=1 skips it.
++		 */
++		if (!sZeroOff) {
++			volatile uint64_t *z = (volatile uint64_t *)zmap->getVirtualAddress();
++			for (uint64_t i = 0, n = size / 8; i < n; i += 8) {
++				z[i] = 0; z[i + 1] = 0; z[i + 2] = 0; z[i + 3] = 0;
++				z[i + 4] = 0; z[i + 5] = 0; z[i + 6] = 0; z[i + 7] = 0;
++			}
++		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		adrenoStep("BoAlloc: stored");
+ 		zmap->release();
+ 		adrenoStep("BoAlloc: zeroed");
+ 		e->pool_pa = pa;
