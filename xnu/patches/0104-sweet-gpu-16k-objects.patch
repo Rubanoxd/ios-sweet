@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -237,7 +237,13 @@
+ 	return true;
+ }
+ 
+-enum { kSweetAdrenoMaxObjects = 1024 };
++/*
++ * xnu 0104: 16384 objects a client (was 1024, about 2 MB of entries). QuartzCore's
++ * render server on Metal imports an IOSurface per layer it composites, besides
++ * Turnip's own buffers: it filled 1024 within a minute, BoAlloc/BoImport answered
++ * kIOReturnNoResources and Turnip crashed on the failed allocation.
++ */
++enum { kSweetAdrenoMaxObjects = 16384 };
+ 
+ class SweetAdrenoUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(SweetAdrenoUserClient);
