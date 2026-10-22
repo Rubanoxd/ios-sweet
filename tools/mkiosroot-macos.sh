@@ -6,8 +6,10 @@
 #
 #   sudo tools/mkiosroot-macos.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE] [--touch-fw DIR]
 #
-# SIZE defaults to 16g. OUT.img is a raw HFS+ volume image for
-# `fastboot flash userdata` (fastboot sparses it on the fly). macOS reads the
+# SIZE (mkfile syntax, e.g. 16g or 56225529856) defaults to 16g. OUT.img is a
+# raw HFS+ volume image for `fastboot flash iosroot` (fastboot sparses it on
+# the fly), written in place as a sparse file: on APFS only the used blocks
+# take space, so a 52 GiB volume needs ~15 GB on the Mac. macOS reads the
 # IPSW's LZBITMAP-compressed files decompressed; the copy is written
 # uncompressed (no decmpfs xattrs), like the Linux script's.
 # Needs Homebrew rsync 3 (hard links): /opt/homebrew/bin/rsync.
@@ -35,7 +37,6 @@ work=$(mktemp -d /tmp/mkiosroot.XXXXXX)
 devs=()
 cleanup() {
 	for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
-	rm -f "$work/root.dmg"
 	rmdir "$work"/* "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -57,9 +58,14 @@ attach "$os" "$work/os" -readonly
 attach "$sysos" "$work/sysos" -readonly -imagekey diskimage-class=CRawDiskImage
 attach "$appos" "$work/appos" -readonly -imagekey diskimage-class=CRawDiskImage
 
-hdiutil create -size "$size" -fs "Case-sensitive Journaled HFS+" -volname iOSRoot \
-	-layout NONE -type UDIF -o "$work/root.dmg" >/dev/null
-attach "$work/root.dmg" "$work/root"
+# Sparse raw volume, formatted through a raw attach, then mounted with owners.
+mkfile -n "$size" "$out"
+rawdev=$(hdiutil attach -nomount -noverify -imagekey diskimage-class=CRawDiskImage "$out" |
+	awk '/\/dev\/disk/ {print $1; exit}')
+[[ -n $rawdev ]] || { echo "attach failed: $out" >&2; exit 1; }
+newfs_hfs -s -J -v iOSRoot "$rawdev"
+hdiutil detach "$rawdev" >/dev/null
+attach "$out" "$work/root" -imagekey diskimage-class=CRawDiskImage
 root=$work/root
 
 copy() {
@@ -122,8 +128,5 @@ fsck_hfs -f -n "$dev"
 hdiutil detach "$dev" >/dev/null
 devs=(${devs[@]+"${devs[@]:1}"})
 
-# UDIF read-write -> raw volume bytes for fastboot.
-hdiutil convert "$work/root.dmg" -format UDTO -o "$work/root" >/dev/null
-mv "$work/root.cdr" "$out"
 [[ -n ${SUDO_UID:-} ]] && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$out"
 ls -l "$out"

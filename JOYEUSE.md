@@ -849,3 +849,32 @@ the running iOS (it hung the phone); copy from a recovery.
 Next: install RisingOS 9 by hand (super, dtbo, vbmeta, vbmeta_system; its
 boot.img into `recoverybak` for the shim), format the new `userdata`, then
 the shim with the menu in `boot` (`shim-boot-joyeuse-dual.img`, ROM dtb).
+
+## Full iOS reinstall: 52 GiB root with every app (2026-10-22)
+
+The IPSW's removable apps (Notes, Calendar, Weather, Clock, Music, Files,
+Maps, ... 32 in all) are in the OS image under `/private/var/staged_system_apps`.
+iOS installs them during the first data migration (SystemAppMigrator ->
+installcoordinationd -> installd), which we skip (`sweet-root-tweaks.py`), and
+installd stages them with `clonefile()`, which HFS+ does not have (ENOTSUP,
+MIInstallerErrorDomain 107). Running SystemAppMigrator by hand consumed the
+staged copies and installed nothing.
+
+What works: ship them in `/Applications` like the other system apps and let
+`uicache` register them. dyld refuses `@rpath`/`@executable_path` expansion for
+them, so Music, Books and Podcasts get absolute framework paths and an ad-hoc
+re-sign with their entitlements (`tools/sweet-fix-app-rpaths.py`).
+
+- `tools/mkiosroot-macos.sh` now writes OUT.img directly as a sparse raw file
+  (mkfile -n, newfs_hfs on a raw attach): the 52.4 GiB volume takes ~12 GB on
+  the Mac and needs no UDIF -> UDTO conversion.
+- `IA/ios-joyeuse/build-ios16-52g.sh` (not in git): mkiosroot at the exact
+  `iosroot` size (56225529856 bytes), staged apps -> `/Applications`
+  (`IA/ios-joyeuse/sysapps-fixed/` for the three fixed ones), then the phone's
+  own additions from `backups/phone-overlay-20261022.tar` (`/var/jb`, the
+  SweetMetalProbe bundle, sshd/netconfig/firstboot jobs, launchd.plist,
+  `/usr/share/firmware/joyeuse`, ssh keys) with `firstboot.done` removed so
+  the first boot runs `uicache -a`.
+- Flashed `fastboot flash -S 512M iosroot ios16-root-52g.img` (24 chunks,
+  533 s, sha256 9b2751c0...1ba1). ABL hung on the following `fastboot boot`
+  as after every big flash.
