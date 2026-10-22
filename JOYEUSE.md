@@ -878,3 +878,14 @@ re-sign with their entitlements (`tools/sweet-fix-app-rpaths.py`).
 - Flashed `fastboot flash -S 512M iosroot ios16-root-52g.img` (24 chunks,
   533 s, sha256 9b2751c0...1ba1). ABL hung on the following `fastboot boot`
   as after every big flash.
+- The user re-entered fastboot by hand; `fastboot boot shim-boot-joyeuse-0107.img`.
+  First boot: SSH after 40 s; lsd/installd started registering only at
+  ~16 min uptime (installd "triggerRegistrationForContainerizedContent"),
+  firstboot's `uicache -a` finished at 17 min: 174 apps registered,
+  SpringBoard shows the lock screen (no Setup Assistant), `/` is 52 GiB
+  with 40 GiB free. TrollStoreLite reinstalled GuardarFoto and Bloons TD 6.
+  The clock starts at 1969 (set by hand with `date -u -s`); timezone
+  `/var/db/timezone/localtime` -> Europe/Madrid. Music needs the
+  MediaLibrary data migrator run once as mobile
+  (`sudo -u mobile sweet-migrator .../MediaLibrary.migrator`), otherwise it
+  crashes in `-[MPMediaLibrary _MediaLibrary_coreLibrary]` (strlen(NULL)).
