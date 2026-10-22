@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -257,6 +257,7 @@
+ 		uint32_t token;              /* CPU-map lease, 0 if none */
+ 		uint32_t metadata_bytes;
+ 		bool imported;
++		bool readonly;               /* an import wired for reading only (xnu 0107): never GPU-writable */
+ 		bool busy_known;             /* last_fence is valid */
+ 		char metadata[NativeAdrenoAbiMetadataBytes];
+ 	};
+@@ -646,16 +647,32 @@
+ 		}
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(im.address, im.bytes,
+ 		    kIODirectionInOut, fTask);
+-		if (md == NULL || md->prepare() != kIOReturnSuccess) {
+-			if (md) {
++		bool readonly = false;
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			/*
++			 * xnu 0107: pages the task may only read (QuartzCore's no-copy
++			 * buffers over memory shared read-only with it) refuse an
++			 * in-out wiring; the GPU only reads them, so wire them for
++			 * reading and map them read-only. Before, the import failed
++			 * and the frontend mirrored the buffer with a CPU copy per
++			 * commit, which raced QuartzCore's reuse of the ring.
++			 */
++			md->release();
++			md = IOMemoryDescriptor::withAddressRange(im.address, im.bytes, kIODirectionOut, fTask);
++			readonly = true;
++			if (md != NULL && md->prepare() != kIOReturnSuccess) {
+ 				md->release();
++				md = NULL;
+ 			}
++		}
++		if (md == NULL) {
+ 			ret = kIOReturnVMError;
+ 			break;
+ 		}
+ 		e->md = md;
+ 		e->bytes = im.bytes;
+ 		e->imported = true;
++		e->readonly = readonly;
+ 		NativeAdrenoAbiBoAllocReply r = { handle };
+ 		memcpy(out, &r, sizeof(r));
+ 		break;
+@@ -681,7 +698,7 @@
+ 			ret = kIOReturnBadArgument;          /* outside this connection's window */
+ 			break;
+ 		}
+-		ret = mapSegments(e, m.iova, (m.permissions & 2) != 0);
++		ret = mapSegments(e, m.iova, (m.permissions & 2) != 0 && !e->readonly);
+ 		adrenoStep("BoMap: 0x%x", ret);
+ 		if (ret == kIOReturnSuccess) {
+ 			e->iova = m.iova;
