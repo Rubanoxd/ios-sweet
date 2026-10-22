@@ -1,0 +1,153 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,3 +116,4 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_wlan.c			standard
++bsd/dev/sweet_tdump_bsd.c		standard
+ bsd/dev/sweet_irq.c			standard
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,3 +42,4 @@
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_tdump.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+--- /dev/null
++++ b/bsd/dev/sweet_tdump_bsd.c
+@@ -0,0 +1,35 @@
++/*
++ * sweet_tdump_bsd.c (xnu 0098): sysctl kern.sweet_tdump=<pid> prints a
++ * thread dump of that process to the kernel log (osfmk/arm64/sweet_tdump.c).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern void sweet_tdump_task(task_t task);
++
++static int
++sysctl_sweet_tdump SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int pid = 0;
++	int error = sysctl_handle_int(oidp, &pid, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	proc_t p = proc_find(pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	sweet_tdump_task(proc_task(p));
++	proc_rele(p);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_tdump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_tdump, "I", "pid: print that process's threads and kernel stacks");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/osfmk/arm64/sweet_tdump.c
+@@ -0,0 +1,98 @@
++/*
++ * sweet_tdump.c (xnu 0098): a thread dump of one task, for a process that
++ * hangs inside the kernel where no stackshot reaches (stackshot times out
++ * on this port). sysctl kern.sweet_tdump=<pid> (bsd/dev/sweet_tdump_bsd.c)
++ * prints, for every thread of the task:
++ *   - its id (the same as pthread_threadid_np), name, state bits (TH_*),
++ *     priority, wait event and last processor;
++ *   - the user registers it entered the kernel with (pc, lr, x16: the trap);
++ *   - the kernel frames saved at its last context switch (kstackptr), walked
++ *     inside its own kernel stack, and the kernel registers of the last
++ *     interrupt taken in the kernel (kpcb) for a thread that never blocks.
++ * Kernel addresses are printed unslid (VM_KERNEL_UNSLIDE) for symbolication
++ * against the kernel file.
++ */
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/processor.h>
++#include <kern/misc_protos.h>
++#include <mach/vm_param.h>
++#include <kern/clock.h>
++
++#if defined(SWEET)
++
++#define TDUMP_FRAMES 24
++
++static void
++sweet_tdump_frames(thread_t th, uint64_t fp, uint64_t lr, const char *what)
++{
++	vm_offset_t lo = th->kernel_stack, hi = th->kernel_stack + kernel_stack_size;
++	char line[24 * TDUMP_FRAMES + 64];
++	int n = snprintf(line, sizeof(line), "SWEET TDUMP:   %s lr %llx", what,
++	    (unsigned long long)VM_KERNEL_UNSLIDE(lr));
++	for (int i = 0; i < TDUMP_FRAMES && fp >= lo && fp + 16 <= hi && !(fp & 0xf) && n < (int)sizeof(line) - 24; i++) {
++		uint64_t next = ((uint64_t *)fp)[0];
++		uint64_t ret = ((uint64_t *)fp)[1];
++		if (ret == 0) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " %llx", (unsigned long long)VM_KERNEL_UNSLIDE(ret));
++		if (next <= fp) {
++			break;
++		}
++		fp = next;
++	}
++	printf("%s\n", line);
++}
++
++void sweet_tdump_task(task_t task);
++
++void
++sweet_tdump_task(task_t task)
++{
++	if (task == TASK_NULL) {
++		return;
++	}
++	/* Never wait for a task lock a hung thread may hold. */
++	int tries = 0;
++	while (!task_lock_try(task)) {
++		if (++tries > 100) {
++			printf("SWEET TDUMP: task lock busy\n");
++			return;
++		}
++		delay(1000);
++	}
++	printf("SWEET TDUMP: task %p, %d threads\n", (void *)VM_KERNEL_ADDRPERM(task), task->thread_count);
++	thread_t th;
++	queue_iterate(&task->threads, th, thread_t, task_threads) {
++		char name[64] = "";   /* MAXTHREADNAMESIZE */
++		thread_get_thread_name(th, name);
++		processor_t last = th->last_processor;
++		printf("SWEET TDUMP: thread %llu '%s' state 0x%x pri %d wait_event %llx cpu %d%s\n",
++		    thread_tid(th), name, th->state, th->sched_pri,
++		    (unsigned long long)VM_KERNEL_UNSLIDE_OR_PERM(th->wait_event),
++		    last ? last->cpu_id : -1, th == current_thread() ? " (this thread)" : "");
++		if (th->machine.upcb != NULL) {
++			arm_saved_state_t *u = th->machine.upcb;
++			printf("SWEET TDUMP:   user pc %llx lr %llx x16 %lld\n",
++			    (unsigned long long)get_saved_state_pc(u), (unsigned long long)get_saved_state_lr(u),
++			    (long long)saved_state64(u)->x[16]);
++		}
++		if (th->kernel_stack != 0 && th->machine.kstackptr != 0) {
++			arm_kernel_saved_state_t *k = (arm_kernel_saved_state_t *)th->machine.kstackptr;
++			sweet_tdump_frames(th, k->fp, k->lr, "switch");
++		} else {
++			printf("SWEET TDUMP:   no kernel stack (continuation)\n");
++		}
++		if (th->machine.kpcb != NULL) {
++			arm_saved_state_t *k = th->machine.kpcb;
++			printf("SWEET TDUMP:   last kernel interrupt at pc %llx\n",
++			    (unsigned long long)VM_KERNEL_UNSLIDE(get_saved_state_pc(k)));
++			sweet_tdump_frames(th, get_saved_state_fp(k), get_saved_state_lr(k), "irq");
++		}
++	}
++	task_unlock(task);
++	printf("SWEET TDUMP: done\n");
++}
++
++#endif /* SWEET */
