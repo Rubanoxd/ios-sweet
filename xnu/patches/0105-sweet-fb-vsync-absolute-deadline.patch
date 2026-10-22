@@ -1,0 +1,53 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -223,6 +223,18 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * xnu 0105: the next vsync is armed first, at an absolute deadline one
++	 * period after this one's. It used to be armed after the work below, so
++	 * a zero-copy flip's 11 MB cache clean stretched every period: with the
++	 * render server on the GPU, QuartzCore paced itself at 24 Hz.
++	 */
++	static uint64_t next, period;
++	if (period == 0) {
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
++	}
++	next = (next == 0 || next + period <= now) ? now + period : next + period;
++	sender->wakeAtTime(next);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -254,7 +266,6 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+ 	/* A zero-copy flip costs a cache clean, not a 10 MB copy: every vsync. */
+@@ -269,10 +280,22 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t began = mach_absolute_time();
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		static uint64_t presents, total, longest;
++		uint64_t took = mach_absolute_time() - began;
++		total += took;
++		longest = took > longest ? took : longest;
++		if (++presents % 600 == 0) {
++			uint64_t mean_ns, longest_ns;
++			absolutetime_to_nanoseconds(total / 600, &mean_ns);
++			absolutetime_to_nanoseconds(longest, &longest_ns);
++			printf("SWEET FB: %llu presents, last 600 took %llu us mean, %llu us longest\n",
++			    presents, mean_ns / 1000, longest_ns / 1000);
++			total = longest = 0;
++		}
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
