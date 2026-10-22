@@ -1,0 +1,86 @@
+--- a/bsd/dev/sweet_tdump_bsd.c
++++ b/bsd/dev/sweet_tdump_bsd.c
+@@ -10,6 +10,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ extern void sweet_tdump_task(task_t task);
++extern void sweet_cpupc(int rounds);
+ 
+ static int
+ sysctl_sweet_tdump SYSCTL_HANDLER_ARGS
+@@ -32,4 +33,20 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_tdump, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sysctl_sweet_tdump, "I", "pid: print that process's threads and kernel stacks");
+ 
++static int
++sysctl_sweet_cpupc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int rounds = 0;
++	int error = sysctl_handle_int(oidp, &rounds, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	sweet_cpupc(rounds);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpupc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_cpupc, "I", "N: print each CPU's external-debug pc sample N times (xnu 0100)");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/osfmk/arm64/sweet_tdump.c
++++ b/osfmk/arm64/sweet_tdump.c
+@@ -121,4 +121,52 @@
+ 	printf("SWEET TDUMP: done\n");
+ }
+ 
++/*
++ * xnu 0100: each CPU's sampled pc through its external debug registers
++ * (CoreSight memory-mapped debug at 0x7010000 + n * 0x100000 on atoll, the
++ * block before each ETM, jtagmm@7040000...): EDPRSR says whether the core is
++ * powered, EDPCSR (lo 0x0a0, hi 0x0ac) is the pc of a recent instruction even
++ * for a core that takes no interrupts. sysctl kern.sweet_cpupc=N reads it N
++ * times per CPU. The block may be secure-only on a production device, where
++ * the access itself could stall: only for an already hung phone.
++ */
++#define DBG_BASE        0x7010000ull
++#define DBG_STRIDE      0x100000ull
++#define DBG_EDPCSR_LO   0x0a0
++#define DBG_EDPCSR_HI   0x0ac
++#define DBG_EDPRSR      0x314
++#define DBG_EDLAR       0xfb0
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void sweet_cpupc(int rounds);
++
++void
++sweet_cpupc(int rounds)
++{
++	static vm_offset_t dbg[8];
++	for (int cpu = 0; cpu < 8; cpu++) {
++		if (dbg[cpu] == 0) {
++			dbg[cpu] = ml_io_map(DBG_BASE + DBG_STRIDE * (uint64_t)cpu, 0x1000);
++		}
++	}
++	for (int r = 0; r < rounds && r < 16; r++) {
++		for (int cpu = 0; cpu < 8; cpu++) {
++			volatile uint32_t *d = (volatile uint32_t *)dbg[cpu];
++			if (d == NULL) {
++				continue;
++			}
++			d[DBG_EDLAR / 4] = 0xc5acce55u;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			uint32_t prsr = d[DBG_EDPRSR / 4];
++			uint32_t lo = d[DBG_EDPCSR_LO / 4];
++			uint32_t hi = d[DBG_EDPCSR_HI / 4];
++			uint64_t pc = ((uint64_t)hi << 32) | lo;
++			printf("SWEET CPUPC: round %d cpu %d edprsr 0x%08x pc %llx (unslid %llx)\n", r, cpu, prsr,
++			    (unsigned long long)pc, (unsigned long long)VM_KERNEL_UNSLIDE(pc));
++			delay(1000);
++		}
++		delay(10000);
++	}
++}
++
+ #endif /* SWEET */
