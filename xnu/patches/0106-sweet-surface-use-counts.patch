@@ -1,0 +1,81 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
++#include <libkern/OSAtomic.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -460,6 +461,8 @@
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -837,8 +840,50 @@
+ {
+ 	return kIOReturnSuccess;
+ }
++
++/*
++ * xnu 0106: real use counts. IOSurfaceIsInUse/IOSurfaceGetUseCount read a
++ * u64 at +0x18 of the surface's shared state page (IOSurfaceClientIsInUse:
++ * client+0x70 -> state, then +0x18), shared by every process that has the
++ * surface. Increment/decrement land there, so a producer sees a surface
++ * still in use by the compositor (QuartzCore's render server on Metal marks
++ * the surfaces its GPU work reads) and does not redraw it under the GPU.
++ */
++#define SWEET_SURFACE_STATE_USE_COUNT   0x18    /* u64 in the state page */
+ 
+ static IOReturn
++sweet_surface_use(uint32_t id, int64_t delta)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	volatile SInt64 *count = (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE_COUNT);
++	if (delta > 0) {
++		OSIncrementAtomic64(count);
++	} else {
++		SInt64 old = *count;
++		while (old > 0 && !OSCompareAndSwap64((UInt64)old, (UInt64)(old - 1), (volatile UInt64 *)count)) {
++			old = *count;
++		}
++	}
++	s->release();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, __unused void *category, void *, void *, void *, void *)
++{
++	return sweet_surface_use((uint32_t)(uintptr_t)id, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, __unused void *category, void *, void *, void *, void *)
++{
++	return sweet_surface_use((uint32_t)(uintptr_t)id, -1);
++}
++
++static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+ 	uint32_t seed = bump ? OSIncrementAtomic((volatile SInt32 *)sweet_surface_seed(s)) + 1 :
+@@ -908,8 +953,8 @@
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
