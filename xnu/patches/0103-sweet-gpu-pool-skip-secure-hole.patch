@@ -1,0 +1,34 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -100,14 +100,17 @@
+  * First fit over 16 KiB pages; every buffer is physically contiguous.
+  */
+ #define POOL_BASE         0xb0000000ull
++#define POOL_END          0xfd000000ull
+ /*
+- * xnu 0102: the pool stops at 0xbcc00000. A CPU store at 0xbcc00000 (and in
+- * the 4 MiB above it at least) stalls the core for good, interrupts masked,
+- * even from user space through a write-combined mapping: memory the secure
+- * world or the hypervisor keeps that no device tree node declares. Measured
+- * with a page-by-page store probe; the end of that region is not known yet.
++ * xnu 0103: [0xbcc00000, 0xc0000000) is never handed out. A CPU store to any
++ * page there stalls the core for good, interrupts masked, even from user space
++ * through a write-combined mapping (backboardd's Metal compositor hung in
++ * BoAlloc on it): 52 MiB the secure world or the hypervisor keeps that no
++ * device tree node declares. Both ends measured with page-by-page store probes
++ * (0xbcbfc000 and 0xc0000000 take stores, 0xbcc00000 and 0xbfffc000 do not).
+  */
+-#define POOL_END          0xbcc00000ull
++#define POOL_HOLE_BASE    0xbcc00000ull
++#define POOL_HOLE_END     0xc0000000ull
+ #define POOL_PAGE         0x4000ull
+ #define POOL_PAGES        ((POOL_END - POOL_BASE) / POOL_PAGE)
+ 
+@@ -226,6 +229,7 @@
+ 	if (sPoolLock == NULL) {
+ 		return false;
+ 	}
++	poolSet((POOL_HOLE_BASE - POOL_BASE) / POOL_PAGE, (POOL_HOLE_END - POOL_HOLE_BASE) / POOL_PAGE, true);
+ 	PE_parse_boot_argn("sweetgpunozero", &sZeroOff, sizeof(sZeroOff));
+ 	setProperty(kIOUserClientClassKey, "SweetAdrenoUserClient");
+ 	setProperty("NativeAdrenoAbiVersion", (unsigned long long)NativeAdrenoAbiVersion, 32);
