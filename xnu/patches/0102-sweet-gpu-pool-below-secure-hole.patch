@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -100,7 +100,14 @@
+  * First fit over 16 KiB pages; every buffer is physically contiguous.
+  */
+ #define POOL_BASE         0xb0000000ull
+-#define POOL_END          0xfd000000ull
++/*
++ * xnu 0102: the pool stops at 0xbcc00000. A CPU store at 0xbcc00000 (and in
++ * the 4 MiB above it at least) stalls the core for good, interrupts masked,
++ * even from user space through a write-combined mapping: memory the secure
++ * world or the hypervisor keeps that no device tree node declares. Measured
++ * with a page-by-page store probe; the end of that region is not known yet.
++ */
++#define POOL_END          0xbcc00000ull
+ #define POOL_PAGE         0x4000ull
+ #define POOL_PAGES        ((POOL_END - POOL_BASE) / POOL_PAGE)
+ 
