@@ -1,0 +1,166 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -72,6 +72,7 @@
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
++#define SWEET_FB_QUEUE                  4       /* swaps waiting for the GPU (xnu 0115) */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -117,8 +118,13 @@
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap */
+ 	bool          fDirty;
++	/* xnu 0115: swaps not shown yet, oldest first, with their sequence numbers. */
++	uint8_t       fQueue[SWEET_FB_QUEUE][SWEET_FB_SWAP_REC_SIZE];
++	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
++	uint32_t      fQueued;
++	uint64_t      fSwapSeq;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -218,6 +224,7 @@
+ }
+ 
+ static uint64_t sweet_fb_wait_since, sweet_fb_gpu_waits, sweet_fb_gpu_timeouts;
++static uint64_t sweet_fb_shown_older, sweet_fb_skipped;
+ 
+ /* xnu 0112: a layer of the frame is still being drawn or read by the GPU. */
+ static bool
+@@ -288,25 +295,47 @@
+ 	}
+ 	/* A zero-copy flip costs a cache clean, not a 10 MB copy: every vsync. */
+ 	bool flush = fb->fDirty && (fb->fZeroCopy || (count % fb->fFlushTicks) == 0);
+-	uint8_t *rec = NULL;
++	/*
++	 * xnu 0112: a frame is shown once the GPU has written it. The Metal
++	 * frontend holds a use count on every surface a command buffer writes
++	 * until it completes; while a layer of the frame is still in use the
++	 * flip waits for a later vsync (at most 100 ms). The frontend then
++	 * delivers QuartzCore's "scheduled" at submission, and the render server
++	 * prepares the next frame while the GPU draws this one.
++	 * xnu 0115: with only the latest swap kept, a render server ahead of
++	 * the GPU replaced the frame being waited for by a newer one, also still
++	 * being drawn, until the 100 ms timeout showed one unfinished. The swaps
++	 * are queued now, and each vsync shows the newest finished one and drops
++	 * the older ones.
++	 */
++	uint8_t *recs = NULL;
++	uint64_t seqs[SWEET_FB_QUEUE];
++	uint32_t n = 0;
+ 	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		n = fb->fQueued ? fb->fQueued : 1;
++		recs = (uint8_t *)IOMallocData(n * SWEET_FB_SWAP_REC_SIZE);
++		if (recs != NULL) {
++			if (fb->fQueued) {
++				memcpy(recs, fb->fQueue, n * SWEET_FB_SWAP_REC_SIZE);
++				memcpy(seqs, fb->fQueueSeq, n * sizeof(seqs[0]));
++			} else {
++				memcpy(recs, fb->fPending, SWEET_FB_SWAP_REC_SIZE);     /* redraw the latest frame */
++				seqs[0] = 0;
++			}
+ 			fb->fDirty = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	/*
+-	 * xnu 0112: a frame is shown once the GPU has written it. The Metal
+-	 * frontend holds a use count on every surface a command buffer reads or
+-	 * writes until it completes; while a layer of the swapped frame is still
+-	 * in use the flip waits for a later vsync (at most 100 ms). The frontend
+-	 * then no longer has to hold QuartzCore's "scheduled" until completion,
+-	 * and the render server prepares the next frame while the GPU draws this
+-	 * one.
+-	 */
+-	if (rec != NULL && sweet_fb_gpu_busy(rec)) {
++	if (recs == NULL) {
++		return;
++	}
++	int pick = -1;
++	for (int i = (int)n - 1; i >= 0 && pick < 0; i--) {
++		if (!sweet_fb_gpu_busy(recs + (uint32_t)i * SWEET_FB_SWAP_REC_SIZE)) {
++			pick = i;
++		}
++	}
++	if (pick < 0) {
+ 		static uint64_t timeout;
+ 		if (timeout == 0) {
+ 			nanoseconds_to_absolutetime(100000000ULL, &timeout);
+@@ -316,21 +345,37 @@
+ 		}
+ 		if (now - sweet_fb_wait_since < timeout) {
+ 			IOLockLock(fb->fLock);
+-			if (!fb->fDirty) {
+-				fb->fDirty = true;      /* fPending is still this frame */
+-			}
++			fb->fDirty = true;
+ 			IOLockUnlock(fb->fLock);
+-			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++			IOFreeData(recs, n * SWEET_FB_SWAP_REC_SIZE);
+ 			sweet_fb_gpu_waits++;
+ 			return;
+ 		}
+ 		sweet_fb_gpu_timeouts++;
++		pick = (int)n - 1;
+ 	}
+ 	sweet_fb_wait_since = 0;
+-	if (rec != NULL) {
++	if ((uint32_t)pick < n - 1) {
++		sweet_fb_shown_older++;
++	}
++	sweet_fb_skipped += (uint32_t)pick;
++	IOLockLock(fb->fLock);
++	if (seqs[pick] != 0) {
++		uint32_t done = 0;
++		while (done < fb->fQueued && fb->fQueueSeq[done] <= seqs[pick]) {
++			done++;
++		}
++		fb->fQueued -= done;
++		memmove(fb->fQueue[0], fb->fQueue[done], fb->fQueued * SWEET_FB_SWAP_REC_SIZE);
++		memmove(&fb->fQueueSeq[0], &fb->fQueueSeq[done], fb->fQueued * sizeof(fb->fQueueSeq[0]));
++	}
++	fb->fDirty = fb->fDirty || fb->fQueued != 0;
++	IOLockUnlock(fb->fLock);
++	{
++		const uint8_t *rec = recs + (uint32_t)pick * SWEET_FB_SWAP_REC_SIZE;
+ 		uint64_t began = mach_absolute_time();
+ 		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		IOFreeData(recs, n * SWEET_FB_SWAP_REC_SIZE);
+ 		static uint64_t presents, total, longest;
+ 		uint64_t took = mach_absolute_time() - began;
+ 		total += took;
+@@ -340,8 +385,9 @@
+ 			absolutetime_to_nanoseconds(total / 600, &mean_ns);
+ 			absolutetime_to_nanoseconds(longest, &longest_ns);
+ 			printf("SWEET FB: %llu presents, last 600 took %llu us mean, %llu us longest, "
+-			    "%llu vsyncs waited for the GPU, %llu timeouts\n",
+-			    presents, mean_ns / 1000, longest_ns / 1000, sweet_fb_gpu_waits, sweet_fb_gpu_timeouts);
++			    "%llu vsyncs waited for the GPU, %llu timeouts, %llu older finished frames shown, %llu skipped\n",
++			    presents, mean_ns / 1000, longest_ns / 1000, sweet_fb_gpu_waits, sweet_fb_gpu_timeouts,
++			    sweet_fb_shown_older, sweet_fb_skipped);
+ 			total = longest = 0;
+ 		}
+ 	}
+@@ -389,6 +435,14 @@
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	if (fQueued == SWEET_FB_QUEUE) {        /* full: the oldest goes */
++		fQueued--;
++		memmove(fQueue[0], fQueue[1], fQueued * SWEET_FB_SWAP_REC_SIZE);
++		memmove(&fQueueSeq[0], &fQueueSeq[1], fQueued * sizeof(fQueueSeq[0]));
++		sweet_fb_skipped++;
++	}
++	memcpy(fQueue[fQueued], rec, SWEET_FB_SWAP_REC_SIZE);
++	fQueueSeq[fQueued++] = ++fSwapSeq;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
