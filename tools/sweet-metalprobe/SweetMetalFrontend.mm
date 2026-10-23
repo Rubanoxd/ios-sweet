@@ -1354,10 +1354,15 @@ static void completed(void *context) {
     sweet_metal_log("work: pipelines made %llu (%llu ms total, longest %llu ms, failed %llu), shader cache hits %llu misses %llu writes %llu",
         (unsigned long long)w[0],(unsigned long long)(w[1]/1000),(unsigned long long)(w[2]/1000),(unsigned long long)w[4],
         (unsigned long long)w[7],(unsigned long long)w[8],(unsigned long long)w[9]);}
-  sweet_metal_log("perf: %.1f frames/s, commit-to-complete %llu us mean, shadow copy %llu us mean (%llu copies)",
+  static uint64_t windowPasses,windowDraws,windowPixels,windowFull;
+  const uint64_t passes=gPasses.load(),draws=gDraws.load(),pixels=gPassPixels.load(),full=gFullScreenPasses.load();
+  sweet_metal_log("perf: %.1f frames/s, commit-to-complete %llu us mean, shadow copy %llu us mean (%llu copies); per buffer %.1f passes (%.1f full-screen), %.0f draws, %.1f Mpx",
       windowFrames*1e6/(double)(now-windowBegan),(unsigned long long)((commitTotal-windowCommit)/windowFrames),
-      (unsigned long long)(copies>windowCopies?(copyTotal-windowCopy)/(copies-windowCopies):0),(unsigned long long)(copies-windowCopies));
+      (unsigned long long)(copies>windowCopies?(copyTotal-windowCopy)/(copies-windowCopies):0),(unsigned long long)(copies-windowCopies),
+      (passes-windowPasses)/(double)windowFrames,(full-windowFull)/(double)windowFrames,(draws-windowDraws)/(double)windowFrames,
+      (pixels-windowPixels)/1e6/windowFrames);
   windowBegan=now;windowFrames=0;windowCommit=commitTotal;windowCopy=copyTotal;windowCopies=copies;
+  windowPasses=passes;windowDraws=draws;windowPixels=pixels;windowFull=full;
  }
 }
 

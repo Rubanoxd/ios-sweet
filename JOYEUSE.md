@@ -932,3 +932,32 @@ with the kernel's collection layout) do nothing, keyboard events work; xnu 0108
 adds `kern.sweet_touch` / `kern.sweet_key` through the real HID path but is
 not built (GitHub Actions is disabled on the fork; Xcode 27 here, the xnu-8796
 build needs Xcode 15's iig).
+
+## Frame rate work (2026-10-23)
+
+- `sweetfb_hz=30` made the kernel show one frame in two vsyncs (fFlushTicks =
+  60/hz): the GPU path was capped at 30 fps. With `sweetfb_hz=60` (boot-arg
+  only; shims `shim-boot-joyeuse-dual-01xx.img` now use it) animations reach
+  ~45-51 fps. A zero-copy present costs ~2.4 ms of CPU.
+- `vmd` (VisualVoicemail) spins at 100 % of a core and launchd ~35 % relaunching
+  it; `killall vmd` until the image disables the job.
+- 512 MiB GPU windows ran out in backboardd (OutOfMemory on IOSurface imports):
+  xnu 0109 makes three 1 GiB windows; 0111 returns a window when its connection
+  closes (a restarted backboardd found none); the Metal bundle no longer runs the
+  bring-up Turnip check in SpringBoard (it held a window). 0108 adds
+  `kern.sweet_touch` / `kern.sweet_key` (sweet-touch uses them: swipes, taps and
+  the home screen's pages work). 0110 adds `kern.sweet_ddr=1` (BCM votes MC0,
+  SH0, ACV): accepted by RPMh, but no measurable change, so DDR is not the limit.
+- Per frame (perf line now has passes, draws, Mpx): one full-screen pass with
+  ~39 draws (2.7 Mpx) takes ~10 ms of GPU, 4-5 passes ~20 ms; `TU_DEBUG=sysmem`
+  12.3 ms vs 14.6 ms default, `gmem` the same. Expected for an A618 is 1-2 ms:
+  next, `tools/sweet-metalprobe/sweet-fillbench.m` (private texture vs IOSurface,
+  clear vs load+blend) to see whether imported host pages are the slow part.
+- Kernel 0110/0111: once after many backboardd restarts the GPU faulted at iova
+  0x80030000 (SMMU cb0 fsr 0x402, cp_int 0x80) and recovery failed ("GPU
+  disabled"); the address is the start of the second 1 GiB window. Not yet
+  understood.
+- Photos: assetsd aborts with "assetsd requires TCCPhotosService access" (its
+  `com.apple.private.tcc.allow` entitlement is not honoured by tccd here), so
+  saving the wallpaper photo fails; a TCC.db row for com.apple.assetsd would
+  work around it. `MobileSlideShow.migrator` was run (as mobile).
