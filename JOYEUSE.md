@@ -961,3 +961,27 @@ build needs Xcode 15's iig).
   `com.apple.private.tcc.allow` entitlement is not honoured by tccd here), so
   saving the wallpaper photo fails; a TCC.db row for com.apple.assetsd would
   work around it. `MobileSlideShow.migrator` was run (as mobile).
+
+## Flip waits for the GPU (xnu 0112-0114, 2026-10-23)
+
+- xnu 0112: `AppleCLCD::vsyncFired` shows a swapped frame only when no layer
+  surface has a use count (the Metal frontend holds one from commit to
+  completion on every render-target surface); otherwise it retries at the
+  next vsync, at most 100 ms. The 600-present log line counts the waits and
+  timeouts.
+- xnu 0114: `kern.sweet_fb_gpu_wait=1`. With it the frontend delivers
+  QuartzCore's "scheduled" at submission again (older kernels keep the
+  deferred path that fixed the half-drawn frames); `SWEET_EARLY_SCHEDULE=0/1`
+  overrides. The log says which: `display frames: "scheduled" ...`.
+- Home-screen page swipes at 650 MHz (scratchpad `fps.sh`: mean of the
+  busy perf lines): deferred 26.5-27.0 frames/s, early with 0112/0114
+  37.4-38.8 frames/s, peaks 61. Camera: app open/close and swipes without
+  half-drawn frames. Per 600 presents about 224 vsyncs waited and 4 timeouts
+  (a frame still in use after 100 ms): not understood yet.
+- xnu 0113: `sweetgpulevel=7` sends 800 MHz through DCVS. Not usable: at the
+  boot vote (0111, no DCVS message) an idle compositor frame took 30 ms
+  instead of 1.8 ms and the GPU then faulted (SMMU translation fault at
+  0x40008000, recovery failed); through DCVS (0113) Turnip's device query
+  failed at boot (the core loses its state going up, as in the 0095
+  experiment). The default stays 6 = 650 MHz.
+- Shims: `shim/out/shim-boot-joyeuse-dual-0114.img` (cmdline B, 60 Hz).
