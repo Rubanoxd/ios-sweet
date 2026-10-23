@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -182,10 +182,13 @@
+  * One GPU address space is shared by every connection (no per-process
+  * pagetables yet), and Turnip places its buffers from the va_start it is
+  * given, so two processes on the same range collide. Each connection gets
+- * its own 512 MiB window of the client range instead; six fit.
++ * its own 1 GiB window of the client range instead; three fit. (512 MiB
++ * windows ran out in backboardd: QuartzCore keeps dozens of full-screen
++ * IOSurfaces imported, 11 MB each, and imports then failed with
++ * OutOfMemory -- layers missing and CPU-mirrored buffers.)
+  */
+-#define VA_WINDOW         0x20000000ull
+-#define VA_SLOTS          6
++#define VA_WINDOW         0x40000000ull
++#define VA_SLOTS          3
+ static uint8_t sVaSlots[VA_SLOTS];
+ 
+ static int
