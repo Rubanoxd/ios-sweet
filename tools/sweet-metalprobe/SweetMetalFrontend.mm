@@ -56,7 +56,7 @@ static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
-static Timed gTimeWaitScheduled,gTimeWaitCompleted;
+static Timed gTimeWaitScheduled,gTimeWaitCompleted,gTimeShadowCopy;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
@@ -67,6 +67,9 @@ static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
 static std::mutex gProblemLock;
 static char gLastProblems[2][200];
+// Per-frame and per-object traces (VLOG) are off: each sweet_metal_log opens, writes and closes a file, which showed in
+// profiles of backboardd. Errors and the perf line still log.
+#define VLOG(...) do{if(0)sweet_metal_log(__VA_ARGS__);}while(0)
 static void noteProblem(NSString *what) {
  gProblems++;
  std::lock_guard<std::mutex> lock(gProblemLock);
@@ -151,7 +154,17 @@ static void stubbed(id self, NSInvocation *inv) {
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 @end
+// Live objects per class (init/dealloc), printed with the perf line: finds frontend objects that never go away.
+static std::mutex gLiveLock;static std::unordered_map<std::string,long> gLive;
+static void liveCount(id object,long delta){std::lock_guard<std::mutex> lock(gLiveLock);gLive[class_getName(object_getClass(object))]+=delta;}
+static std::string liveSummary(){
+ std::lock_guard<std::mutex> lock(gLiveLock);std::string out;
+ for(auto &kv:gLive)if(kv.second){char b[80];snprintf(b,sizeof b,"%s=%ld ",kv.first.c_str(),kv.second);out+=b;}
+ return out;
+}
 @implementation NBObject
+- (instancetype)init {if((self=[super init]))liveCount(self,1);return self;}
+- (void)dealloc {liveCount(self,-1);}
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
     NSMethodSignature *sig = [super methodSignatureForSelector:selector];
@@ -190,6 +203,9 @@ static void waitForResource(id resource);
 @property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
 @property(nonatomic) void *wrapped;
 @property(nonatomic) IOSurfaceRef surfaceOwner; // keeps a shared import's CPU mapping alive
+@property(nonatomic) NSUInteger mirrorLength;
+@property(nonatomic) NSUInteger wrappedLength;   // the caller's length of a no-copy buffer's bytes
+@property(nonatomic) BOOL mirror;   // a no-copy buffer the runtime could not import: GPU memory refreshed from `wrapped` at each commit
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
 @end
@@ -198,11 +214,24 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic) BOOL shadow;   // renders into its own buffer, copied into `surface` at completion (shadowCopy)
+@property(nonatomic) BOOL display;  // a display surface (scanout pool): only the GPU and the display touch it, no CPU cache maintenance
+@property(nonatomic,strong) NBBuffer *shadowBuffer;   // that buffer (-buffer answers nil for a surface texture, as Metal does)
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 @end
+static NSHashTable *gMirrors;   // NBBuffers with mirror set
+static void mirrorAll(void) {
+ NSArray *all;@synchronized([NBBuffer class]){all=gMirrors.allObjects;}
+ // Through the kernel: QuartzCore may unmap a no-copy buffer's bytes while the buffer lives (a plain memcpy crashed the
+ // render server); a mirror whose bytes are gone just keeps its last copy.
+ for(NBBuffer *b in all) {
+  vm_size_t got=0;
+  (void)vm_read_overwrite(mach_task_self(),(vm_address_t)b.wrapped,b.mirrorLength,(vm_address_t)nmb_buffer_contents(b.handle),&got);
+ }
+}
 @implementation NBBuffer
 - (void)dealloc {
  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
@@ -210,7 +239,7 @@ static void waitForResource(id resource);
  if(_surfaceOwner)CFRelease(_surfaceOwner);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
-- (void *)contents {return nmb_buffer_contents(_handle);}
+- (void *)contents {return _mirror?_wrapped:nmb_buffer_contents(_handle);}
 - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
 - (MTLResourceOptions)resourceOptions {return _options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
@@ -257,9 +286,18 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
+// Apple's extended-range (XR) formats, which the iPhone X display uses, as plain BGRA8: Turnip has no XR
+// encoding and the scanout (xnu 0083) shows 32-bit BGRA. Colors outside [0,1] clamp.
+static uint64_t displayFormat(uint64_t f) {
+ switch(f) {
+  case 550:case 552:case 554:return MTLPixelFormatBGRA8Unorm;
+  case 551:case 553:case 555:return MTLPixelFormatBGRA8Unorm_sRGB;
+  default:return f;
+ }
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ *out={(uint64_t)d.textureType,displayFormat((uint64_t)d.pixelFormat),d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
  return true;
 }
 @implementation NBTexture
@@ -325,12 +363,99 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
+// Display surfaces with sweetdpu=2 live in the scanout pool, physical memory with no VM pages: wiring them for a GPU import
+// (NativeAdreno BoImport, md->prepare) blocked backboardd in the kernel with its VM map locked. They render into a buffer of
+// their own instead (one per surface, kept for the surface's life so loads see the previous frame) and their plane 0 is
+// copied into the surface when the command completes, before Metal's completed handlers let QuartzCore swap it.
+static NSMutableDictionary<NSNumber *,NBBuffer *> *gShadows;
+// Display surfaces imported directly (the GPU renders into the scanout pool pages) instead of through a shadow buffer and a
+// CPU copy (68 ms a frame for 11 MB read from write-combined memory). Needs xnu 0103: before it, the GPU pool's secure hole
+// hung these imports too.
+static const bool kDirectDisplay=true;
+static bool gShadowNoCopy;   // /var/tmp/sweetmetal.nocopy at device open: render display surfaces without showing them (tests)
+static NBBuffer *shadowBuffer(IOSurfaceRef surface,size_t bytes) {
+ @synchronized([NBBuffer class]) {
+  if(!gShadows)gShadows=[NSMutableDictionary dictionary];
+  NSNumber *key=@(IOSurfaceGetID(surface));
+  NBBuffer *buffer=gShadows[key];
+  if(buffer && buffer.length>=bytes)return buffer;
+  NmbBuffer *handle=nmb_buffer_new(gDevice,bytes,MTLResourceStorageModeShared,IOSurfaceGetBaseAddress(surface));
+  if(!handle){NBLOG(@"native-metal: shadow buffer refused: %@",lastError());return nil;}
+  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+  flush_dcache(buffer.contents,bytes);
+  if(gShadows.count>=8)[gShadows removeAllObjects];
+  gShadows[key]=buffer;
+  VLOG("shadow buffer for surface %u: %zu bytes",IOSurfaceGetID(surface),bytes);
+  return buffer;
+ }
+}
+static void shadowCopy(NSMutableSet *surfaces) {
+ static unsigned calls;
+ if(++calls<=4) {
+  unsigned shadows=0;for(NBTexture *t in surfaces)if(t.shadow)shadows++;
+  VLOG("shadowCopy: %lu surfaces, %u shadows, nocopy %d",(unsigned long)surfaces.count,shadows,(int)gShadowNoCopy);
+ }
+ for(NBTexture *texture in surfaces) {
+  if(!texture.shadow || !texture.surface || !texture.shadowBuffer)continue;
+  void *dst=IOSurfaceGetBaseAddress(texture.surface);
+  const size_t bytes=texture.rowBytes*texture.descriptor.height;
+  void *src=texture.shadowBuffer.contents;
+  if(!dst || !src || bytes>IOSurfaceGetAllocSize(texture.surface)) {
+   static unsigned skips;
+   if(++skips<=4)sweet_metal_log("shadow copy skipped: surface %u dst %p src %p bytes %zu alloc %zu",
+       IOSurfaceGetID(texture.surface),dst,src,bytes,IOSurfaceGetAllocSize(texture.surface));
+   continue;
+  }
+  if(gShadowNoCopy)continue;
+  const uint64_t copyBegan=nowUs();
+  // The shadow buffer is GPU pool memory mapped write-combined (no cache maintenance) and the surface is the
+  // scanout pool: both page aligned and the size a multiple of 64, so memcpy only makes aligned accesses (no DC ZVA).
+  // The per-word volatile loop plus a dc civac pass over the source took 227 ms a frame; memcpy is the copy itself.
+  memcpy(dst,src,bytes);
+  __asm__ volatile("dsb sy");
+  const uint32_t *s32=(const uint32_t *)src;const volatile uint32_t *d32=(const volatile uint32_t *)dst;
+  gTimeShadowCopy.add(copyBegan);
+  static unsigned shadowCopies;
+  if(++shadowCopies<=6 || shadowCopies%120==0) {
+   size_t srcNZ=0,dstNZ=0;
+   for(size_t i=0;i<bytes/4;i+=97){if(s32[i])srcNZ++;if(d32[i])dstNZ++;}
+   VLOG("shadow copy #%u surface %u: %zu bytes, nonzero samples src %zu dst %zu, px[mid] %08x",
+       shadowCopies,IOSurfaceGetID(texture.surface),bytes,srcNZ,dstNZ,s32[(bytes/8)&~(size_t)0xf]);
+  }
+ }
+}
+// The caller's own memory a command uses (no-copy buffers, and textures over them): the Adreno 618 does not snoop the
+// CPU caches, so QuartzCore's vertex and uniform rings, written through cached mappings, reached the GPU stale (icons
+// drawn at old positions or not at all) until cleaned to memory. Cleaned before each commit only: by completion
+// QuartzCore may have unmapped the bytes already (cleaning them then crashed the render server).
+static void flushHostBuffers(NSSet *owners) {
+ for(id owner in owners) {
+  NBBuffer *b=nil;
+  if([owner isKindOfClass:[NBBuffer class]])b=owner;
+  else if([owner isKindOfClass:[NBTexture class]] && !((NBTexture *)owner).surface)b=((NBTexture *)owner).buffer;
+  if(b && b.wrapped && b.wrappedLength && !b.mirror && !b.surfaceOwner)flush_dcache(b.wrapped,b.wrappedLength);
+ }
+}
 static void flushSurfaces(NSMutableSet *surfaces) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)
-  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
+ for(NBTexture *texture in surfaces)if(texture.surface && !texture.shadow && !texture.display) {
+  void *base = IOSurfaceGetBaseAddress(texture.surface);
+  size_t alloc = IOSurfaceGetAllocSize(texture.surface);
+  ranges.emplace_back(reinterpret_cast<uintptr_t>(base), alloc);
+  static unsigned surfCheckCount;
+  if (++surfCheckCount <= 10 || (surfCheckCount % 60) == 0) {
+      const uint8_t *p = (const uint8_t *)base;
+      size_t nonZero = 0;
+      if (p) {
+          size_t clen = alloc < 65536 ? alloc : 65536;
+          for (size_t k = 0; k < clen; k++) if (p[k]) nonZero++;
+          VLOG("flushSurfaces #%u: surf=%p base=%p alloc=%zu nonZeroIn64K=%zu px[0..3]=%u,%u,%u,%u",
+              surfCheckCount, texture.surface, base, alloc, nonZero, p[0], p[1], p[2], p[3]);
+      }
+  }
+ }
  std::sort(ranges.begin(),ranges.end());
  const auto last=std::unique(ranges.begin(),ranges.end());
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
@@ -340,8 +465,12 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
  }
 }
-static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+// keepXR: the texels are an extended-range format as written by somebody else (an app's 'w30r' backing store): metal2vulkan
+// decodes those itself, so the format is passed as it is instead of displayFormat()'s BGRA8 (which read them as garbage:
+// a light grey 10-bit word read as 8-bit BGRA is magenta -- the app zooming in from its icon).
+static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface,bool keepXR=false) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+ if(keepXR)descriptor.format=(uint64_t)d.pixelFormat;
  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -389,9 +518,14 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
  Method method=class_getInstanceMethod(object_getClass(object),selector);
  return method && !strcmp(method_getTypeEncoding(method),encoding);
 }
-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
+// Bytes of a function constant of MTLDataType `type`, packed as metal2vulkan reads them (a uchar3 is 3 bytes; QuartzCore's
+// uber-shader takes uchar3 constants).
 static uint64_t constantBytes(uint64_t type) {
  switch(type) {
+  case 47:case 51:case 55:return 3;
+  case 18:case 39:case 43:return 6;
+  case 5:case 31:case 35:return 12;
+  case 83:case 87:return 24;
   case 3:case 29:case 33:return 4;
   case 4:case 30:case 34:return 8;
   case 6:case 32:case 36:return 16;
@@ -457,8 +591,13 @@ static std::string quartzCoreCallers();
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
 // runtime does when the function is made.
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
+ VLOG("newFunctionWithDescriptor name=%s constants=%d", d.name.UTF8String?:"(nil)", d.constantValues?1:0);
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
- if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
+ if(d.constantValues){
+  NSError *e=nil;id<MTLFunction> f=[self newFunctionWithName:d.name constantValues:d.constantValues error:&e];
+  if(!f)sweet_metal_log("newFunctionWithDescriptor %s failed: %s",d.name.UTF8String?:"?",e.localizedDescription.UTF8String?:"?");
+  if(error)*error=e;return f;
+ }
  id<MTLFunction> function=[self newFunctionWithName:d.name];
  if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
  if(error)*error=nil;return function;
@@ -488,6 +627,11 @@ static std::string quartzCoreCallers();
 @end
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
+// For a variant whose color formats follow the pass (an extended-range surface drawn in its own format, see variantFor:):
+@property(nonatomic,strong) MTLRenderPipelineDescriptor *descriptor;
+@property(nonatomic) MTLPipelineOption options;
+@property(nonatomic,copy) NSString *formats;               // the formats it was made with, "f0,f1,...,f7"
+@property(nonatomic,strong) NSMutableDictionary<NSString *,NBRenderPipeline *> *variants;
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -571,12 +715,14 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+@property(nonatomic,strong) NSMutableArray *usedSurfaces;   // IOSurfaces this command buffer marked in use (xnu 0106)
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
 @property(nonatomic,strong) dispatch_group_t handlers;
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
+@property(atomic) BOOL schedulingDeferred;   // a frame for the display: "scheduled" waits for the GPU (see didSchedule)
 - (void)refuse:(NSString *)what;
 @end
 @interface NBEncoder : NBObject
@@ -621,6 +767,12 @@ static void waitForResource(id resource) {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && objc_getAssociatedObject(self,"traceDisplay")) {
+  IOSurfaceRef ts=[(NBTexture *)texture surface];
+  sweet_metal_log("trace: texture %lu stage %u = %s %u fmt %llu %llux%llu",(unsigned long)index,stage,ts?(IOSurfaceGetPlaneCount(ts)==2?"display surface":"surface"):"texture",
+      ts?IOSurfaceGetID(ts):0,(unsigned long long)[(NBTexture *)texture descriptor].format,(unsigned long long)[(NBTexture *)texture descriptor].width,
+      (unsigned long long)[(NBTexture *)texture descriptor].height);
+ }
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -675,12 +827,29 @@ static void waitForResource(id resource) {
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
+// The pipeline to draw with in a pass whose color formats are `passFormats`: itself, or a variant made for them (below).
+static NmbRenderPipeline *pipelineFor(NBRenderPipeline *pipeline,NSString *passFormats);
+// SWEET_TRACE_PASSES=N (sweetmetal.env): log the next N render passes and blits that touch the display's
+// two-plane surfaces (load/store actions, scissors), to see how QuartzCore keeps the two buffers up to date.
+static std::atomic<long> gTraceLeft{-1};
+static bool traceDisplay() {
+ long v=gTraceLeft.load();
+ if(v<0){const char *e=getenv("SWEET_TRACE_PASSES");v=e?atol(e):0;gTraceLeft.store(v);}
+ return v>0;
+}
+static bool isDisplaySurface(id<MTLTexture> t) {
+ if(![(id)t isKindOfClass:[NBTexture class]])return false;
+ IOSurfaceRef s=((NBTexture *)t).surface;
+ return s && IOSurfaceGetPlaneCount(s)==2;
+}
 @interface NBRenderEncoder : NBEncoder
 @end
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+ NSString *passFormats=objc_getAssociatedObject(self,"passFormats");
+ NmbRenderPipeline *handle=passFormats?pipelineFor((NBRenderPipeline *)state,passFormats):[(NBRenderPipeline *)state handle];
+ [self check:nmb_render_set_pipeline(self.handle,handle) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -710,6 +879,7 @@ static void waitForResource(id resource) {
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
+ if(objc_getAssociatedObject(self,"traceDisplay"))sweet_metal_log("trace: scissor %lu,%lu %lux%lu",(unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height);
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
@@ -811,6 +981,12 @@ static void waitForResource(id resource) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+ if((isDisplaySurface(s)||isDisplaySurface(d)) && traceDisplay()) {
+  long left=--gTraceLeft;
+  sweet_metal_log("trace: blit surface %u (%lu,%lu %lux%lu) -> surface %u (%lu,%lu) (%ld left)",
+      isDisplaySurface(s)?IOSurfaceGetID(((NBTexture *)s).surface):0,(unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height,
+      isDisplaySurface(d)?IOSurfaceGetID(((NBTexture *)d).surface):0,(unsigned long)dO.x,(unsigned long)dO.y,left);
+ }
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
@@ -933,6 +1109,22 @@ static void scheduled(void *context);
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  // A color attachment loaded with DontCare loads instead. On an Apple GPU only the tiles a draw's primitives touch
+  // lose their texels; metal2vulkan clears everything its draws' viewports and scissors reach, and QuartzCore's partial
+  // redraws (full-screen viewport, a few quads) then blacked out the rest: the dark boxes in transitions. A memoryless
+  // texture (never loaded) and depth/stencil keep their action.
+  {
+   const uint64_t f=texture.descriptor.format;
+   const bool depthStencil=(f>=250 && f<=262);
+   const bool memoryless=((texture.descriptor.options&MTLResourceStorageModeMask)==MTLResourceStorageModeMemoryless);
+   if(out.load==MTLLoadActionDontCare && !depthStencil && !memoryless)out.load=MTLLoadActionLoad;
+  }
+  static unsigned passLogCount;
+  if (++passLogCount <= 10 || (passLogCount % 60) == 0) {
+      VLOG("attachment: tex=%p surf=%p (%zux%zu) load=%lu store=%lu",
+          texture, texture.surface, (size_t)texture.descriptor.width, (size_t)texture.descriptor.height,
+          (unsigned long)a.loadAction, (unsigned long)a.storeAction);
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -948,11 +1140,36 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ bool traced=false;
+ if(isDisplaySurface(d.colorAttachments[0].texture) && traceDisplay()) {
+  traced=true;long left=--gTraceLeft;
+  MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[0];
+  sweet_metal_log("trace: pass on surface %u (%ld left) load %lu->%lu store %lu clear %.2f,%.2f,%.2f,%.2f target %lux%lu",
+      IOSurfaceGetID(((NBTexture *)c.texture).surface),left,(unsigned long)c.loadAction,(unsigned long)pass.colors[0].load,(unsigned long)c.storeAction,
+      c.clearColor.red,c.clearColor.green,c.clearColor.blue,c.clearColor.alpha,(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight);
+ }
+ id<MTLRenderCommandEncoder> encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(traced && encoder)objc_setAssociatedObject(encoder,"traceDisplay",@YES,OBJC_ASSOCIATION_RETAIN);
+ {
+  // A pass over an extended-range texture kept in its own format: pipelines follow its formats (pipelineFor).
+  bool xr=false;NSMutableArray *f=[NSMutableArray array];
+  for(unsigned i=0;i<8;i++) {
+   id<MTLTexture> t=d.colorAttachments[i].texture;
+   const uint64_t fmt=[(id)t isKindOfClass:[NBTexture class]]?((NBTexture *)t).descriptor.format:0;
+   if(fmt>=552 && fmt<=555)xr=true;
+   [f addObject:@(fmt)];
+  }
+  if(xr && encoder)objc_setAssociatedObject(encoder,"passFormats",[f componentsJoinedByString:@","],OBJC_ASSOCIATION_RETAIN);
+ }
+ return encoder;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
+ static unsigned presentCount;
+ if (++presentCount <= 20 || (presentCount % 60) == 0) {
+  VLOG("presentDrawable #%u drawable=%p", presentCount, drawable);
+ }
  if(drawable){
   [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
    (void)cb;
@@ -988,6 +1205,23 @@ static void scheduled(void *context);
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
 // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
 - (void)didSchedule {
+ // QuartzCore swaps a display surface to the screen once its frame is scheduled. Apple's display driver then waits for the
+ // GPU to finish writing the surface; ours (xnu SweetFramebuffer / DPU zero-copy) flips at the next vsync. A frame that
+ // took the GPU longer than that (transitions: blurs, 12-20 ms) was shown half drawn: rows without their text, a
+ // layer's black background, boxes over the home screen. So for a command buffer that draws into a display surface,
+ // "scheduled" is delivered when it completes (finish). SWEET_EARLY_SCHEDULE=1: as before.
+ static int early=-1;
+ if(early<0)early=getenv("SWEET_EARLY_SCHEDULE")?1:0;
+ if(!early) {
+  bool display=false;
+  @synchronized(self){
+   for(NBTexture *t in _surfaces) {
+    IOSurfaceRef ts=t.surface;
+    if(ts && IOSurfaceGetPlaneCount(ts)==2){display=true;break;}
+   }
+  }
+  if(display){self.schedulingDeferred=YES;return;}
+ }
  {
   const uint64_t took=nowUs()-self.committedUs;
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -1009,6 +1243,9 @@ static void scheduled(void *context);
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
+ shadowCopy(_surfaces);
+ for(id surface in _usedSurfaces)IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)surface);
+ [_usedSurfaces removeAllObjects];
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -1016,8 +1253,15 @@ static void scheduled(void *context);
  NSArray *completedHandlers;
  @synchronized(self){
   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
-  if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
+  if(!_schedulingDelivered && !self.schedulingDeferred){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
+ }
+ // A display frame's deferred "scheduled": now that the GPU is done, before the completed handlers.
+ if(self.schedulingDeferred && !_schedulingDelivered) {
+  NSArray *scheduled;
+  @synchronized(self){_schedulingDelivered=YES;scheduled=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];}
+  for(MTLCommandBufferHandler block in scheduled)block((id<MTLCommandBuffer>)self);
+  dispatch_group_leave(_schedulingHandlers);
  }
  void (^run)(void)=^{
   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
@@ -1027,9 +1271,26 @@ static void scheduled(void *context);
  if(queue)dispatch_async(queue,run);else run();
 }
 - (void)commit {
+ mirrorAll();
+ flushHostBuffers(_resourceOwners);
+ // Like Apple's GPU driver, the surfaces a command buffer reads or writes are in use until it completes: a producer
+ // (an app redrawing its layer) waits for IOSurfaceIsInUse to clear instead of drawing under the GPU.
+ if(!_usedSurfaces)_usedSurfaces=[NSMutableArray array];
+ for(NBTexture *t in _surfaces) {
+  IOSurfaceRef surface=t.surface;
+  if(!surface && [t.parent isKindOfClass:[NBTexture class]])surface=((NBTexture *)t.parent).surface;
+  if(surface && ![_usedSurfaces containsObject:(__bridge id)surface]){IOSurfaceIncrementUseCount(surface);[_usedSurfaces addObject:(__bridge id)surface];}
+ }
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
+ static unsigned commitCount;
+ if (++commitCount <= 20 || (commitCount % 60) == 0) {
+  char st[256]={};
+  native_bridge_metal_status(st, sizeof(st));
+  VLOG("commit #%u: passes=%u draws=%u blits=%u surfaces=%lu | stats: %s",
+      commitCount, encodedWork.passes, encodedWork.draws, encodedWork.blits, (unsigned long)_surfaces.count, st);
+ }
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -1083,6 +1344,21 @@ static void completed(void *context) {
   if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
  }
  [commandBuffer finish];
+ // Every 60 completions: frames per second and where a frame's time goes (xnu-0103 era profiling).
+ static uint64_t windowBegan,windowFrames,windowCommit,windowCopy,windowCopies;
+ const uint64_t now=nowUs();if(!windowBegan)windowBegan=now;
+ if(++windowFrames>=20) {
+  const uint64_t commitTotal=gTimeEncodeToCommit.total.load(),copyTotal=gTimeShadowCopy.total.load(),copies=gTimeShadowCopy.count.load();
+  sweet_metal_log("live: %s",liveSummary().c_str());
+  {uint64_t w[10]={};if(gDevice && nmb_device_work_stats(gDevice,w))
+    sweet_metal_log("work: pipelines made %llu (%llu ms total, longest %llu ms, failed %llu), shader cache hits %llu misses %llu writes %llu",
+        (unsigned long long)w[0],(unsigned long long)(w[1]/1000),(unsigned long long)(w[2]/1000),(unsigned long long)w[4],
+        (unsigned long long)w[7],(unsigned long long)w[8],(unsigned long long)w[9]);}
+  sweet_metal_log("perf: %.1f frames/s, commit-to-complete %llu us mean, shadow copy %llu us mean (%llu copies)",
+      windowFrames*1e6/(double)(now-windowBegan),(unsigned long long)((commitTotal-windowCommit)/windowFrames),
+      (unsigned long long)(copies>windowCopies?(copyTotal-windowCopy)/(copies-windowCopies):0),(unsigned long long)(copies-windowCopies));
+  windowBegan=now;windowFrames=0;windowCommit=commitTotal;windowCopy=copyTotal;windowCopies=copies;
+ }
 }
 
 @implementation NBQueue
@@ -1212,15 +1488,99 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  for(char &c:line)if(c=='\n')c=' ';
  journal(line);
 }
+@interface NSObject (SweetMetalSPI)
+- (NSData *)bitcodeData;
+@end
+
+static NBFunction *bridgeForeignFunction(id<MTLFunction> fn) {
+    if (!fn) return nil;
+    if ([(id)fn isKindOfClass:[NBFunction class]]) return (NBFunction *)fn;
+
+    VLOG("bridgeForeignFunction: class=%s name=%s",
+        class_getName(object_getClass(fn)), fn.name.UTF8String ?: "?");
+
+    if ([fn respondsToSelector:@selector(bitcodeData)]) {
+        @try {
+            NSData *data = [(id)fn bitcodeData];
+            if ([data isKindOfClass:[NSData class]] && data.length >= 16) {
+                const uint8_t *raw = (const uint8_t *)data.bytes;
+                size_t len = data.length;
+                uint32_t magic = *(const uint32_t *)raw;
+                VLOG("bitcodeData length=%zu magic=0x%08x", len, magic);
+
+                const void *bcBytes = raw;
+                size_t bcLen = len;
+                bool isAir = false;
+
+                if (magic == 0x0b17c0de) {
+                    // Apple Bitcode Wrapper Header: magic (4), version (4), offset (4), size (4)
+                    uint32_t offset = *(const uint32_t *)(raw + 8);
+                    uint32_t size = *(const uint32_t *)(raw + 12);
+                    VLOG("Apple bitcode wrapper: offset=%u size=%u", offset, size);
+                    if (offset + size <= len) {
+                        bcBytes = raw + offset;
+                        bcLen = size;
+                        uint32_t innerMagic = *(const uint32_t *)bcBytes;
+                        VLOG("Wrapped bitcode magic=0x%08x", innerMagic);
+                        isAir = (innerMagic == 0xdec04342);
+                    }
+                } else if (magic == 0xdec04342) {
+                    isAir = true;
+                } else if (magic == 0x424c544d) {
+                    isAir = false;
+                }
+
+                NmbLibrary *lib = nmb_library_new(gDevice, bcBytes, bcLen, isAir);
+                VLOG("nmb_library_new (%zu bytes, isAir=%d) -> %s",
+                    bcLen, isAir, lib ? "OK" : nmb_last_error());
+                if (lib) {
+                    NmbFunction *fHandle = nmb_function_new(lib, fn.name.UTF8String ?: "");
+                    VLOG("nmb_function_new '%s' -> %s",
+                        fn.name.UTF8String ?: "", fHandle ? "OK" : nmb_last_error());
+                    if (fHandle) {
+                        NBFunction *nbf = [NBFunction new];
+                        nbf.handle = fHandle;
+                        nbf.name = fn.name;
+                        VLOG("Bridged foreign function %s successfully! (NBFunction %p)",
+                            fn.name.UTF8String ?: "", nbf);
+                        return nbf;
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            sweet_metal_log("bitcodeData exception: %s", e.reason.UTF8String ?: "?");
+        }
+    }
+
+    return nil;
+}
+
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
-static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
+static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error,const uint64_t *formats=nullptr) {
+ VLOG("renderDescriptor: vert=%p (class %s, name %s) frag=%p (class %s, name %s)",
+     d.vertexFunction,
+     d.vertexFunction ? class_getName(object_getClass(d.vertexFunction)) : "nil",
+     d.vertexFunction.name.UTF8String ?: "?",
+     d.fragmentFunction,
+     d.fragmentFunction ? class_getName(object_getClass(d.fragmentFunction)) : "nil",
+     d.fragmentFunction.name.UTF8String ?: "?");
+
+ if (d.vertexFunction && ![(id)d.vertexFunction isKindOfClass:[NBFunction class]]) {
+  NBFunction *b = bridgeForeignFunction(d.vertexFunction);
+  if (b) d.vertexFunction = (id<MTLFunction>)b;
+ }
+ if (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]]) {
+  NBFunction *b = bridgeForeignFunction(d.fragmentFunction);
+  if (b) d.fragmentFunction = (id<MTLFunction>)b;
+ }
+
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
   if(error)*error=nbError(@"foreign function");return false;
  }
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
-  p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
+  p->colors[i]={formats?formats[i]:displayFormat((uint64_t)a.pixelFormat),(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
@@ -1233,6 +1593,38 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
   }
  }
  return true;
+}
+
+static NmbRenderPipeline *pipelineFor(NBRenderPipeline *pipeline,NSString *passFormats) {
+ if(!pipeline.descriptor || [pipeline.formats isEqualToString:passFormats])return pipeline.handle;
+ NSArray<NSString *> *mine=[pipeline.formats componentsSeparatedByString:@","],*pass=[passFormats componentsSeparatedByString:@","];
+ uint64_t formats[8];bool differs=false;
+ for(unsigned i=0;i<8;i++) {
+  const uint64_t m=(uint64_t)mine[i].longLongValue,q=(uint64_t)pass[i].longLongValue;
+  const bool xr=(m>=552 && m<=555)||(q>=552 && q<=555);
+  formats[i]=(m && q && m!=q && xr)?q:m;
+  if(formats[i]!=m)differs=true;
+ }
+ if(!differs)return pipeline.handle;
+ NSString *key=[NSString stringWithFormat:@"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",formats[0],formats[1],formats[2],formats[3],formats[4],formats[5],formats[6],formats[7]];
+ @synchronized(pipeline) {
+  if(!pipeline.variants)pipeline.variants=[NSMutableDictionary dictionary];
+  NBRenderPipeline *v=pipeline.variants[key];
+  if(v)return v.handle;
+  auto *p=new NmbRenderPipelineDescriptor();
+  NmbRenderPipeline *handle=nullptr;
+  if(renderDescriptor(pipeline.descriptor,p,nil,formats)) {
+   const NmbPipelineOptions creation={(uint64_t)pipeline.options,nullptr,0};
+   handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);
+  }
+  delete p;
+  static int logged;
+  if(logged++<40)sweet_metal_log("pipeline variant for %s: %s (%s)",key.UTF8String,handle?"made":nmb_last_error(),
+      [NSThread isMainThread]?"main thread":"other thread");
+  if(!handle)return pipeline.handle;
+  v=[NBRenderPipeline new];v.handle=handle;v.formats=key;pipeline.variants[key]=v;
+  return handle;
+ }
 }
 
 // ---- heaps ----
@@ -1289,7 +1681,12 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 
 // Creation and archive population must use the same complete supported descriptor.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,NSError **error) {
- if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
+ if(!d)return false;
+ if(d.computeFunction && ![(id)d.computeFunction isKindOfClass:[NBFunction class]]) {
+  NBFunction *b = bridgeForeignFunction(d.computeFunction);
+  if (b) d.computeFunction = (id<MTLFunction>)b;
+ }
+ if(![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
  MTLStageInputOutputDescriptor *stage=d.stageInputDescriptor;
@@ -1408,6 +1805,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
 }
 - (id<MTLCommandQueue>)newCommandQueue {
+ VLOG("newCommandQueue");
  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
 }
@@ -1462,9 +1860,18 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
- if(!handle){NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;}
+ bool mirror=false;
+ if(!handle && pointer && length) {
+  // The runtime refuses some of QuartzCore's no-copy buffers (HostMemory NotRepresentable). nil made the render server
+  // spin; a mirror is GPU memory with the caller's bytes, refreshed from them before every commit (mirrorAll).
+  handle=nmb_buffer_new(gDevice,length,options,pointer);
+  mirror=handle!=nullptr;
+ }
+ if(!handle){NBLOG(@"native-metal: no-copy buffer refused (%p, %lu bytes, options 0x%lx): %@",pointer,(unsigned long)length,(unsigned long)options,lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
- buffer.wrapped=pointer;buffer.deallocator=deallocator;
+ buffer.wrapped=pointer;buffer.deallocator=deallocator;buffer.mirror=mirror;buffer.mirrorLength=length;buffer.wrappedLength=length;
+ if(mirror)@synchronized([NBBuffer class]){if(!gMirrors)gMirrors=[NSHashTable weakObjectsHashTable];[gMirrors addObject:buffer];}
+ if(mirror){static unsigned mirrors;if(++mirrors<=5 || mirrors%100==0)sweet_metal_log("mirror buffer #%u (%p, %lu bytes): %s",mirrors,pointer,(unsigned long)length,lastError().UTF8String?:"?");}
  return (id<MTLBuffer>)buffer;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -1476,18 +1883,111 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
- void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+ VLOG("newTextureWithDescriptor:iosurface:%p plane:%lu (desc %zux%zu format=%llu)", surface, (unsigned long)plane, d ? d.width : 0, d ? d.height : 0, d ? (uint64_t)d.pixelFormat : 0);
+ // Which surface formats arrive as which Metal formats (once per combination).
+ if(d) {
+  static NSMutableSet<NSString *> *seenImports;
+  OSType fourcc=IOSurfaceGetPixelFormat(surface);
+  NSString *k=[NSString stringWithFormat:@"%08x-%llu-%zu-%lu",(unsigned)fourcc,(unsigned long long)d.pixelFormat,IOSurfaceGetPlaneCount(surface),(unsigned long)plane];
+  bool first=false;
+  @synchronized([NBTexture class]){if(!seenImports)seenImports=[NSMutableSet new];if(![seenImports containsObject:k]){[seenImports addObject:k];first=true;}}
+  if(first)sweet_metal_log("import: surface '%c%c%c%c' planes %zu plane %lu as pixelFormat %llu (%zux%zu)",(char)(fourcc>>24),(char)(fourcc>>16),
+      (char)(fourcc>>8),(char)fourcc,IOSurfaceGetPlaneCount(surface),(unsigned long)plane,(unsigned long long)d.pixelFormat,(size_t)d.width,(size_t)d.height);
+ }
+ // QuartzCore renders the iPhone X display into two-plane RGB10A8_2P_XR10 surfaces (550, 551: XR10 color, then
+ // an A8 plane). The scanout (xnu 0083) shows plane 0 as 32-bit BGRA, so plane 0 becomes a BGRA8 target and
+ // the alpha plane is left alone.
+ size_t planeOffset=0,planeRow=0;
+ const bool xr2p=d && !plane && IOSurfaceGetPlaneCount(surface)==2 && d.pixelFormat>=550 && d.pixelFormat<=555;
+ if(xr2p) {
+  planeOffset=(size_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0)-(uint8_t *)IOSurfaceGetBaseAddress(surface));
+  planeRow=IOSurfaceGetBytesPerRowOfPlane(surface,0);
+  // SweetSurface (xnu 0046) keeps no per-plane layout: plane 0 is then the surface's own 32-bit rows.
+  if(!planeRow)planeRow=IOSurfaceGetBytesPerRow(surface);
+  if(!planeRow)planeRow=((size_t)d.width*4+63)&~(size_t)63;
+  static unsigned dump;if(!dump++)sweet_metal_log("iosurface 2P: alloc %zu row %zu elem %zu fmt 0x%x planes %zu row0 %zu row1 %zu",
+      IOSurfaceGetAllocSize(surface),IOSurfaceGetBytesPerRow(surface),IOSurfaceGetBytesPerElement(surface),
+      IOSurfaceGetPixelFormat(surface),IOSurfaceGetPlaneCount(surface),IOSurfaceGetBytesPerRowOfPlane(surface,0),IOSurfaceGetBytesPerRowOfPlane(surface,1));
+  if(planeRow*(size_t)d.height>IOSurfaceGetAllocSize(surface)){sweet_metal_log("iosurface 2P: plane 0 does not fit");return nil;}
+  static unsigned once;if(!once++)sweet_metal_log("iosurface: 2P_XR10 surface %zux%zu, plane 0 as BGRA8 (offset %zu, row %zu)",
+      (size_t)d.width,(size_t)d.height,planeOffset,planeRow);
+ }
+ if(!surface || !d || plane || (IOSurfaceGetPlaneCount(surface) && !xr2p)) {
+  sweet_metal_log("iosurface import refused: invalid arguments");
+  return nil;
+ }
+ if(xr2p && !kDirectDisplay) {
+  NBBuffer *shadow=shadowBuffer(surface,planeRow*(size_t)d.height);
+  NBTexture *texture=shadow?textureOnBuffer(shadow,d,0,planeRow,false):nil;
+  if(!texture){sweet_metal_log("iosurface import refused: shadow texture failed");return nil;}
+  texture.surface=(IOSurfaceRef)CFRetain(surface);texture.shadow=YES;texture.shadowBuffer=shadow;texture.rowBytes=planeRow;
+  return (id<MTLTexture>)texture;
+ }
+ // A display surface keeps its import and texture: QuartzCore asks for a texture of it again and again, and each new
+ // one re-imported 13 MB and made metal2vulkan a new image for it. (Caching every surface instead kept an image per app
+ // layer alive and ran the GPU pool dry: DeviceLost.)
+ static NSMutableDictionary<NSString *,NBTexture *> *surfaceTextures;
+ static NSMutableArray<NSString *> *surfaceOrder;
+ NSString *surfaceKey=[NSString stringWithFormat:@"%u-%llu-%lu-%lu-%lu",IOSurfaceGetID(surface),(unsigned long long)displayFormat(d.pixelFormat),
+     (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.usage];
+ if(xr2p) @synchronized([NBTexture class]) {
+  NBTexture *cached=surfaceTextures[surfaceKey];
+  if(cached){[surfaceOrder removeObject:surfaceKey];[surfaceOrder addObject:surfaceKey];return (id<MTLTexture>)cached;}
+ }
+ void *base=IOSurfaceGetBaseAddress(surface);
+ const size_t allocation=IOSurfaceGetAllocSize(surface);
+ if(!base) {
+  sweet_metal_log("iosurface import refused: base is NULL");
+  return nil;
+ }
+ if(((uintptr_t)base & 4095) != 0) {
+  sweet_metal_log("iosurface import refused: base %p not 4K aligned", base);
+  return nil;
+ }
+ const size_t page = 4096;
  const size_t bytes=(allocation+page-1)&~(page-1);
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
+ if(!buffer) {
+  sweet_metal_log("iosurface import refused: surfaceBuffer failed");
+  return nil;
+ }
+ // An extended-range surface this process renders into (a snapshot) holds BGRA8 texels from then on, as every texture of it
+ // must read them; one only sampled (an app's backing store, written by the app) keeps its real format.
+ static NSMutableSet<NSNumber *> *renderedXR;
+ bool rendered=false;
+ if(!xr2p && d.pixelFormat>=550 && d.pixelFormat<=555) @synchronized([NBTexture class]) {
+  if(!renderedXR)renderedXR=[NSMutableSet new];
+  NSNumber *sid=@(IOSurfaceGetID(surface));
+  if(d.usage & MTLTextureUsageRenderTarget)[renderedXR addObject:sid];
+  rendered=[renderedXR containsObject:sid];
+ }
+ // SWEET_XR_BGRA8=1: the earlier compromise (surfaces drawn here held BGRA8 bytes, which other processes misread).
+ static int legacy=-1;if(legacy<0)legacy=getenv("SWEET_XR_BGRA8")?1:0;
+ const bool keepXR=!xr2p && d.pixelFormat>=552 && d.pixelFormat<=555 && !(legacy && rendered);
+ if(!xr2p && d.pixelFormat>=550 && d.pixelFormat<=555) {
+  static int xrLogged;
+  if(xrLogged++<8)sweet_metal_log("import: extended-range surface %u format %llu usage 0x%lx -> %s",IOSurfaceGetID(surface),
+      (unsigned long long)d.pixelFormat,(unsigned long)d.usage,keepXR?"its own format":"BGRA8 (rendered here)");
+ }
+ NBTexture *texture=textureOnBuffer(buffer,d,planeOffset,xr2p?planeRow:IOSurfaceGetBytesPerRow(surface),true,keepXR);
+ if(!texture) {
+  sweet_metal_log("iosurface import refused: textureOnBuffer failed");
+  return nil;
+ }
+ texture.surface=(IOSurfaceRef)CFRetain(surface);texture.display=xr2p;
+ if(xr2p) @synchronized([NBTexture class]) {
+  if(!surfaceTextures){surfaceTextures=[NSMutableDictionary dictionary];surfaceOrder=[NSMutableArray array];}
+  if(surfaceOrder.count>=96){[surfaceTextures removeObjectForKey:surfaceOrder.firstObject];[surfaceOrder removeObjectAtIndex:0];}
+  surfaceTextures[surfaceKey]=texture;[surfaceOrder addObject:surfaceKey];
+ }
+ VLOG("iosurface import OK -> texture %p", texture);
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+ sweet_metal_log("newLibraryWithData (%zu bytes) -> %s", size, handle ? "OK" : nmb_last_error());
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
 }
@@ -1495,6 +1995,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+ VLOG("newLibraryWithFile %s (%zu bytes) -> %s", path.UTF8String?:"?", (size_t)bytes.length, handle ? "OK" : nmb_last_error());
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
 }
@@ -1514,6 +2015,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
+ if(function && ![(id)function isKindOfClass:[NBFunction class]]) {
+  NBFunction *b = bridgeForeignFunction(function);
+  if (b) function = (id<MTLFunction>)b;
+ }
  if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
@@ -1547,9 +2052,28 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+ VLOG("newRenderPipelineState: vert=%s frag=%s -> %s",
+     d.vertexFunction.name.UTF8String ?: "?", d.fragmentFunction.name.UTF8String ?: "?", handle ? "OK" : nmb_last_error());
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ state.descriptor=[d copy];state.options=options;
+ NSMutableArray *f=[NSMutableArray array];for(unsigned i=0;i<8;i++)[f addObject:@(displayFormat((uint64_t)d.colorAttachments[i].pixelFormat))];
+ state.formats=[f componentsJoinedByString:@","];
+ // A pipeline QuartzCore made for an extended-range target: its variant in that format is made now, off this thread
+ // (metal2vulkan took up to 1.4 s for one, and making it at the first snapshot froze the screen).
+ bool xr=false;NSMutableArray *xf=[NSMutableArray array];
+ for(unsigned i=0;i<8;i++) {
+  const uint64_t pf=(uint64_t)d.colorAttachments[i].pixelFormat;
+  if(pf>=552 && pf<=555)xr=true;
+  [xf addObject:@((pf>=552 && pf<=555)?pf:displayFormat(pf))];
+ }
+ if(xr && !getenv("SWEET_LAZY_XR_VARIANTS")) {
+  static dispatch_queue_t variantQueue=dispatch_queue_create("sweet.xr-variants",DISPATCH_QUEUE_SERIAL);
+  NSString *xrFormats=[xf componentsJoinedByString:@","];
+  dispatch_async(variantQueue,^{pipelineFor(state,xrFormats);});
+ }
+ return (id<MTLRenderPipelineState>)state;
 }
 - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {
  if(d.url && !d.url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -1619,6 +2143,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ gShadowNoCopy=access("/var/tmp/sweetmetal.nocopy",F_OK)==0;if(gShadowNoCopy)sweet_metal_log("shadow copies off (sweetmetal.nocopy)");
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
@@ -1636,7 +2161,12 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
  unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
  for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
- free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
+ free(methods);installAnswers(cls);
+ // Always NO, whether or not the runtime answers it: otherwise _MTLDevice's own answer makes QuartzCore render the display into
+ // RGB10A8_2P_XR10 (format 550) surfaces, which the 8-bit BGRA scanout cannot show.
+ {SEL xr=sel_registerName("supportsExtendedXR10Formats");IMP no=imp_implementationWithBlock(^BOOL(id){return NO;});
+  if(!class_addMethod(cls,xr,no,"B16@0:8"))class_replaceMethod(cls,xr,no,"B16@0:8");}
+ class_addProtocol(cls,@protocol(MTLDevice));
  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);

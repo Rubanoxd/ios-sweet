@@ -1,0 +1,120 @@
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index b987a46..f271294 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -713,7 +713,7 @@ pub(super) fn aliases(
+         && image.offset == 0
+         && image.row_pitch == layout.row_pitch
+         && (layout.slices == 1 || image.array_pitch == layout.slice_pitch)
+-        && texels_alone(layout, image.subresource, image.array_pitch)
++        && (super::texture::alias_host_pages() || texels_alone(layout, image.subresource, image.array_pitch))
+         && image.size <= room
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 9ad31de..b06d82b 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2040,7 +2040,10 @@ impl Device {
+         // usage. A CPU write to the bytes then could be undone, where Metal keeps every one, and
+         // Metal's contract leaves no moment the CPU may not write them. The shadow's copies
+         // address its texels alone, through the buffer.
+-        let host = texels.buffer.caller_memory() == Some(CallerMemory::HostPages);
++        // M2V_ALIAS_HOST_PAGES=1 (ios-sweet, Turnip on Adreno): a linear image's layout moves read and write
++        // nothing there (no compression, no clear on transition), so an image may alias host pages too; where
++        // the device's linear layout differs from Metal's the texture still falls back to its shadow.
++        let host = texels.buffer.caller_memory() == Some(CallerMemory::HostPages) && !alias_host_pages();
+         // The plans a linear image aliasing the bytes is tried with, the first the device makes:
+         // with the feedback loop usage a draw takes that reads the texture its own pass renders
+         // through a snapshot (`feedback_candidate`, `texture/attached_reads.rs`), which costs a
+@@ -2330,6 +2333,7 @@ impl Device {
+     ) -> Result<Aliased, Error> {
+         match texels.buffer.caller_memory() {
+             None => {}
++            Some(CallerMemory::HostPages) if alias_host_pages() => {}
+             Some(CallerMemory::HostPages) => {
+                 return Err(internal("an aliasing image over the caller's host pages"));
+             }
+@@ -2341,8 +2345,12 @@ impl Device {
+                 ))
+             }
+         }
++        // With M2V_ALIAS_HOST_PAGES the bytes between rows (an IOSurface's padded rows) do not stop an alias: Turnip's
++        // linear layout moves never touch them.
+         if let Err(why) = holds {
+-            return Ok(Err(why.clone()));
++            if !alias_host_pages() {
++                return Ok(Err(why.clone()));
++            }
+         }
+         let (memory, buffer_offset, type_index) = texels.buffer.memory();
+         let memory_offset = buffer_offset + texels.layout.offset;
+@@ -5452,3 +5460,9 @@ struct HostCopy {
+     /// (`two_planes.rs`).
+     planes: bool,
+ }
++
++/// Whether an image may alias the caller's host pages (`M2V_ALIAS_HOST_PAGES=1`, read once).
++pub(super) fn alias_host_pages() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_ALIAS_HOST_PAGES").map_or(false, |v| v == "1"))
++}
+diff --git a/crates/metal2vulkan/src/lower/fragment/mod.rs b/crates/metal2vulkan/src/lower/fragment/mod.rs
+index 67bdbfb..1c554a7 100644
+--- a/crates/metal2vulkan/src/lower/fragment/mod.rs
++++ b/crates/metal2vulkan/src/lower/fragment/mod.rs
+@@ -343,7 +343,10 @@ pub fn finish(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<(), Error> {
+     let shadow = cx.families.fragment.stencil.is_some();
+     let storage = !cx.families.fragment.fetch.is_empty() || shadow;
+     let interlock =
+-        if rog::declared(cx.entry) || cx.families.fragment.imageblock.is_some() || storage {
++        if rog::declared_with(cx.entry, fetch::inputs_order(cx.profile) && !storage)
++            || cx.families.fragment.imageblock.is_some()
++            || storage
++        {
+             Some(rog::mode(cx)?)
+         } else {
+             None
+diff --git a/crates/metal2vulkan/src/lower/fragment/rog.rs b/crates/metal2vulkan/src/lower/fragment/rog.rs
+index cce59a9..5c5f287 100644
+--- a/crates/metal2vulkan/src/lower/fragment/rog.rs
++++ b/crates/metal2vulkan/src/lower/fragment/rog.rs
+@@ -79,7 +79,28 @@ fn role_layouts(role: &ParamRole) -> [Option<StructRef>; 2] {
+ /// `e.structs` holds every layout of the module, so a layout only another function names does not
+ /// count. A group's color output the function does not read needs none ([module docs](self)).
+ pub(super) fn declared(e: &Entry) -> bool {
+-    let params = e.ep.params.iter().any(|b| role_group(&b.role).is_some());
++    declared_with(e, false)
++}
++
++/// [`declared`], on a device whose input-attachment fetch is already in rasterization order
++/// (`rasterizationOrderColorAttachmentAccess`, `fetch::inputs_order`): there a group on a color
++/// input, or on the color output of an attachment the function reads, is ordered by the fetch
++/// itself (Metal's group over a color is that same per-pixel order), so only groups on buffers,
++/// textures, argument-buffer and imageblock members still need the interlock. QuartzCore's
++/// `inplace_copy_lph` is such a function; Turnip has the access but no pixel interlock.
++pub(super) fn declared_with(e: &Entry, inputs_ordered: bool) -> bool {
++    // Relaxed (the device orders color fetches): a write-only texture in a group is left
++    // unordered too. Only overlapping writes to one texel lose their primitive order, which
++    // QuartzCore's in-place copies (one write per fragment, at its own pixel) never make.
++    let params = e.ep.params.iter().any(|b| {
++        role_group(&b.role).is_some()
++            && !(inputs_ordered
++                && match &b.role {
++                    ParamRole::ColorInput { .. } => true,
++                    ParamRole::Texture(t) => t.access == crate::air::abi::Access::Write,
++                    _ => false,
++                })
++    });
+     let read = |attachment| {
+         e.ep.params
+             .iter()
+@@ -90,7 +111,7 @@ pub(super) fn declared(e: &Entry) -> bool {
+             attachment,
+             raster_order_group: Some(_),
+             ..
+-        } => read(attachment),
++        } => !inputs_ordered && read(attachment),
+         _ => false,
+     });
+     if params || outputs {

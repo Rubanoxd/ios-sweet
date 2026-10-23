@@ -1,0 +1,22 @@
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+index 67491ab..230bfb9 100644
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -198,9 +198,17 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
+ 
+          /* when possible, use a bit more alignment than necessary
+           * presumably this is better for performance?
++          *
++          * Not on Darwin (ios-sweet): linear images there alias IOSurfaces,
++          * whose rows are 64-byte aligned (SweetSurface), and a 256-byte
++          * pitch here made metal2vulkan shadow every surface texture (the
++          * display's 1125-pixel rows: 4544 bytes, not 4608) with copies in
++          * and out on each use.
+           */
++#ifndef __APPLE__
+          if (!explicit_layout)
+             layout->pitchalign = fdl_cpp_shift(layout);
++#endif
+       } else {
+          /* 3 component formats have pitch aligned as their counterpart
+           * 4 component formats

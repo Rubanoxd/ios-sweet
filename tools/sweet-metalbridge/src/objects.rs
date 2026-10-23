@@ -183,8 +183,38 @@ fn millis_after(text: &str, marker: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+// The plugin's log function, found at run time (the bundle has it; a standalone dylib build does not).
+fn sweet_metal_log_fn() -> Option<unsafe extern "C" fn(*const std::ffi::c_char, ...)> {
+    static FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: dlsym with the default handle and a NUL-terminated name.
+    let p = *FN.get_or_init(|| unsafe { libc::dlsym(libc::RTLD_SELF, c"sweet_metal_log".as_ptr()) as usize });
+    // SAFETY: the symbol, where present, is `void sweet_metal_log(const char *fmt, ...)`.
+    (p != 0).then(|| unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*const std::ffi::c_char, ...)>(p) })
+}
+
+// The first three messages of each id go to the plugin's log (sweetmetal.log): which degradations a client
+// meets (shadowed textures, linear attachment copies...) and why.
+fn log_first_messages(message: &DebugMessage) {
+    static SEEN: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else { return };
+    let n = match seen.iter_mut().find(|(id, _)| *id == message.id_name) {
+        Some((_, n)) => { *n += 1; *n }
+        None => { seen.push((message.id_name.to_string(), 1)); 1 }
+    };
+    if n <= 3 {
+        let text: String = message.text.chars().take(300).collect();
+        if let Ok(line) = std::ffi::CString::new(format!("m2v {} #{}: {}", message.id_name, n, text)) {
+            // SAFETY: a printf-style call with one NUL-terminated string argument.
+            if let Some(log) = sweet_metal_log_fn() {
+                unsafe { log(c"%s".as_ptr(), line.as_ptr()) };
+            }
+        }
+    }
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
+    log_first_messages(message);
     if message.id_name == "metal2vulkan-pipeline-creation" {
         let made = millis_after(&message.text, " made in ");
         let us = made.or_else(|| millis_after(&message.text, " failed in ")).map_or(0, |ms| (ms * 1000.0) as u64);
