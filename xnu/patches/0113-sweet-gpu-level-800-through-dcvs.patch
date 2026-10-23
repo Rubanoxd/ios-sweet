@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2155,14 +2155,24 @@
+ 		/* Fixed GPU level, set once and only downwards: on hardware every
+ 		 * step down (650, 355, 180 MHz) kept the core running, the step
+ 		 * back up to 800 MHz lost its state. sweetgpulevel=N picks the
+-		 * gpu_khz[] index (1..7), default 6 = 650 MHz. */
++		 * gpu_khz[] index (1..7), default 6 = 650 MHz.
++		 * xnu 0113: 7 (800 MHz) is sent too. Left at the boot vote
++		 * without a DCVS message the GPU ran about 17 times slower than
++		 * at 650 MHz (an idle compositor frame took 30 ms, not 1.8):
++		 * probably the bus bandwidth vote, which goes with the DCVS message. */
+ 		int level = 6;
+ 		PE_parse_boot_argn("sweetgpulevel", &level, sizeof(level));
+-		if (level >= 1 && (unsigned)level < GPU_LEVEL_BUSY) {
++		if (level >= 1 && (unsigned)level <= GPU_LEVEL_BUSY) {
+ 			lck_mtx_lock(gpu_mtx);
+ 			int saved = gpu_dcvs;
+ 			gpu_dcvs = 1;
++			if ((unsigned)level == gpu_level) {
++				gpu_level = 0;          /* not the boot vote's level: send it */
++			}
+ 			gpu_set_level((unsigned)level);
++			if (gpu_level == 0) {
++				gpu_level = GPU_LEVEL_BUSY;
++			}
+ 			gpu_dcvs = saved;
+ 			lck_mtx_unlock(gpu_mtx);
+ 		}
