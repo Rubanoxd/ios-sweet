@@ -1,0 +1,119 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@
+ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_tdump_bsd.c		standard
+ bsd/dev/sweet_inject.c			standard
++bsd/dev/sweet_ddr.c			standard
+ bsd/dev/sweet_irq.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+--- /dev/null
++++ b/bsd/dev/sweet_ddr.c
+@@ -0,0 +1,44 @@
++/*
++ * sweet_ddr.c (xnu 0110): kern.sweet_ddr=1 votes the most DDR bandwidth the
++ * bus clock managers give (MC0: DDR, SH0: the memory NoC, ACV: the apps
++ * enable bit), as Linux's interconnect does for the A618 at its top OPP.
++ * Without a vote from us the DDR runs at whatever others ask, and full-screen
++ * GPU passes (QuartzCore's blurs) took 35-60 ms a frame. One way: it only
++ * raises; 0 is refused rather than leaving the DDR without our vote.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern int sweet_rpmh_bcm_vote(const char *const *res, const uint32_t *x, const uint32_t *y, unsigned n);
++
++static int sweet_ddr_level;
++
++static int
++sysctl_sweet_ddr SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = sweet_ddr_level;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (v != 1) {
++		return EINVAL;
++	}
++	static const char *const res[3] = {"MC0", "SH0", "ACV"};
++	static const uint32_t x[3] = {0x3fff, 0x3fff, 0};
++	static const uint32_t y[3] = {0x3fff, 0x3fff, 0x8};   /* ACV: the APPS enable bit */
++	error = sweet_rpmh_bcm_vote(res, x, y, 3);
++	if (!error) {
++		sweet_ddr_level = 1;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ddr, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_ddr, "I", "1: vote the most DDR bandwidth (MC0, SH0, ACV)");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -15,6 +15,7 @@
+ int sweet_rpmh_cmd_db(const char *res, unsigned *slave, uint32_t *addr, uint16_t *aux, unsigned *naux,
+     unsigned max);
+ int sweet_rpmh_arc_vote(const char *res, unsigned hlvl);
++int sweet_rpmh_bcm_vote(const char *const *res, const uint32_t *x, const uint32_t *y, unsigned n);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -471,6 +472,51 @@
+ out:
+ 	if (error) {
+ 		printf("SWEET RPMH: %s level %u vote failed errno=%d\n", res, hlvl, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++/*
++ * ACTIVE votes for N bus clock managers (cmd-db slave 5) in one request:
++ * Linux's BCM_TCS_CMD with commit and valid set, average (x) and peak (y)
++ * in the BCM's units, each 14 bits. Used to give the GPU DDR bandwidth
++ * (sweet_ddr.c): on sc7180/atoll the CPU votes it (dev_pm_opp_set_bw), not
++ * the A618's legacy GMU.
++ */
++int
++sweet_rpmh_bcm_vote(const char *const *res, const uint32_t *x, const uint32_t *y, unsigned n)
++{
++	if (!res || !x || !y || n == 0 || n > 4) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t addrs[4], values[4];
++	int error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned i = 0; !error && i < n; ++i) {
++		unsigned slave = 0;
++		uint32_t off = 0, len = 0;
++		error = rh_find(res[i], &slave, &addrs[i], &off, &len);
++		if (!error && slave != 5) {
++			error = EINVAL;
++		}
++		if (!error) {
++			values[i] = (1u << 30) | (1u << 29) | ((x[i] & 0x3fffu) << 14) | (y[i] & 0x3fffu);
++			printf("SWEET RPMH: BCM %s at %#x aux %u bytes, vote x %u y %u\n", res[i], addrs[i], len, x[i], y[i]);
++		}
++	}
++	if (!error) {
++		error = rh_send_cmds(addrs, values, n, "bcm");
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: BCM vote failed errno=%d\n", error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
