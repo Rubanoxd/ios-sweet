@@ -1,0 +1,112 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -217,6 +217,24 @@
+ 	return true;
+ }
+ 
++static uint64_t sweet_fb_wait_since, sweet_fb_gpu_waits, sweet_fb_gpu_timeouts;
++
++/* xnu 0112: a layer of the frame is still being drawn or read by the GPU. */
++static bool
++sweet_fb_gpu_busy(const uint8_t *rec)
++{
++	uint32_t mask;
++	memcpy(&mask, rec + 0x104, 4);
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id;
++		memcpy(&id, rec + 0x54 + 4 * layer, 4);
++		if ((mask & (1u << layer)) && id != 0 && sweet_surface_use_count(id) > 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -279,6 +297,36 @@
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
++	/*
++	 * xnu 0112: a frame is shown once the GPU has written it. The Metal
++	 * frontend holds a use count on every surface a command buffer reads or
++	 * writes until it completes; while a layer of the swapped frame is still
++	 * in use the flip waits for a later vsync (at most 100 ms). The frontend
++	 * then no longer has to hold QuartzCore's "scheduled" until completion,
++	 * and the render server prepares the next frame while the GPU draws this
++	 * one.
++	 */
++	if (rec != NULL && sweet_fb_gpu_busy(rec)) {
++		static uint64_t timeout;
++		if (timeout == 0) {
++			nanoseconds_to_absolutetime(100000000ULL, &timeout);
++		}
++		if (sweet_fb_wait_since == 0) {
++			sweet_fb_wait_since = now;
++		}
++		if (now - sweet_fb_wait_since < timeout) {
++			IOLockLock(fb->fLock);
++			if (!fb->fDirty) {
++				fb->fDirty = true;      /* fPending is still this frame */
++			}
++			IOLockUnlock(fb->fLock);
++			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++			sweet_fb_gpu_waits++;
++			return;
++		}
++		sweet_fb_gpu_timeouts++;
++	}
++	sweet_fb_wait_since = 0;
+ 	if (rec != NULL) {
+ 		uint64_t began = mach_absolute_time();
+ 		fb->present(rec);
+@@ -291,8 +339,9 @@
+ 			uint64_t mean_ns, longest_ns;
+ 			absolutetime_to_nanoseconds(total / 600, &mean_ns);
+ 			absolutetime_to_nanoseconds(longest, &longest_ns);
+-			printf("SWEET FB: %llu presents, last 600 took %llu us mean, %llu us longest\n",
+-			    presents, mean_ns / 1000, longest_ns / 1000);
++			printf("SWEET FB: %llu presents, last 600 took %llu us mean, %llu us longest, "
++			    "%llu vsyncs waited for the GPU, %llu timeouts\n",
++			    presents, mean_ns / 1000, longest_ns / 1000, sweet_fb_gpu_waits, sweet_fb_gpu_timeouts);
+ 			total = longest = 0;
+ 		}
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -871,6 +871,18 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++int64_t
++sweet_surface_use_count(uint32_t id)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL) {
++		return 0;
++	}
++	int64_t count = *(volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE_COUNT);
++	s->release();
++	return count;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapIncrementUse(void *id, __unused void *category, void *, void *, void *, void *)
+ {
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -52,6 +52,12 @@
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
+ /*
++ * Use count of a surface (xnu 0106: IOSurfaceIncrementUseCount from the GPU
++ * client while its work reads or writes it), 0 for an unknown id.
++ */
++int64_t sweet_surface_use_count(uint32_t id);
++
++/*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
+  * and every user.
