@@ -1,0 +1,74 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_wlan.c			standard
+ bsd/dev/sweet_tdump_bsd.c		standard
++bsd/dev/sweet_inject.c			standard
+ bsd/dev/sweet_irq.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/mem.c				standard
+--- /dev/null
++++ b/bsd/dev/sweet_inject.c
+@@ -0,0 +1,61 @@
++/*
++ * sweet_inject.c (xnu 0108): touches and keys from user space, through the same
++ * path as the real drivers (sweet_hid_touch / sweet_hid_key -> SweetHIDTouch /
++ * SweetHIDButtons -> backboardd), so tests can drive the UI without hands.
++ *
++ *   kern.sweet_touch = finger << 25 | down << 24 | x << 12 | y
++ *                      (x 0..1079, y 0..2399: panel pixels, as the touch driver reports)
++ *   kern.sweet_key   = key << 1 | down   (key 0 power, 1 volume up, 2 volume down, 3 home)
++ *
++ * Writing needs root (sysctl's default).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);
++
++static int
++sysctl_sweet_touch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int finger = (v >> 25) & 0xf, down = (v >> 24) & 1, x = (v >> 12) & 0xfff, y = v & 0xfff;
++	if (finger > 9 || x > 1079 || y > 2399) {
++		return EINVAL;
++	}
++	sweet_hid_touch(finger, down, x, y);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_touch, "I", "finger<<25 | down<<24 | x<<12 | y: inject a touch");
++
++static int
++sysctl_sweet_key SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int key = (v >> 1) & 0xff, down = v & 1;
++	if (key > 3) {
++		return EINVAL;
++	}
++	sweet_hid_key(key, down);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_sweet_key, "I", "key<<1 | down: inject a button (0 power, 1 vol+, 2 vol-, 3 home)");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
