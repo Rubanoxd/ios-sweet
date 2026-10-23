@@ -1002,3 +1002,45 @@ build needs Xcode 15's iig).
   finished frames shown, 136 skipped); swipes 35.4-37.3 frames/s early,
   26.1 deferred, the same boot; camera clean. Shim
   `shim/out/shim-boot-joyeuse-dual-0115.img`.
+
+## Widgets and wallpaper: extension points need AMFI's answer (xnu 0116, 2026-10-24)
+
+Symptom: in the Today view only the Batteries widget drew (Stocks, Maps, Screen
+Time empty: chronod "Ignoring restricted extension", "Unknown extension
+process", "Extension not found"); the home screen wallpaper was black.
+
+Tools (`tools/sweet-diag/`, `build.sh`): `sweet-oslog` (live unified log; the
+on-disk tracev3 files cannot be read on the Mac: logd writes no timesync
+files), `sweet-stack PID` (user backtraces; symbolize the redacted shared
+cache frames with `ipsw dyld a2s` on a copy of the cache and the slide from
+`_dyld_get_shared_cache_range`), `sweet-lsquery`.
+
+Three layers, found in order:
+1. LaunchServices had none of the apps' plug-ins: the first boot's
+   `uicache -a` registered the apps while lsd's seeding was stuck.
+2. installd stalled every LaunchServices seed: its scan of bundle containers
+   asks FairPlay about Bloons TD 6's `SC_Info` (`-[MIExecutableBundle
+   fairPlaySinfInfoWithError:]`), and fairplayd never answers. The binary is
+   decrypted (cryptid 0), so `SC_Info` was moved to
+   `/var/mobile/Documents/BloonsTD6-SC_Info/`. Do the same for any other
+   App Store IPA installed with TrollStore.
+3. Extension points declared by frameworks (`NSExtensionSDK` in
+   WidgetKit's, PosterKit's... Info.plist) come from ExtensionKit's extension
+   point cache. Its code signature is enforced unless
+   `amfi_interface_query_bootarg_state()` (`__mac_syscall("AMFI", 0x60,
+   &u64)`) reports one of the bits 0x86; the call failed with ENOPOLICY,
+   enforcement then needs the AppleMobileFileIntegrity service ("Unable to
+   find AMFI") and lsd registered 6 extension points instead of 134.
+   xnu 0116 adds a MAC policy named "AMFI" that answers call 0x60 with 0x4
+   (installd reads the same mask as "code signing enforcement disabled");
+   other calls still return ENOPOLICY. A feature-flag override in
+   `/Library/Preferences/FeatureFlags/Domain/ExtensionKit.plist` is ignored.
+
+After 0116, `tools/sweet-diag/sweet-rereg-plugins.sh` (uicache -p of every
+`/Applications` app with plug-ins) registered the widget plug-ins with their
+extension point; they persist across lsd restarts and reboots. After a
+SpringBoard restart chronod launches the widget extensions (Calendar,
+Fitness, People) and PosterBoard the poster providers (WeatherPoster,
+LegacyPoster). `sweet-shot` does not show widgets or the wallpaper (separate
+layers): check them on the panel. Shim
+`shim/out/shim-boot-joyeuse-dual-0116.img`.
