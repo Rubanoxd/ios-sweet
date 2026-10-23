@@ -1,0 +1,74 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -28,6 +28,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/errno.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -307,8 +308,54 @@
+ 
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++};
++
++/*
++ * Policy "AMFI" (xnu 0116): libAppleMobileFileIntegrity's
++ * amfi_interface_query_bootarg_state() is __mac_syscall("AMFI", 0x60,
++ * &u64). It failed with ENOPOLICY, so ExtensionKit enforced the code
++ * signature of its extension point cache, could not check it ("Unable to
++ * find AMFI": no AppleMobileFileIntegrity service) and left the extension
++ * points that frameworks declare (WidgetKit's com.apple.widgetkit-extension
++ * among them) unregistered: chronod found no widget extension. The state
++ * returned has 0x4 set, one of the bits (mask 0x86) that ExtensionKit and
++ * installd read as "code signing enforcement disabled", which is what
++ * SWEET runs with. Other calls keep failing with ENOPOLICY; the first use
++ * of each is logged.
++ */
++#define SWEET_AMFI_CALL_BOOTARG_STATE   0x60
++#define SWEET_AMFI_BOOTARG_STATE        0x4ULL
++
++static uint64_t sweet_amfi_calls_seen[2];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(sweet_amfi_calls_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_calls_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s call 0x%x\n", name, call);
++	}
++	if (call == SWEET_AMFI_CALL_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_STATE;
++		return copyout(&state, arg, sizeof(state));
++	}
++	return ENOPOLICY;
++}
++
++static const struct mac_policy_ops sweet_amfi_syscall_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
++static struct mac_policy_conf sweet_amfi_syscall_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI system calls",
++	.mpc_ops = &sweet_amfi_syscall_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_syscall_mac_handle;
++
+ /*
+  * Privileges for non-root processes come from MAC policies (priv_check_cred
+  * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
+@@ -379,5 +426,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_syscall_mac_conf, &sweet_amfi_syscall_mac_handle, NULL);
++	printf("SWEET AMFI: system call policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
