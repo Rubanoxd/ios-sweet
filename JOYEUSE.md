@@ -889,3 +889,46 @@ re-sign with their entitlements (`tools/sweet-fix-app-rpaths.py`).
   MediaLibrary data migrator run once as mobile
   (`sudo -u mobile sweet-migrator .../MediaLibrary.migrator`), otherwise it
   crashes in `-[MPMediaLibrary _MediaLibrary_coreLibrary]` (strlen(NULL)).
+
+## GPU compositing glitches: found with a camera, fixed in the frontend (2026-10-23)
+
+Tools (`tools/sweet-touch/`): `sweet-touch key 0x40` (Home; synthetic touches are
+ignored by backboardd, see below), `sweet-shot` / `sweet-rec` (the display's
+IOSurfaces read from inside iOS; they must `dc civac` first, the Adreno does not
+snoop, and the two-plane display surfaces report rows of 0 bytes: use the
+surface's 4544), `sweet-prefs` (CFPreferences without `defaults`;
+`SBDontLockAfterCrash` keeps experiments that restart backboardd unlocked).
+The ground truth is a camera: OBS's projector window grabbed with
+`screencapture -l <window> ` at ~8 fps while the phone runs `uiopen` sequences.
+A back buffer read from iOS is not what is on screen (it holds an older frame,
+or one the GPU is drawing): judging glitches from IOSurface dumps misleads.
+
+What the camera showed in GPU mode, and the fixes (SweetMetalFrontend.mm):
+1. **Half-drawn frames** in transitions (rows without their text, a layer's
+   black background, light boxes over the home screen, almost black frames).
+   QuartzCore swaps a display surface once its frame is *scheduled*; Apple's
+   display driver then waits for the GPU, ours flips at the next vsync, and
+   transition frames take the GPU 12-20 ms. Fix: a command buffer that draws
+   into a two-plane display surface delivers "scheduled" at completion
+   (`SWEET_EARLY_SCHEDULE=1`: as before). Not a Turnip tiling issue:
+   `TU_DEBUG=sysmem` showed the same.
+2. **Magenta / yellow apps** while zooming in or switching. Single-plane
+   'w30r' (BGR10_XR, 554) surfaces were turned into BGRA8 by displayFormat():
+   apps' XR backing stores were read as 8-bit (light grey -> magenta), and the
+   app snapshots backboardd renders into 'w30r' were written as BGRA8 and then
+   read as XR by SpringBoard, which keeps them as ASTC `.ktx` in SplashBoard
+   (bad snapshots persist until those caches are cleared). Fix: single-plane
+   extended-range surfaces keep their real format for reads and draws
+   (metal2vulkan encodes/decodes XR itself), and a pipeline used in a pass whose
+   color formats differ gets a variant made for them (`pipelineFor`); the XR
+   variants of pipelines QuartzCore makes for XR targets are made at creation
+   on a background queue (one took 1.4 s in metal2vulkan and froze the screen
+   when made at the first snapshot). `SWEET_XR_BGRA8=1`: the old behaviour.
+3. `/var/tmp/sweetmetal.env` (KEY=VALUE lines) sets the render server's
+   environment without a rebuild; `SWEET_TRACE_PASSES=N` logs display passes
+   (QuartzCore loads the buffer and redraws damaged rectangles; no blits).
+Synthetic touches: IOHIDEventSystemClient digitizer events (any sender ID,
+with the kernel's collection layout) do nothing, keyboard events work; xnu 0108
+adds `kern.sweet_touch` / `kern.sweet_key` through the real HID path but is
+not built (GitHub Actions is disabled on the fork; Xcode 27 here, the xnu-8796
+build needs Xcode 15's iig).
