@@ -977,7 +977,7 @@ build needs Xcode 15's iig).
   busy perf lines): deferred 26.5-27.0 frames/s, early with 0112/0114
   37.4-38.8 frames/s, peaks 61. Camera: app open/close and swipes without
   half-drawn frames. Per 600 presents about 224 vsyncs waited and 4 timeouts
-  (a frame still in use after 100 ms): not understood yet.
+  (a frame still in use after 100 ms); xnu 0115 fixes them, see below.
 - xnu 0113: `sweetgpulevel=7` sends 800 MHz through DCVS. Not usable: at the
   boot vote (0111, no DCVS message) an idle compositor frame took 30 ms
   instead of 1.8 ms and the GPU then faulted (SMMU translation fault at
@@ -985,3 +985,20 @@ build needs Xcode 15's iig).
   failed at boot (the core loses its state going up, as in the 0095
   experiment). The default stays 6 = 650 MHz.
 - Shims: `shim/out/shim-boot-joyeuse-dual-0114.img` (cmdline B, 60 Hz).
+- The timeouts were not slow GPU work: the frontend now logs every command
+  buffer that takes over 100 ms from commit to completion (`slow command
+  buffer`), and in swipes there were none (only one or two right after
+  backboardd starts, pipeline compiles). The kernel kept only the latest
+  swap: with the render server ahead of the GPU each new swap replaced the
+  frame being waited for with one also still being drawn, until the 100 ms
+  timeout showed an unfinished frame. A user-space use-count sampler does not
+  help here: another process does not see the counts change.
+- xnu 0115: up to four swaps queued; each vsync shows the newest one whose
+  surfaces are no longer in use and drops the older ones. The 600-present
+  line adds "older finished frames shown" and "skipped". The first build
+  panicked (`__memmove_chk` object size 1132 < 3396: memmove from
+  `fQueue[0]` over several records); the queue is one flat array now.
+  Measured: 0 timeouts over about 1800 presents with swipes (282 older
+  finished frames shown, 136 skipped); swipes 35.4-37.3 frames/s early,
+  26.1 deferred, the same boot; camera clean. Shim
+  `shim/out/shim-boot-joyeuse-dual-0115.img`.

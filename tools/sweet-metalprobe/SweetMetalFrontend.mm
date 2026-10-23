@@ -1250,6 +1250,19 @@ static void scheduled(void *context);
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ // A command buffer that took more than 100 ms (the kernel's longest wait for a display frame, xnu 0112/0115).
+ if(self.committed) {
+  const uint64_t took=nowUs()-self.committedUs;
+  static std::atomic<unsigned> slowLogged{0};
+  if(took>100000 && slowLogged++<200) {
+   bool display=false;
+   for(NBTexture *t in _surfaces){IOSurfaceRef ts=t.surface;if(ts && IOSurfaceGetPlaneCount(ts)==2){display=true;break;}}
+   unsigned long inFlight;@synchronized(gInFlight){inFlight=gInFlight.count;}
+   sweet_metal_log("slow command buffer #%u: %llu ms from commit to completion%s, %u passes %u draws %u blits %u dispatches, %.1f Mpx, %lu in flight",
+       self.commitIndex,(unsigned long long)(took/1000),display?" (display)":"",encodedWork.passes,encodedWork.draws,encodedWork.blits,
+       encodedWork.dispatches,encodedWork.pixels/1e6,inFlight);
+  }
+ }
  flushSurfaces(_surfaces);
  shadowCopy(_surfaces);
  for(id surface in _usedSurfaces)IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)surface);
