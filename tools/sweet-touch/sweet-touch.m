@@ -15,6 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <IOKit/IOKitLib.h>
+#include <sys/sysctl.h>
 
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
@@ -54,8 +55,30 @@ static double sx = 1, sy = 1;  /* SWEET_TOUCH_UNITS=points: send 375x812 points 
  * (Collection=1, the finger's position, Range/Touch, ButtonMask, the finger's mask) with one
  * finger child (index 0, identity 2; Identity in the mask when it lands).
  */
+/* xnu 0108: kern.sweet_touch takes a touch through the real driver path (panel pixels 1080x2400). */
+static int kernelTouch = -1;
+static bool sendKernel(double x, double y, int touching)
+{
+	if (kernelTouch < 0) {
+		int v = 0;
+		size_t len = sizeof(v);
+		kernelTouch = sysctlbyname("kern.sweet_touch", &v, &len, NULL, 0) == 0 && !getenv("SWEET_TOUCH_HID");
+	}
+	if (!kernelTouch) {
+		return false;
+	}
+	int px = (int)(x * 1079 + 0.5), py = (int)(y * 2399 + 0.5);
+	px = px < 0 ? 0 : (px > 1079 ? 1079 : px);
+	py = py < 0 ? 0 : (py > 2399 ? 2399 : py);
+	int v = (touching ? 1 << 24 : 0) | (px << 12) | py;
+	return sysctlbyname("kern.sweet_touch", NULL, NULL, &v, sizeof(v)) == 0;
+}
+
 static void send(double x, double y, int touching, uint32_t mask)
 {
+	if (sendKernel(x, y, touching)) {
+		return;
+	}
 	uint64_t t = mach_absolute_time();
 	x *= sx;
 	y *= sy;
@@ -86,9 +109,29 @@ static uint64_t service_id(const char *cls)
 	return id;
 }
 
+/* xnu 0108: kern.sweet_key, the real buttons' path (0 power, 1 vol+, 2 vol-, 3 home). */
+static bool keyKernel(uint32_t usage)
+{
+	int k = usage == 0x30 ? 0 : usage == 0xe9 ? 1 : usage == 0xea ? 2 : usage == 0x40 ? 3 : -1;
+	if (k < 0 || getenv("SWEET_TOUCH_HID")) {
+		return false;
+	}
+	for (int down = 1; down >= 0; down--) {
+		int v = (k << 1) | down;
+		if (sysctlbyname("kern.sweet_key", NULL, NULL, &v, sizeof(v)) != 0) {
+			return false;
+		}
+		usleep(80000);
+	}
+	return true;
+}
+
 /* A consumer-page button (0x30 power, 0x40 menu/home, 0xe9 volume up, 0xea volume down) as SweetHIDButtons. */
 static void key(uint32_t usage)
 {
+	if (keyKernel(usage)) {
+		return;
+	}
 	uint64_t id = service_id("SweetHIDButtons");
 	for (int down = 1; down >= 0; down--) {
 		IOHIDEventRef e = IOHIDEventCreateKeyboardEvent(kCFAllocatorDefault, mach_absolute_time(), 0x0c, usage, down, 0);

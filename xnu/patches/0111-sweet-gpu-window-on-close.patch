@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -341,9 +341,33 @@
+ 	IOUserClient::free();
+ }
+ 
++/*
++ * The connection is closed (or its task died): its objects are unmapped and
++ * its GPU address window goes back now, not when the last reference to this
++ * object is dropped, which could come much later -- with three windows a
++ * restarted backboardd then found none free (xnu 0111).
++ */
+ IOReturn
+ SweetAdrenoUserClient::clientClose(void)
+ {
++	bool unmapped = true;
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++	}
++	if (fEntries != NULL) {
++		for (unsigned i = 0; i < kSweetAdrenoMaxObjects; ++i) {
++			if (fEntries[i].md != NULL && freeEntry(&fEntries[i], true) != kIOReturnSuccess) {
++				unmapped = false;           /* still busy on the GPU: free() gives the window back */
++			}
++		}
++	}
++	if (fLock != NULL) {
++		IOLockUnlock(fLock);
++	}
++	if (unmapped && fSlot >= 0) {
++		vaSlotGive(fSlot);
++		fSlot = -1;
++	}
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }

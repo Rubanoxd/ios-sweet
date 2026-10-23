@@ -97,7 +97,9 @@ turnip_start(void)
 {
 	static int started;
 	const char *name = getprogname();
-	if (started || !name || (strcmp(name, "SpringBoard") != 0 && strcmp(name, "sweet-mtlquery") != 0)) {
+	/* Only sweet-mtlquery: in SpringBoard this bring-up check held one of the kernel's few GPU address windows
+	 * for the life of the process (xnu 0109 has three), and backboardd could be left without one. */
+	if (started || !name || strcmp(name, "sweet-mtlquery") != 0) {
 		return;
 	}
 	started = 1;
