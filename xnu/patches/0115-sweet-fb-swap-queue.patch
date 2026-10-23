@@ -16,7 +16,7 @@
 +	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap */
  	bool          fDirty;
 +	/* xnu 0115: swaps not shown yet, oldest first, with their sequence numbers. */
-+	uint8_t       fQueue[SWEET_FB_QUEUE][SWEET_FB_SWAP_REC_SIZE];
++	uint8_t       fQueue[SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE];   /* one flat array: the size checks of memmove see all of it */
 +	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
 +	uint32_t      fQueued;
 +	uint64_t      fSwapSeq;
@@ -123,7 +123,7 @@
 +			done++;
 +		}
 +		fb->fQueued -= done;
-+		memmove(fb->fQueue[0], fb->fQueue[done], fb->fQueued * SWEET_FB_SWAP_REC_SIZE);
++		memmove(fb->fQueue, fb->fQueue + done * SWEET_FB_SWAP_REC_SIZE, fb->fQueued * SWEET_FB_SWAP_REC_SIZE);
 +		memmove(&fb->fQueueSeq[0], &fb->fQueueSeq[done], fb->fQueued * sizeof(fb->fQueueSeq[0]));
 +	}
 +	fb->fDirty = fb->fDirty || fb->fQueued != 0;
@@ -155,11 +155,11 @@
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
 +	if (fQueued == SWEET_FB_QUEUE) {        /* full: the oldest goes */
 +		fQueued--;
-+		memmove(fQueue[0], fQueue[1], fQueued * SWEET_FB_SWAP_REC_SIZE);
++		memmove(fQueue, fQueue + SWEET_FB_SWAP_REC_SIZE, fQueued * SWEET_FB_SWAP_REC_SIZE);
 +		memmove(&fQueueSeq[0], &fQueueSeq[1], fQueued * sizeof(fQueueSeq[0]));
 +		sweet_fb_skipped++;
 +	}
-+	memcpy(fQueue[fQueued], rec, SWEET_FB_SWAP_REC_SIZE);
++	memcpy(fQueue + fQueued * SWEET_FB_SWAP_REC_SIZE, rec, SWEET_FB_SWAP_REC_SIZE);
 +	fQueueSeq[fQueued++] = ++fSwapSeq;
  	fDirty = true;
  	IOLockUnlock(fLock);
