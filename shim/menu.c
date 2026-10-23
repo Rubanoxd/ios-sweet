@@ -72,6 +72,13 @@ static void draw_countdown(int left)
 		center(1700, line, 3, GREY, BG);
 }
 
+/* What the countdown picks: iOS. A test build may pass -DMENU_TIMEOUT_ANDROID. */
+#ifdef MENU_TIMEOUT_ANDROID
+#define TIMEOUT_CHOICE() (android_probe() ? 1 : 0)
+#else
+#define TIMEOUT_CHOICE() 0
+#endif
+
 int menu_choose(unsigned timeout_s)
 {
 	con_clear(BG);
@@ -104,7 +111,7 @@ int menu_choose(unsigned timeout_s)
 				shown = left;
 			}
 			if (left <= 0)
-				return 0;
+				return TIMEOUT_CHOICE();
 		}
 		if (!have_keys || now - last_poll < hz / 50)
 			continue;
