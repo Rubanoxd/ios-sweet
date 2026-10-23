@@ -1,0 +1,27 @@
+--- a/bsd/dev/sweet_dpu.c
++++ b/bsd/dev/sweet_dpu.c
+@@ -30,6 +30,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+@@ -262,6 +263,16 @@
+ }
+ 
+ /*
++ * xnu 0112 (AppleCLCD::vsyncFired) shows a swapped frame only once the GPU
++ * no longer uses its surface. kern.sweet_fb_gpu_wait=1 tells the Metal
++ * frontend so: it then delivers QuartzCore's "scheduled" at submission
++ * instead of holding it until the GPU completes (xnu 0114).
++ */
++static int sweet_fb_gpu_wait = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gpu_wait, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_fb_gpu_wait, 0, "the display flip waits for the GPU");
++
++/*
+  * Show the (img_w x img_h, stride) image at pa: the pipe fetches the
+  * panel-sized rectangle at (x, y) of it. Its source size, format and the
+  * rest of the pipeline stay as ABL set them. The CPU caches of the image

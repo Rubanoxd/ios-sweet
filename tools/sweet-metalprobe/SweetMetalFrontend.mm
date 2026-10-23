@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -1209,9 +1210,16 @@ static void scheduled(void *context);
  // GPU to finish writing the surface; ours (xnu SweetFramebuffer / DPU zero-copy) flips at the next vsync. A frame that
  // took the GPU longer than that (transitions: blurs, 12-20 ms) was shown half drawn: rows without their text, a
  // layer's black background, boxes over the home screen. So for a command buffer that draws into a display surface,
- // "scheduled" is delivered when it completes (finish). SWEET_EARLY_SCHEDULE=1: as before.
+ // "scheduled" is delivered when it completes (finish). A kernel whose flip waits for the GPU itself (xnu 0112, which
+ // reads the use counts commit holds until completion; kern.sweet_fb_gpu_wait=1 from 0114) needs none of that: the
+ // render server then prepares the next frame while the GPU draws this one. SWEET_EARLY_SCHEDULE=0/1 overrides.
  static int early=-1;
- if(early<0)early=getenv("SWEET_EARLY_SCHEDULE")?1:0;
+ if(early<0) {
+  const char *v=getenv("SWEET_EARLY_SCHEDULE");
+  int wait=0;size_t size=sizeof(wait);
+  early=v?atoi(v)!=0:(sysctlbyname("kern.sweet_fb_gpu_wait",&wait,&size,NULL,0)==0 && wait==1);
+  sweet_metal_log("display frames: \"scheduled\" %s",early?"at submission (the kernel waits for the GPU)":"at completion");
+ }
  if(!early) {
   bool display=false;
   @synchronized(self){
